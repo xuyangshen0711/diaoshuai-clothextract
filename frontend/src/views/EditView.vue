@@ -52,7 +52,7 @@ async function save() {
     const updated = await updateRecord(current.value.id, { ...form })
     const idx = items.value.findIndex((x) => x.id === updated.id)
     if (idx >= 0) items.value[idx] = updated
-    status.value = '已保存，并重建索引'
+    status.value = '已保存'
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
@@ -63,11 +63,16 @@ async function save() {
 
 <template>
   <section class="panel">
-    <div class="field" style="margin-bottom: 16px">
-      <label>选择图片</label>
+    <div class="page-head">
+      <h2>修正</h2>
+      <p class="meta">人工确认后的标签会优先保留</p>
+    </div>
+
+    <div class="field" style="max-width: 520px; margin-bottom: 20px">
+      <label>选择款式</label>
       <select v-model="selectedId">
         <option v-for="item in items" :key="item.id" :value="item.id">
-          {{ item.id }} · {{ item.tags.一句话描述 || item.source.location }}
+          {{ item.tags.一句话描述 || item.source.location }}
         </option>
       </select>
     </div>
@@ -76,7 +81,7 @@ async function save() {
       <div>
         <img :src="current.image_url" :alt="current.id" />
         <p class="sub" style="margin-top: 10px">
-          {{ current.source.source_file }} / {{ current.source.location }}
+          {{ current.source.source_file }} · {{ current.source.location }}
         </p>
       </div>
       <div>
@@ -88,16 +93,16 @@ async function save() {
             </select>
           </div>
           <div class="field wide">
-            <label>细节元素（逗号分隔）</label>
-            <input v-model="detailsText" />
+            <label>细节</label>
+            <input v-model="detailsText" placeholder="开襟, 口袋" />
           </div>
           <div class="field wide">
-            <label>一句话描述</label>
+            <label>描述</label>
             <textarea v-model="form.一句话描述" rows="3" />
           </div>
         </div>
-        <div class="toolbar" style="margin-top: 14px">
-          <button class="btn primary" :disabled="saving" @click="save">保存修正</button>
+        <div class="toolbar" style="margin-top: 16px">
+          <button class="btn primary" :disabled="saving" @click="save">保存</button>
         </div>
         <div v-if="status" class="status">{{ status }}</div>
         <div v-if="error" class="error">{{ error }}</div>

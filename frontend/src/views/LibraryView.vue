@@ -36,9 +36,12 @@ watch(filters, load, { deep: true })
 
 <template>
   <section class="panel">
+    <div class="page-head">
+      <h2>图库</h2>
+      <p class="meta">{{ loading ? '加载中…' : `${count} 款` }}</p>
+    </div>
     <FilterBar v-model="filters" />
-    <p class="meta">共 {{ count }} 条{{ loading ? ' · 加载中…' : '' }}</p>
     <div v-if="error" class="error">{{ error }}</div>
-    <ImageGrid :items="items" empty-text="暂无图片。请先在「导入」上传 PDF / PPT。" />
+    <ImageGrid :items="items" empty-text="还没有图片。去「导入」上传资料吧。" />
   </section>
 </template>

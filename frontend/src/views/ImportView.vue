@@ -25,9 +25,9 @@ async function runImport() {
   error.value = ''
   status.value = ''
   try {
-    if (!files.value.length) throw new Error('请先选择 PDF / PPTX / Excel 文件')
+    if (!files.value.length) throw new Error('请先选择文件')
     const data = await importFiles(files.value, backend.value)
-    status.value = `抽取并打标 ${data.extracted} 张，目录共 ${data.catalog_count} 条（${data.backend}）`
+    status.value = `已入库 ${data.extracted} 张，共 ${data.catalog_count} 款`
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
@@ -41,7 +41,7 @@ async function runRetag(overwrite: boolean) {
   status.value = ''
   try {
     const data = await retag(backend.value, overwrite)
-    status.value = `${overwrite ? '全量' : '增量'}打标完成，目录 ${data.catalog_count} 条`
+    status.value = overwrite ? `已全量重打标，共 ${data.catalog_count} 款` : `已更新未确认标签`
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
@@ -54,7 +54,7 @@ async function runRebuild() {
   error.value = ''
   try {
     const data = await rebuildIndex()
-    status.value = `索引已重建（${data.catalog_count} 条）`
+    status.value = `索引已更新（${data.catalog_count} 款）`
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
@@ -65,29 +65,32 @@ async function runRebuild() {
 
 <template>
   <section class="panel">
-    <p class="meta">
-      支持 PDF / PPTX / XLSX。当前 API Key：
-      {{ openaiReady ? '已配置（可用 GPT-4o-mini）' : '未配置（仅 Mock）' }}
-    </p>
+    <div class="page-head">
+      <h2>导入</h2>
+      <p class="meta">{{ openaiReady ? 'GPT-4o-mini' : 'Mock 模式' }}</p>
+    </div>
+
+    <div class="dropzone">
+      <strong>上传 PDF / PPT / Excel</strong>
+      <p style="margin: 8px 0 14px">把企划或商品资料拖进来，或点击选择文件</p>
+      <input type="file" multiple accept=".pdf,.pptx,.xlsx,.xlsm" @change="onFiles" />
+      <p v-if="files.length" style="margin: 12px 0 0">已选 {{ files.length }} 个文件</p>
+    </div>
 
     <div class="toolbar">
-      <div class="field">
-        <label>打标后端</label>
+      <div class="field" style="min-width: 160px">
+        <label>打标方式</label>
         <select v-model="backend">
           <option value="openai">GPT-4o-mini</option>
           <option value="mock">Mock</option>
         </select>
       </div>
-      <div class="field">
-        <label>上传文件</label>
-        <input type="file" multiple accept=".pdf,.pptx,.xlsx,.xlsm" @change="onFiles" />
-      </div>
     </div>
 
     <div class="toolbar">
       <button class="btn primary" :disabled="loading" @click="runImport">抽取并打标</button>
-      <button class="btn" :disabled="loading" @click="runRetag(false)">重打未确认项</button>
-      <button class="btn" :disabled="loading" @click="runRetag(true)">全量重打标</button>
+      <button class="btn" :disabled="loading" @click="runRetag(false)">补打标签</button>
+      <button class="btn" :disabled="loading" @click="runRetag(true)">全量重打</button>
       <button class="btn" :disabled="loading" @click="runRebuild">重建索引</button>
     </div>
 
