@@ -105,15 +105,32 @@ def catalog(
     season: str | None = None,
     color: str | None = None,
     fit: str | None = None,
+    group: str | None = None,
+    exclude_samples: bool = True,
+    q: str | None = None,
 ) -> dict[str, Any]:
+    records = load_catalog()
+    if exclude_samples:
+        records = [r for r in records if r.source.source_type != "sample"]
+    group_map = {
+        "上衣": {"毛衣", "衬衫", "连衣裙", "套装"},
+        "下装": {"裤装", "半裙"},
+        "外套": {"外套"},
+    }
+    if group and group != "全部" and group in group_map:
+        allowed = group_map[group]
+        records = [r for r in records if r.tags.品类 in allowed]
     records = filter_records(
-        load_catalog(),
+        records,
         category=category,
         style=style,
         season=season,
         color=color,
         fit=fit,
     )
+    if q and q.strip():
+        needle = q.strip().lower()
+        records = [r for r in records if needle in r.search_text().lower()]
     return {"count": len(records), "items": [_serialize(r) for r in records]}
 
 

@@ -57,11 +57,13 @@ export function getFilters() {
   return request<FilterMeta>('/api/meta/filters')
 }
 
-export function getCatalog(params: Record<string, string>) {
+export function getCatalog(params: Record<string, string | boolean>) {
   const qs = new URLSearchParams()
   Object.entries(params).forEach(([k, v]) => {
-    if (v && v !== '全部') qs.set(k, v)
+    if (v === undefined || v === null || v === '' || v === '全部') return
+    qs.set(k, String(v))
   })
+  if (!('exclude_samples' in params)) qs.set('exclude_samples', 'true')
   const suffix = qs.toString() ? `?${qs}` : ''
   return request<{ count: number; items: CatalogItem[] }>(`/api/catalog${suffix}`)
 }

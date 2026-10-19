@@ -25,7 +25,7 @@ const current = computed(() => items.value.find((x) => x.id === selectedId.value
 
 onMounted(async () => {
   Object.assign(meta, await getFilters())
-  const data = await getCatalog({})
+  const data = await getCatalog({ exclude_samples: true })
   items.value = data.items
   if (items.value.length) selectedId.value = items.value[0].id
 })
