@@ -197,16 +197,55 @@ def extract_from_pptx(path: Path, out_dir: Path) -> list[ImageRecord]:
 
 
 def extract_from_xlsx(path: Path, out_dir: Path) -> list[ImageRecord]:
-    """Extract images from xlsx via openpyxl when possible, else zip media."""
+    """Extract images from xlsx; prefer sheet-level images so location keeps Sheet 名."""
     records: list[ImageRecord] = []
     stem = _safe_stem(path.stem)
     wb = load_workbook(str(path))
+    image_idx = 0
 
-    # openpyxl >= 3.x exposes workbook._images in some builds; prefer zip fallback
-    # for reliable embedded media extraction across versions.
-    wb.close()
+    try:
+        for sheet in wb.worksheets:
+            images = list(getattr(sheet, "_images", []) or [])
+            for img in images:
+                try:
+                    content = img._data()  # noqa: SLF001 - openpyxl private but stable enough for MVP
+                except Exception:
+                    continue
+                image_idx += 1
+                saved = _save_image_bytes(
+                    content,
+                    out_dir,
+                    f"{stem}_{_safe_stem(sheet.title)}_{image_idx:02d}",
+                    preferred_suffix=".png",
+                )
+                if saved is None:
+                    continue
+                records.append(
+                    ImageRecord(
+                        image_path=str(saved.resolve()),
+                        source=SourceMeta(
+                            source_file=path.name,
+                            source_type="xlsx",
+                            location=sheet.title,
+                        ),
+                    )
+                )
+    finally:
+        wb.close()
 
+    if records:
+        return records
+
+    # Fallback: zip media when sheet._images is empty (some exporters).
     with zipfile.ZipFile(path) as zf:
+        sheet_names = []
+        try:
+            wb2 = load_workbook(str(path), read_only=True)
+            sheet_names = list(wb2.sheetnames)
+            wb2.close()
+        except Exception:
+            sheet_names = ["Sheet"]
+
         media_names = [
             name
             for name in zf.namelist()
@@ -222,13 +261,15 @@ def extract_from_xlsx(path: Path, out_dir: Path) -> list[ImageRecord]:
             )
             if saved is None:
                 continue
+            # Best-effort sheet label when drawing→sheet map is unavailable.
+            sheet_guess = sheet_names[(idx - 1) % len(sheet_names)]
             records.append(
                 ImageRecord(
                     image_path=str(saved.resolve()),
                     source=SourceMeta(
                         source_file=path.name,
                         source_type="xlsx",
-                        location=f"xl/media ({Path(name).name})",
+                        location=f"{sheet_guess} / {Path(name).name}",
                     ),
                 )
             )

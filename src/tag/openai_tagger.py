@@ -69,8 +69,12 @@ def _extract_json(text: str) -> dict:
 
 
 def _coerce_tags(data: dict) -> FashionTags:
+    from src.schema import normalize_category
+
     def pick(key: str, default: str = "其他") -> str:
         value = str(data.get(key, default) or default).strip()
+        if key == "品类":
+            return normalize_category(value)
         allowed = _ENUMS[key]
         return value if value in allowed else default
 
@@ -92,7 +96,7 @@ def _coerce_tags(data: dict) -> FashionTags:
         袖型=pick("袖型"),
         细节元素=details,
         一句话描述=description,
-    )
+    ).normalized()
 
 
 class OpenAITagger:

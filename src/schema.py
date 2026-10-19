@@ -1,4 +1,4 @@
-"""Shared tag schema and record models for the fashion image library."""
+"""Shared tag schema and record models — aligned to docs/mvp-requirements.md."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-
-CATEGORY = ["毛衣", "外套", "连衣裙", "衬衫", "T恤", "裤装", "半裙", "套装", "马甲", "其他"]
+# Section 4 draft taxonomy from the MVP requirements doc.
+CATEGORY = ["毛衣", "外套", "连衣裙", "衬衫", "裤装", "半裙", "套装", "其他"]
 STYLE = ["极简", "复古", "甜美", "通勤", "工装", "法式", "休闲", "其他"]
 SEASON = ["春", "夏", "秋", "冬", "四季"]
 FIT = ["修身", "宽松", "直筒", "廓形", "其他"]
@@ -17,6 +17,14 @@ COLOR = ["黑色", "白色", "灰色", "米色", "蓝色", "红色", "其他"]
 NECKLINE = ["圆领", "V领", "高领", "翻领", "无领", "其他"]
 SLEEVE = ["长袖", "短袖", "无袖", "泡泡袖", "其他"]
 DETAILS = ["开襟", "拉链", "口袋", "刺绣", "印花", "拼接", "其他"]
+
+# Legacy values from earlier trials → map back to the MD draft.
+CATEGORY_ALIASES = {
+    "T恤": "衬衫",
+    "马甲": "外套",
+    "针织开衫": "毛衣",
+    "羽绒服": "外套",
+}
 
 FILTER_FIELDS = {
     "品类": CATEGORY,
@@ -27,6 +35,12 @@ FILTER_FIELDS = {
     "领型": NECKLINE,
     "袖型": SLEEVE,
 }
+
+
+def normalize_category(value: str) -> str:
+    value = (value or "其他").strip()
+    value = CATEGORY_ALIASES.get(value, value)
+    return value if value in CATEGORY else "其他"
 
 
 class FashionTags(BaseModel):
@@ -40,11 +54,25 @@ class FashionTags(BaseModel):
     细节元素: list[str] = Field(default_factory=list)
     一句话描述: str = ""
 
+    def normalized(self) -> "FashionTags":
+        detail_set = set(DETAILS)
+        return FashionTags(
+            品类=normalize_category(self.品类),
+            风格=self.风格 if self.风格 in STYLE else "其他",
+            季节=self.季节 if self.季节 in SEASON else "其他",
+            版型=self.版型 if self.版型 in FIT else "其他",
+            颜色主色调=self.颜色主色调 if self.颜色主色调 in COLOR else "其他",
+            领型=self.领型 if self.领型 in NECKLINE else "其他",
+            袖型=self.袖型 if self.袖型 in SLEEVE else "其他",
+            细节元素=[d for d in self.细节元素 if d in detail_set],
+            一句话描述=self.一句话描述.strip(),
+        )
+
 
 class SourceMeta(BaseModel):
     source_file: str
     source_type: str  # pptx | xlsx | pdf | upload | sample
-    location: str  # e.g. "slide 3" or "Sheet1!A1"
+    location: str  # e.g. "slide 3" / "Sheet1" / "page 2"
     extracted_at: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -55,7 +83,7 @@ class ImageRecord(BaseModel):
     image_path: str
     source: SourceMeta
     tags: FashionTags = Field(default_factory=FashionTags)
-    tags_source: str = "untagged"  # mock | api | manual | untagged
+    tags_source: str = "untagged"  # mock | openai | manual | untagged
     manually_edited: bool = False
     created_at: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()

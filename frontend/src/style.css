@@ -261,13 +261,13 @@ a {
 }
 
 .btn.primary {
-  background: var(--ink);
+  background: #2f2e2b;
   color: #faf9f5;
-  border-color: var(--ink);
+  border-color: #2f2e2b;
 }
 
 .btn.primary:hover {
-  background: #2a2a28;
+  background: #1f1e1c;
 }
 
 .btn:disabled {
@@ -284,28 +284,29 @@ a {
 .grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 28px 18px;
+  gap: 36px 22px;
 }
 
 .card {
   display: grid;
-  gap: 10px;
+  gap: 8px;
 }
 
 .card img {
   width: 100%;
   aspect-ratio: 3 / 4;
   object-fit: cover;
-  border-radius: 12px;
+  border-radius: 16px;
   background: #efeee9;
 }
 
 .card h3 {
   margin: 0;
-  font-size: 0.9rem;
+  font-size: 0.88rem;
   font-weight: 500;
   letter-spacing: -0.01em;
   line-height: 1.35;
+  color: #3a3935;
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
@@ -314,8 +315,8 @@ a {
 
 .card .sub {
   margin: 0;
-  color: var(--muted);
-  font-size: 0.8rem;
+  color: #9a9890;
+  font-size: 0.75rem;
 }
 
 .empty,
@@ -351,7 +352,13 @@ a {
 .form-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
+  gap: 16px 14px;
+}
+
+.form-grid .field select,
+.form-grid .field input,
+.form-grid .field textarea {
+  border-color: rgba(20, 20, 19, 0.06);
 }
 
 .form-grid .wide {
