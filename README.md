@@ -1,14 +1,16 @@
 # 服装内部图片库（MVP）
 
-把散落在 PPT / Excel 里的女装款式图抽取、打标、入库，支持文字搜索与以图搜图。第一版面向内部设计师/业务员试用。
+把散落在 PPT / Excel / PDF 里的女装款式图抽取、打标、入库，支持文字搜索与以图搜图。
+
+当前界面：**Vue 3 + Vite**；后端：**FastAPI**（复用 `src/` 抽图、打标、检索逻辑）。Streamlit 版仍保留在 `app/streamlit_app.py` 作为备选。
 
 ## 功能
 
-- 从 `.pptx` / `.xlsx` / `.pdf` 批量抽图，保留来源（文件名、页码 / media 名）
+- 从 `.pptx` / `.xlsx` / `.pdf` 批量抽图，保留来源
 - 自动打标：优先 **GPT-4o-mini**（需 `OPENAI_API_KEY`）；无 key 时回退 Mock
 - 目录浏览 + 筛选
-- 文字语义搜索 / 以图搜图（本地轻量向量 + FAISS；后续可换 CLIP）
-- 人工修正标签入口
+- 文字搜索 / 以图搜图
+- 人工修正标签
 
 ## 快速开始
 
@@ -17,55 +19,51 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# 配置 OpenAI（GPT-4o-mini 打标）
 cp .env.example .env
 # 编辑 .env，填入 OPENAI_API_KEY=sk-...
 
-# 可选：生成 6 张演示样本并建索引
-python scripts/seed_sample_catalog.py
+# 终端 1：API
+uvicorn api.main:app --host 0.0.0.0 --port 8520 --reload
 
-# 对已入库图片用 GPT-4o-mini 重打标
-python scripts/retag_with_openai.py --pdf-only
-
-# 启动界面（默认示例端口）
-streamlit run app/streamlit_app.py --server.port 8517 --server.address 0.0.0.0
+# 终端 2：Vue 前端
+cd frontend
+npm install
+npm run dev
 ```
 
-浏览器打开 <http://127.0.0.1:8517>。
+打开前端：<http://127.0.0.1:8518>  
+API 文档：<http://127.0.0.1:8520/docs>
+
+可选：对已入库 PDF 图重打标
+
+```bash
+python scripts/retag_with_openai.py --pdf-only
+```
 
 ## 目录结构
 
 ```
-├── app/streamlit_app.py      # 界面
+├── api/main.py               # FastAPI
+├── frontend/                 # Vue 3 + Vite
+├── app/streamlit_app.py      # 旧 Streamlit 界面（可选）
 ├── data/
-│   ├── raw/                  # 原始 PPT / Excel
-│   ├── extracted/            # 抽出的图片
-│   └── processed/            # catalog.json + FAISS 索引
-├── prompts/tagging_prompt.md # 打标提示词草稿（给未来 API 用）
-├── scripts/seed_sample_catalog.py
-├── src/
-│   ├── extract/              # python-pptx / openpyxl 抽图
-│   ├── tag/                  # Mock 打标（API 占位已留）
-│   ├── index/                # 向量索引
-│   └── search/               # 文字搜 / 以图搜图
-└── docs/mvp-requirements.md  # 原始需求与技术方案
+│   ├── raw/
+│   ├── extracted/
+│   └── processed/
+├── prompts/tagging_prompt.md
+├── scripts/
+└── src/                      # extract / tag / index / search
 ```
-
-## 使用流程
-
-1. 在「导入与处理」上传 PPT/Excel，或把文件放到 `data/raw/`
-2. 点击「抽取图片」（会自动 Mock 打标并建索引）
-3. 在「图片库」浏览筛选；在「检索」做文字搜或以图搜图
-4. 在「人工修正」改标签（会标记为 manual，重建索引）
 
 ## 技术说明
 
-| 模块 | 当前实现 | 后续可替换 |
-|------|----------|------------|
-| 抽图 | `python-pptx` + `openpyxl` + `pymupdf` | SlideSpeak CLI 等 |
-| 打标 | GPT-4o-mini（`OPENAI_API_KEY`） | Claude / Qwen-VL / product-tagger；无 key 时 Mock |
-| 向量 | local-lite（颜色+纹理哈希）+ FAISS | CLIP / SigLIP |
-| 界面 | Streamlit | FastAPI + 前端 |
+| 模块 | 当前实现 |
+|------|----------|
+| 前端 | Vue 3 + Vue Router + Vite |
+| API | FastAPI |
+| 抽图 | python-pptx / openpyxl / pymupdf |
+| 打标 | GPT-4o-mini |
+| 检索 | local-lite 向量 + FAISS；文字检索含词表匹配 |
 
 ## 本期不做
 

@@ -6,6 +6,8 @@ venv/
 .env
 .DS_Store
 .streamlit/secrets.toml
+node_modules/
+frontend/dist/
 
 # Generated runtime data (keep directory structure via .gitkeep)
 data/raw/*
