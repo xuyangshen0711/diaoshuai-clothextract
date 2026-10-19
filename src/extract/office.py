@@ -32,11 +32,32 @@ def _unique_path(directory: Path, stem: str, suffix: str, content: bytes) -> Pat
     return candidate
 
 
+def _apply_pdf_orientation(image: Image.Image, transform: tuple | list | None) -> Image.Image:
+    """Match on-page orientation. Many lookbook PDFs store images with a Y flip."""
+    if not transform or len(transform) < 4:
+        return image
+    a, b, c, d = (float(transform[0]), float(transform[1]), float(transform[2]), float(transform[3]))
+    # Axis-aligned cases only (typical for exported PPT/PDF lookbooks).
+    if abs(b) > 1e-3 or abs(c) > 1e-3:
+        return image
+    flip_h = a < 0
+    flip_v = d < 0
+    if flip_h and flip_v:
+        return image.transpose(Image.Transpose.ROTATE_180)
+    if flip_v:
+        return image.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+    if flip_h:
+        return image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+    return image
+
+
 def _save_image_bytes(
     content: bytes,
     out_dir: Path,
     stem: str,
     preferred_suffix: str = ".png",
+    transform: tuple | list | None = None,
+    overwrite: bool = False,
 ) -> Path | None:
     try:
         image = Image.open(io.BytesIO(content))
@@ -47,27 +68,38 @@ def _save_image_bytes(
     if min(image.size) < MIN_IMAGE_SIDE or (image.size[0] * image.size[1]) < MIN_IMAGE_PIXELS:
         return None
 
-    fmt = (image.format or "PNG").upper()
-    suffix = {
-        "JPEG": ".jpg",
-        "JPG": ".jpg",
-        "PNG": ".png",
-        "WEBP": ".webp",
-        "GIF": ".gif",
-        "BMP": ".bmp",
-    }.get(fmt, preferred_suffix)
+    original_fmt = (image.format or "").upper()
+    image = _apply_pdf_orientation(image, transform)
+    # Bake EXIF orientation if present, then drop orientation tag.
+    try:
+        from PIL import ImageOps
+
+        image = ImageOps.exif_transpose(image) or image
+    except Exception:
+        pass
+
+    suffix = preferred_suffix if preferred_suffix.startswith(".") else f".{preferred_suffix}"
+    if suffix.lower() not in IMAGE_SUFFIXES:
+        fmt = original_fmt or "PNG"
+        suffix = {
+            "JPEG": ".jpg",
+            "JPG": ".jpg",
+            "PNG": ".png",
+            "WEBP": ".webp",
+            "GIF": ".gif",
+            "BMP": ".bmp",
+        }.get(fmt, ".png")
 
     if image.mode not in ("RGB", "RGBA"):
         image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
 
     path = _unique_path(out_dir, stem, suffix, content)
-    if path.exists():
+    if path.exists() and not overwrite:
         return path
 
-    save_kwargs = {}
     if suffix in {".jpg", ".jpeg"} and image.mode == "RGBA":
         image = image.convert("RGB")
-    image.save(path, **save_kwargs)
+    image.save(path)
     return path
 
 
@@ -81,6 +113,13 @@ def extract_from_pdf(path: Path, out_dir: Path) -> list[ImageRecord]:
     try:
         for page_idx in range(doc.page_count):
             page = doc[page_idx]
+            transform_by_xref: dict[int, tuple] = {}
+            for info in page.get_image_info(xrefs=True):
+                xref = info.get("xref")
+                transform = info.get("transform")
+                if xref is not None and transform is not None:
+                    transform_by_xref[int(xref)] = tuple(transform)
+
             images = page.get_images(full=True)
             image_idx = 0
             for img in images:
@@ -102,6 +141,8 @@ def extract_from_pdf(path: Path, out_dir: Path) -> list[ImageRecord]:
                     out_dir,
                     f"{stem}_page{page_idx + 1}_{image_idx:02d}",
                     preferred_suffix=ext,
+                    transform=transform_by_xref.get(xref),
+                    overwrite=True,
                 )
                 if saved is None:
                     continue
