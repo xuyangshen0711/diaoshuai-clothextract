@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.DS_Store
+.streamlit/secrets.toml
+
+# Generated runtime data (keep directory structure via .gitkeep)
+data/raw/*
+!data/raw/.gitkeep
+data/extracted/*
+!data/extracted/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Local uploads mirror (requirements doc lives under docs/)
+uploads/
