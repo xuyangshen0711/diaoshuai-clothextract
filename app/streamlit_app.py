@@ -24,7 +24,7 @@ from src.extract.office import extract_from_directory, extract_from_file  # noqa
 from src.index.embeddings import build_index  # noqa: E402
 from src.schema import FILTER_FIELDS, FashionTags, ImageRecord  # noqa: E402
 from src.search.query import filter_records, search_by_image, search_by_text  # noqa: E402
-from src.tag.tagger import tag_records  # noqa: E402
+from src.tag.tagger import has_openai_key, tag_records  # noqa: E402
 
 st.set_page_config(
     page_title="服装内部图片库",
@@ -134,9 +134,23 @@ def page_search() -> None:
 
 def page_import() -> None:
     st.subheader("导入与处理")
+    api_ready = has_openai_key()
+    default_backend = "openai" if api_ready else "mock"
     st.markdown(
-        "支持 `.pptx` / `.xlsx` / `.pdf`。抽取后会用 **Mock 打标**（本地启发式，无需 API），"
-        "再写入目录并可选重建 FAISS 索引。"
+        "支持 `.pptx` / `.xlsx` / `.pdf`。"
+        f"当前默认打标：**{'GPT-4o-mini' if api_ready else 'Mock（未检测到 OPENAI_API_KEY）'}**。"
+    )
+    if not api_ready:
+        st.warning(
+            "尚未配置 `OPENAI_API_KEY`。请在项目根目录 `.env` 写入 key 后重启应用，"
+            "或先用 Mock / 人工修正。"
+        )
+
+    backend = st.selectbox(
+        "打标后端",
+        ["openai", "mock"],
+        index=0 if default_backend == "openai" else 1,
+        format_func=lambda x: "GPT-4o-mini（推荐）" if x == "openai" else "Mock 本地启发式",
     )
 
     uploaded = st.file_uploader(
@@ -144,13 +158,15 @@ def page_import() -> None:
         type=["pptx", "xlsx", "xlsm", "pdf"],
         accept_multiple_files=True,
     )
-    col_a, col_b, col_c = st.columns(3)
+    col_a, col_b, col_c, col_d = st.columns(4)
 
     with col_a:
-        run_extract = st.button("抽取图片", type="primary", use_container_width=True)
+        run_extract = st.button("抽取并打标", type="primary", use_container_width=True)
     with col_b:
-        run_tag = st.button("对未打标项执行 Mock 打标", use_container_width=True)
+        run_tag = st.button("API 重打未确认项", use_container_width=True)
     with col_c:
+        run_retag_all = st.button("API 全量重打标", use_container_width=True)
+    with col_d:
         run_index = st.button("重建索引", use_container_width=True)
 
     if run_extract:
@@ -172,20 +188,70 @@ def page_import() -> None:
             if not new_records:
                 st.warning("未抽到图片。请确认文件内含嵌入图。")
             else:
-                tagged = tag_records(new_records, backend="mock")
-                merged = upsert_records(load_catalog(), tagged)
-                save_catalog(merged)
-                build_index(merged)
-                st.success(f"抽取并打标 {len(tagged)} 张，目录现有 {len(merged)} 条，索引已更新。")
+                if backend == "openai" and not has_openai_key():
+                    st.error("缺少 OPENAI_API_KEY。")
+                else:
+                    progress = st.progress(0.0, text="打标中…")
+
+                    def on_progress(idx, total, record, skipped=False):
+                        progress.progress(idx / max(total, 1), text=f"打标 {idx}/{total}")
+
+                    tagged = tag_records(
+                        new_records,
+                        backend=backend,
+                        overwrite=True,
+                        progress_callback=on_progress,
+                    )
+                    merged = upsert_records(load_catalog(), tagged)
+                    save_catalog(merged)
+                    build_index(merged)
+                    st.success(
+                        f"抽取并打标 {len(tagged)} 张（{backend}），目录现有 {len(merged)} 条。"
+                    )
 
     if run_tag:
         catalog = load_catalog()
         if not catalog:
             st.warning("目录为空。")
+        elif backend == "openai" and not has_openai_key():
+            st.error("缺少 OPENAI_API_KEY。")
         else:
-            tagged = tag_records(catalog, backend="mock", overwrite=False)
+            progress = st.progress(0.0, text="打标中…")
+
+            def on_progress(idx, total, record, skipped=False):
+                progress.progress(idx / max(total, 1), text=f"打标 {idx}/{total}")
+
+            tagged = tag_records(
+                catalog,
+                backend=backend,
+                overwrite=False,
+                progress_callback=on_progress,
+            )
             save_catalog(tagged)
-            st.success("Mock 打标完成。")
+            build_index(tagged)
+            st.success("已对未确认项完成打标。")
+
+    if run_retag_all:
+        catalog = load_catalog()
+        if not catalog:
+            st.warning("目录为空。")
+        elif backend == "openai" and not has_openai_key():
+            st.error("缺少 OPENAI_API_KEY。")
+        else:
+            progress = st.progress(0.0, text="全量重打标…")
+
+            def on_progress(idx, total, record, skipped=False):
+                progress.progress(idx / max(total, 1), text=f"重打标 {idx}/{total}")
+
+            tagged = tag_records(
+                catalog,
+                backend=backend,
+                overwrite=True,
+                progress_callback=on_progress,
+            )
+            save_catalog(tagged)
+            build_index(tagged)
+            st.success("全量重打标完成（已跳过逻辑：人工修正项也会被覆盖）。")
 
     if run_index:
         catalog = load_catalog()
@@ -254,17 +320,18 @@ def page_edit() -> None:
 
 def main() -> None:
     st.title("服装内部图片库")
-    st.caption("MVP：PPT/Excel 抽图 · Mock 打标 · 文字搜 / 以图搜图 · 人工修正")
+    st.caption("MVP：PPT/Excel/PDF 抽图 · GPT-4o-mini 打标 · 文字搜 / 以图搜图 · 人工修正")
 
     page = st.sidebar.radio(
         "功能",
         ["图片库", "检索", "导入与处理", "人工修正"],
     )
     st.sidebar.markdown("---")
+    api_ready = has_openai_key()
     st.sidebar.markdown(
-        "**打标后端**：Mock（本地）  \n"
-        "**向量后端**：local-lite（可换成 CLIP）  \n"
-        "API 接入后续再做。"
+        f"**打标后端**：{'GPT-4o-mini ✅' if api_ready else '未配置 API Key'}  \n"
+        "**向量后端**：local-lite  \n"
+        "Key 放在项目根目录 `.env`。"
     )
 
     if page == "图片库":

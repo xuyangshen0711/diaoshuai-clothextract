@@ -1,12 +1,17 @@
-"""Image tagging backends. MVP ships with a local mock; API backends later."""
+"""Image tagging backends: mock heuristics and OpenAI GPT-4o-mini."""
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
+from dotenv import load_dotenv
 from PIL import Image
 
 from src.schema import COLOR, FashionTags, ImageRecord
+
+ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(ROOT / ".env")
 
 
 def _dominant_color_name(image_path: Path) -> str:
@@ -38,7 +43,7 @@ def _dominant_color_name(image_path: Path) -> str:
 
 
 class MockTagger:
-    """Heuristic placeholder until multimodal API is wired."""
+    """Heuristic fallback when API key is unavailable."""
 
     name = "mock"
 
@@ -48,7 +53,6 @@ class MockTagger:
         if color not in COLOR:
             color = "其他"
 
-        # Mild filename hints for sample assets.
         name_lower = path.stem.lower()
         category = "其他"
         style = "休闲"
@@ -65,6 +69,7 @@ class MockTagger:
             "shirt": ("衬衫", "极简", "春", "直筒", "翻领", "长袖", ["开襟"]),
             "pants": ("裤装", "工装", "四季", "直筒", "无领", "无袖", ["口袋"]),
             "skirt": ("半裙", "甜美", "夏", "修身", "无领", "无袖", ["拼接"]),
+            "vest": ("马甲", "休闲", "秋", "宽松", "无领", "无袖", ["口袋"]),
         }
         for key, values in hints.items():
             if key in name_lower:
@@ -89,41 +94,43 @@ class MockTagger:
         )
 
 
-class ApiTaggerPlaceholder:
-    """Reserved for OpenAI / Claude / Qwen-VL. Not active in MVP skeleton."""
-
-    name = "api"
-
-    def __init__(self, provider: str = "openai") -> None:
-        self.provider = provider
-
-    def tag(self, image_path: str | Path) -> FashionTags:
-        raise NotImplementedError(
-            "API tagging is intentionally deferred. "
-            "Set TAGGER_BACKEND=mock for now, or implement ApiTagger later."
-        )
-
-
-def get_tagger(backend: str = "mock"):
-    if backend == "mock":
+def get_tagger(backend: str | None = None):
+    choice = (backend or os.getenv("TAGGER_BACKEND", "openai")).lower()
+    if choice == "mock":
         return MockTagger()
-    if backend == "api":
-        return ApiTaggerPlaceholder()
-    raise ValueError(f"Unknown tagger backend: {backend}")
+    if choice in {"api", "openai", "gpt", "gpt-4o-mini"}:
+        from src.tag.openai_tagger import OpenAITagger
+
+        return OpenAITagger()
+    raise ValueError(f"Unknown tagger backend: {choice}")
 
 
 def tag_records(
     records: list[ImageRecord],
-    backend: str = "mock",
+    backend: str | None = None,
     overwrite: bool = False,
+    progress_callback=None,
 ) -> list[ImageRecord]:
     tagger = get_tagger(backend)
-    for record in records:
+    total = len(records)
+    for idx, record in enumerate(records, start=1):
         if record.manually_edited and not overwrite:
+            if progress_callback:
+                progress_callback(idx, total, record, skipped=True)
             continue
-        if record.tags_source not in {"untagged", "mock"} and not overwrite:
+        # Without overwrite: only fill untagged / mock placeholders.
+        if not overwrite and record.tags_source not in {"untagged", "mock"}:
+            if progress_callback:
+                progress_callback(idx, total, record, skipped=True)
             continue
         record.tags = tagger.tag(record.image_path)
         record.tags_source = tagger.name
         record.touch()
+        if progress_callback:
+            progress_callback(idx, total, record, skipped=False)
     return records
+
+
+def has_openai_key() -> bool:
+    load_dotenv(ROOT / ".env")
+    return bool(os.getenv("OPENAI_API_KEY"))

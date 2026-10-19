@@ -5,7 +5,7 @@
 ## 功能
 
 - 从 `.pptx` / `.xlsx` / `.pdf` 批量抽图，保留来源（文件名、页码 / media 名）
-- Mock 自动打标（品类、风格、季节、版型、颜色等；**暂不调用商业 API**）
+- 自动打标：优先 **GPT-4o-mini**（需 `OPENAI_API_KEY`）；无 key 时回退 Mock
 - 目录浏览 + 筛选
 - 文字语义搜索 / 以图搜图（本地轻量向量 + FAISS；后续可换 CLIP）
 - 人工修正标签入口
@@ -17,8 +17,15 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
+# 配置 OpenAI（GPT-4o-mini 打标）
+cp .env.example .env
+# 编辑 .env，填入 OPENAI_API_KEY=sk-...
+
 # 可选：生成 6 张演示样本并建索引
 python scripts/seed_sample_catalog.py
+
+# 对已入库图片用 GPT-4o-mini 重打标
+python scripts/retag_with_openai.py --pdf-only
 
 # 启动界面（默认示例端口）
 streamlit run app/streamlit_app.py --server.port 8517 --server.address 0.0.0.0
@@ -56,7 +63,7 @@ streamlit run app/streamlit_app.py --server.port 8517 --server.address 0.0.0.0
 | 模块 | 当前实现 | 后续可替换 |
 |------|----------|------------|
 | 抽图 | `python-pptx` + `openpyxl` + `pymupdf` | SlideSpeak CLI 等 |
-| 打标 | `MockTagger` 本地启发式 | OpenAI / Claude / Qwen-VL / product-tagger |
+| 打标 | GPT-4o-mini（`OPENAI_API_KEY`） | Claude / Qwen-VL / product-tagger；无 key 时 Mock |
 | 向量 | local-lite（颜色+纹理哈希）+ FAISS | CLIP / SigLIP |
 | 界面 | Streamlit | FastAPI + 前端 |
 
