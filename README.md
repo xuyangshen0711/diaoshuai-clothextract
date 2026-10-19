@@ -4,7 +4,7 @@
 
 ## 功能
 
-- 从 `.pptx` / `.xlsx` 批量抽图，保留来源（文件名、页码 / media 名）
+- 从 `.pptx` / `.xlsx` / `.pdf` 批量抽图，保留来源（文件名、页码 / media 名）
 - Mock 自动打标（品类、风格、季节、版型、颜色等；**暂不调用商业 API**）
 - 目录浏览 + 筛选
 - 文字语义搜索 / 以图搜图（本地轻量向量 + FAISS；后续可换 CLIP）
@@ -55,7 +55,7 @@ streamlit run app/streamlit_app.py --server.port 8517 --server.address 0.0.0.0
 
 | 模块 | 当前实现 | 后续可替换 |
 |------|----------|------------|
-| 抽图 | `python-pptx` + `openpyxl` / zip media | SlideSpeak CLI 等 |
+| 抽图 | `python-pptx` + `openpyxl` + `pymupdf` | SlideSpeak CLI 等 |
 | 打标 | `MockTagger` 本地启发式 | OpenAI / Claude / Qwen-VL / product-tagger |
 | 向量 | local-lite（颜色+纹理哈希）+ FAISS | CLIP / SigLIP |
 | 界面 | Streamlit | FastAPI + 前端 |

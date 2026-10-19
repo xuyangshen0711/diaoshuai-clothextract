@@ -135,13 +135,13 @@ def page_search() -> None:
 def page_import() -> None:
     st.subheader("导入与处理")
     st.markdown(
-        "支持 `.pptx` / `.xlsx`。抽取后会用 **Mock 打标**（本地启发式，无需 API），"
+        "支持 `.pptx` / `.xlsx` / `.pdf`。抽取后会用 **Mock 打标**（本地启发式，无需 API），"
         "再写入目录并可选重建 FAISS 索引。"
     )
 
     uploaded = st.file_uploader(
-        "上传 PPT / Excel",
-        type=["pptx", "xlsx", "xlsm"],
+        "上传 PPT / Excel / PDF",
+        type=["pptx", "xlsx", "xlsm", "pdf"],
         accept_multiple_files=True,
     )
     col_a, col_b, col_c = st.columns(3)
@@ -154,7 +154,12 @@ def page_import() -> None:
         run_index = st.button("重建索引", use_container_width=True)
 
     if run_extract:
-        if not uploaded and not list(RAW_DIR.glob("*.pptx")) and not list(RAW_DIR.glob("*.xlsx")):
+        if (
+            not uploaded
+            and not list(RAW_DIR.glob("*.pptx"))
+            and not list(RAW_DIR.glob("*.xlsx"))
+            and not list(RAW_DIR.glob("*.pdf"))
+        ):
             st.warning("请先上传文件，或把文件放到 `data/raw/`。")
         else:
             new_records: list[ImageRecord] = []

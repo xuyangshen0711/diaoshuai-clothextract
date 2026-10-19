@@ -1,4 +1,4 @@
-"""Extract embedded images from PPTX / XLSX with source metadata."""
+"""Extract embedded images from PPTX / XLSX / PDF with source metadata."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import io
 import zipfile
 from pathlib import Path
 
+import pymupdf
 from openpyxl import load_workbook
 from PIL import Image
 from pptx import Presentation
@@ -16,6 +17,9 @@ from src.catalog import EXTRACTED_DIR, ensure_data_dirs
 from src.schema import ImageRecord, SourceMeta
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+# Skip tiny icons / logos commonly embedded in lookbooks.
+MIN_IMAGE_SIDE = 120
+MIN_IMAGE_PIXELS = 20_000
 
 
 def _safe_stem(name: str) -> str:
@@ -40,6 +44,9 @@ def _save_image_bytes(
     except Exception:
         return None
 
+    if min(image.size) < MIN_IMAGE_SIDE or (image.size[0] * image.size[1]) < MIN_IMAGE_PIXELS:
+        return None
+
     fmt = (image.format or "PNG").upper()
     suffix = {
         "JPEG": ".jpg",
@@ -62,6 +69,55 @@ def _save_image_bytes(
         image = image.convert("RGB")
     image.save(path, **save_kwargs)
     return path
+
+
+def extract_from_pdf(path: Path, out_dir: Path) -> list[ImageRecord]:
+    """Extract embedded images from PDF via PyMuPDF."""
+    records: list[ImageRecord] = []
+    stem = _safe_stem(path.stem)
+    doc = pymupdf.open(path)
+    seen_xrefs: set[int] = set()
+
+    try:
+        for page_idx in range(doc.page_count):
+            page = doc[page_idx]
+            images = page.get_images(full=True)
+            image_idx = 0
+            for img in images:
+                xref = img[0]
+                if xref in seen_xrefs:
+                    continue
+                seen_xrefs.add(xref)
+                try:
+                    extracted = doc.extract_image(xref)
+                except Exception:
+                    continue
+                content = extracted.get("image")
+                if not content:
+                    continue
+                ext = f".{(extracted.get('ext') or 'png').lstrip('.')}"
+                image_idx += 1
+                saved = _save_image_bytes(
+                    content,
+                    out_dir,
+                    f"{stem}_page{page_idx + 1}_{image_idx:02d}",
+                    preferred_suffix=ext,
+                )
+                if saved is None:
+                    continue
+                records.append(
+                    ImageRecord(
+                        image_path=str(saved.resolve()),
+                        source=SourceMeta(
+                            source_file=path.name,
+                            source_type="pdf",
+                            location=f"page {page_idx + 1}",
+                        ),
+                    )
+                )
+    finally:
+        doc.close()
+    return records
 
 
 def extract_from_pptx(path: Path, out_dir: Path) -> list[ImageRecord]:
@@ -152,7 +208,9 @@ def extract_from_file(path: Path | str, out_dir: Path | None = None) -> list[Ima
         return extract_from_pptx(source, target)
     if suffix in {".xlsx", ".xlsm"}:
         return extract_from_xlsx(source, target)
-    raise ValueError(f"Unsupported file type: {suffix}. Use .pptx or .xlsx")
+    if suffix == ".pdf":
+        return extract_from_pdf(source, target)
+    raise ValueError(f"Unsupported file type: {suffix}. Use .pptx, .xlsx, or .pdf")
 
 
 def extract_from_directory(
@@ -169,6 +227,7 @@ def extract_from_directory(
             *root.glob("*.pptx"),
             *root.glob("*.xlsx"),
             *root.glob("*.xlsm"),
+            *root.glob("*.pdf"),
         ]
     )
     for file_path in files:
