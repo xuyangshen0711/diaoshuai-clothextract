@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from src.index.embeddings import EmbeddingBackend, load_index
+from src.index.embeddings import get_embedding_backend, load_index
 from src.schema import (
     CATEGORY,
     COLOR,
@@ -74,6 +74,10 @@ def _vector_rank(
         return []
 
     vec = np.asarray(query_vec, dtype=np.float32).reshape(1, -1)
+    if vec.shape[1] != index.d:
+        raise ValueError(
+            f"Query dim {vec.shape[1]} != index dim {index.d}. Please rebuild the index."
+        )
     scores, indices = index.search(vec, min(max(top_k * 5, top_k), len(ids)))
     by_id = {r.id: r for r in records}
     ranked: list[tuple[ImageRecord, float]] = []
@@ -101,7 +105,6 @@ def _query_terms(query: str) -> list[str]:
             terms.append(word.lower())
             remaining = remaining.replace(word.lower(), " ")
     terms.extend(_TOKEN_RE.findall(remaining))
-    # de-dupe, keep order
     seen: set[str] = set()
     ordered: list[str] = []
     for term in terms:
@@ -122,7 +125,12 @@ def _lexical_score(query: str, record: ImageRecord) -> float:
             hits += 1.0
             if token in record.tags.一句话描述:
                 hits += 0.5
-            if token in {record.tags.品类, record.tags.风格, record.tags.领型, record.tags.版型}:
+            if token in {
+                record.tags.品类,
+                record.tags.风格,
+                record.tags.领型,
+                record.tags.版型,
+            }:
                 hits += 0.75
     return hits / len(tokens)
 
@@ -131,23 +139,36 @@ def search_by_text(
     records: list[ImageRecord],
     query: str,
     top_k: int = 12,
-    backend: EmbeddingBackend | None = None,
+    backend=None,
     filtered: list[ImageRecord] | None = None,
 ) -> list[tuple[ImageRecord, float]]:
-    """Lexical-first text search (works well for Chinese tags without CLIP)."""
+    """CLIP text→image search, boosted by Chinese tag lexical matches."""
     query = query.strip()
     if not query:
         return []
-    backend = backend or EmbeddingBackend()
+    backend = backend or get_embedding_backend()
     pool = filtered if filtered is not None else records
+    candidate_ids = {r.id for r in pool}
+
+    # Primary: shared CLIP space (text query vs indexed image vectors).
+    try:
+        vector_hits = {
+            r.id: score
+            for r, score in _vector_rank(
+                records,
+                backend.encode_text(query),
+                top_k=max(top_k * 3, top_k),
+                candidate_ids=candidate_ids,
+            )
+        }
+    except Exception:
+        vector_hits = {}
 
     scored: list[tuple[ImageRecord, float]] = []
-    q_vec = backend.encode_text(query)
     for record in pool:
         lex = _lexical_score(query, record)
-        r_vec = backend.encode_text(record.search_text())
-        cos = float(np.dot(q_vec, r_vec))
-        score = lex * 2.0 + max(cos, 0.0) * 0.35
+        clip = max(vector_hits.get(record.id, 0.0), 0.0)
+        score = clip * 1.0 + lex * 1.25
         if score > 0:
             scored.append((record, score))
     scored.sort(key=lambda item: item[1], reverse=True)
@@ -158,10 +179,10 @@ def search_by_image(
     records: list[ImageRecord],
     image_path: str | Path,
     top_k: int = 12,
-    backend: EmbeddingBackend | None = None,
+    backend=None,
     filtered: list[ImageRecord] | None = None,
 ) -> list[tuple[ImageRecord, float]]:
-    backend = backend or EmbeddingBackend()
+    backend = backend or get_embedding_backend()
     pool = filtered if filtered is not None else records
     candidate_ids = {r.id for r in pool}
     return _vector_rank(

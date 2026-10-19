@@ -1,16 +1,21 @@
 # 服装内部图片库（MVP）
 
-把散落在 PPT / Excel / PDF 里的女装款式图抽取、打标、入库，支持文字搜索与以图搜图。
+按 `docs/mvp-requirements.md` 落地的女装内部图片库：从 PPT / Excel / PDF 抽图 → GPT-4o-mini 打标 → CLIP + FAISS 检索。
 
-当前界面：**Vue 3 + Vite**；后端：**FastAPI**（复用 `src/` 抽图、打标、检索逻辑）。Streamlit 版仍保留在 `app/streamlit_app.py` 作为备选。
+界面：**Vue 3 + Vite**；后端：**FastAPI**。Streamlit 仍保留在 `app/streamlit_app.py`。
 
-## 功能
+## 已实现（对照需求）
 
-- 从 `.pptx` / `.xlsx` / `.pdf` 批量抽图，保留来源
-- 自动打标：优先 **GPT-4o-mini**（需 `OPENAI_API_KEY`）；无 key 时回退 Mock
-- 目录浏览 + 筛选
-- 文字搜索 / 以图搜图
-- 人工修正标签
+| 需求 | 状态 |
+|------|------|
+| PPT / Excel 抽图 + 来源元数据 | ✅（额外支持 PDF） |
+| 自动打标（品类/风格/季节等） | ✅ GPT-4o-mini，严格 JSON |
+| 文字搜索 + 以图搜图 + 筛选 | ✅ CLIP 向量 + 中文标签加权 |
+| 可用界面 | ✅ Vue 3（文档也允许轻量 Web） |
+| 人工修正入口 | ✅ |
+| 优先复用开源 / 不自训模型 | ✅ python-pptx / openpyxl / pymupdf / CLIP / FAISS / OpenAI |
+
+标签体系以需求草稿为准，试用期补充了 `T恤`、`马甲`，便于区分上装。
 
 ## 快速开始
 
@@ -20,51 +25,38 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env
-# 编辑 .env，填入 OPENAI_API_KEY=sk-...
+# 填入 OPENAI_API_KEY=sk-...
 
-# 终端 1：API
-uvicorn api.main:app --host 0.0.0.0 --port 8520 --reload
+# 一键流水线：抽图 → 打标 → 建 CLIP 索引
+python scripts/run_pipeline.py --input data/raw --backend openai
 
-# 终端 2：Vue 前端
-cd frontend
-npm install
-npm run dev
+# API
+uvicorn api.main:app --host 0.0.0.0 --port 8520
+
+# Vue 前端
+cd frontend && npm install && npm run dev
 ```
 
-打开前端：<http://127.0.0.1:8518>  
-API 文档：<http://127.0.0.1:8520/docs>
-
-可选：对已入库 PDF 图重打标
-
-```bash
-python scripts/retag_with_openai.py --pdf-only
-```
+- 前端：<http://127.0.0.1:8518>
+- API 文档：<http://127.0.0.1:8520/docs>
 
 ## 目录结构
 
 ```
-├── api/main.py               # FastAPI
-├── frontend/                 # Vue 3 + Vite
-├── app/streamlit_app.py      # 旧 Streamlit 界面（可选）
-├── data/
-│   ├── raw/
-│   ├── extracted/
-│   └── processed/
+├── api/main.py
+├── frontend/                 # Vue 3
+├── app/streamlit_app.py      # 可选旧界面
+├── data/{raw,extracted,processed}
+├── docs/mvp-requirements.md
 ├── prompts/tagging_prompt.md
-├── scripts/
-└── src/                      # extract / tag / index / search
+├── scripts/{run_pipeline,retag_with_openai,seed_sample_catalog}.py
+└── src/{extract,tag,index,search}
 ```
 
-## 技术说明
+## 费用说明（GPT-4o-mini）
 
-| 模块 | 当前实现 |
-|------|----------|
-| 前端 | Vue 3 + Vue Router + Vite |
-| API | FastAPI |
-| 抽图 | python-pptx / openpyxl / pymupdf |
-| 打标 | GPT-4o-mini |
-| 检索 | local-lite 向量 + FAISS；文字检索含词表匹配 |
+当前配置下，约 **$0.0006 / 张**（≈ ¥0.004）。检索本身走本地 CLIP，不额外计费。
 
 ## 本期不做
 
-ERP 打通、外部爬虫、以图生款、复杂多用户权限。
+ERP、外部爬虫、以图生款、复杂多用户权限。

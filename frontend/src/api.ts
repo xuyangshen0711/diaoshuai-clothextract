@@ -44,7 +44,13 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export function getHealth() {
-  return request<{ ok: boolean; openai_ready: boolean; catalog_count: number }>('/api/health')
+  return request<{
+    ok: boolean
+    openai_ready: boolean
+    catalog_count: number
+    tagger?: string
+    embedding_backend?: string
+  }>('/api/health')
 }
 
 export function getFilters() {

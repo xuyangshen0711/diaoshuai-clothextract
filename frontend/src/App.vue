@@ -4,12 +4,14 @@ import { getHealth } from './api'
 
 const openaiReady = ref(false)
 const catalogCount = ref(0)
+const embeddingBackend = ref('…')
 
 onMounted(async () => {
   try {
     const health = await getHealth()
     openaiReady.value = health.openai_ready
     catalogCount.value = health.catalog_count
+    embeddingBackend.value = health.embedding_backend || 'unknown'
   } catch {
     /* backend may still be starting */
   }
@@ -22,7 +24,7 @@ onMounted(async () => {
       <div class="brand">
         <h1>服装内部图片库</h1>
         <p>
-          Vue 3 前端 · FastAPI · GPT-4o-mini 打标
+          Vue 3 · FastAPI · GPT-4o-mini · {{ embeddingBackend }}
           · {{ catalogCount }} 条
           · {{ openaiReady ? 'API 已就绪' : 'API 未配置' }}
         </p>

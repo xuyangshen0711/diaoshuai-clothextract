@@ -1,13 +1,15 @@
-"""Lightweight embedding + FAISS index for text and image similarity search.
+"""CLIP + FAISS embeddings for text and image search (MVP).
 
-Uses a local perceptual/color embedding so the MVP runs without downloading
-CLIP weights. Swap EmbeddingBackend.encode_* for CLIP later.
+Uses sentence-transformers CLIP when available; falls back to a local
+color/texture hasher so the app still runs offline.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+from functools import lru_cache
 from pathlib import Path
 
 import faiss
@@ -17,15 +19,20 @@ from PIL import Image
 from src.catalog import INDEX_DIR, ensure_data_dirs
 from src.schema import ImageRecord
 
-VECTOR_DIM = 96
 INDEX_FILE = "faiss.index"
 META_FILE = "meta.json"
+# Image tower + multilingual text tower share CLIP space (MD: CLIP + FAISS).
+CLIP_IMAGE_MODEL = os.getenv("CLIP_IMAGE_MODEL", "clip-ViT-B-32")
+CLIP_TEXT_MODEL = os.getenv(
+    "CLIP_TEXT_MODEL",
+    "sentence-transformers/clip-ViT-B-32-multilingual-v1",
+)
+LOCAL_DIM = 96
 
 
 def _gray_patch_features(image: Image.Image) -> np.ndarray:
     gray = image.convert("L").resize((8, 8), Image.Resampling.LANCZOS)
-    arr = np.asarray(gray, dtype=np.float32).flatten() / 255.0
-    return arr  # 64 dims
+    return np.asarray(gray, dtype=np.float32).flatten() / 255.0
 
 
 def _color_histogram(image: Image.Image) -> np.ndarray:
@@ -35,17 +42,16 @@ def _color_histogram(image: Image.Image) -> np.ndarray:
     for channel in range(3):
         h, _ = np.histogram(arr[:, :, channel], bins=8, range=(0, 255), density=True)
         hist.append(h.astype(np.float32))
-    return np.concatenate(hist)  # 24 dims
+    return np.concatenate(hist)
 
 
-def _image_vector(path: Path) -> np.ndarray:
+def _local_image_vector(path: Path) -> np.ndarray:
     image = Image.open(path).convert("RGB")
     vec = np.concatenate([_gray_patch_features(image), _color_histogram(image)])
-    # pad/truncate to VECTOR_DIM
-    if vec.shape[0] < VECTOR_DIM:
-        vec = np.pad(vec, (0, VECTOR_DIM - vec.shape[0]))
+    if vec.shape[0] < LOCAL_DIM:
+        vec = np.pad(vec, (0, LOCAL_DIM - vec.shape[0]))
     else:
-        vec = vec[:VECTOR_DIM]
+        vec = vec[:LOCAL_DIM]
     norm = np.linalg.norm(vec)
     if norm > 0:
         vec = vec / norm
@@ -55,72 +61,131 @@ def _image_vector(path: Path) -> np.ndarray:
 _TOKEN_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]+")
 
 
-def _text_vector(text: str) -> np.ndarray:
-    """Bag-of-chars style hashing for Chinese/English MVP text search."""
-    vec = np.zeros(VECTOR_DIM, dtype=np.float32)
+def _local_text_vector(text: str) -> np.ndarray:
+    vec = np.zeros(LOCAL_DIM, dtype=np.float32)
     tokens = _TOKEN_RE.findall(text.lower())
     if not tokens:
         return vec
     for token in tokens:
         for i, ch in enumerate(token):
-            slot = hash(f"{ch}:{i % 3}") % VECTOR_DIM
+            slot = hash(f"{ch}:{i % 3}") % LOCAL_DIM
             vec[slot] += 1.0
-        slot2 = hash(token) % VECTOR_DIM
-        vec[slot2] += 1.5
+        vec[hash(token) % LOCAL_DIM] += 1.5
     norm = np.linalg.norm(vec)
     if norm > 0:
         vec = vec / norm
     return vec
 
 
-class EmbeddingBackend:
-    """Local lightweight backend. Replace with CLIP/SigLIP when ready."""
+@lru_cache(maxsize=1)
+def _load_clip_pair():
+    from sentence_transformers import SentenceTransformer
 
+    image_model = SentenceTransformer(CLIP_IMAGE_MODEL)
+    text_model = SentenceTransformer(CLIP_TEXT_MODEL)
+    return image_model, text_model
+
+
+class LocalLiteBackend:
     name = "local-lite"
+    dim = LOCAL_DIM
 
     def encode_image(self, image_path: str | Path) -> np.ndarray:
-        return _image_vector(Path(image_path))
+        return _local_image_vector(Path(image_path))
 
     def encode_text(self, text: str) -> np.ndarray:
-        return _text_vector(text)
+        return _local_text_vector(text)
 
     def encode_record(self, record: ImageRecord) -> np.ndarray:
-        # Index image vectors only so "以图搜图" matches the stored space.
-        # Text search uses lexical scoring over tags (see src/search/query.py).
         return self.encode_image(record.image_path)
+
+
+class ClipBackend:
+    """CLIP image + multilingual text towers in one shared space."""
+
+    name = "clip-multilingual"
+    dim = 512
+
+    def __init__(self) -> None:
+        self.image_model, self.text_model = _load_clip_pair()
+        probe = self.encode_text("probe")
+        self.dim = int(probe.shape[0])
+
+    def encode_image(self, image_path: str | Path) -> np.ndarray:
+        image = Image.open(image_path).convert("RGB")
+        vec = self.image_model.encode(
+            [image],
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )[0]
+        return vec.astype(np.float32)
+
+    def encode_text(self, text: str) -> np.ndarray:
+        vec = self.text_model.encode(
+            [text],
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )[0]
+        return vec.astype(np.float32)
+
+    def encode_record(self, record: ImageRecord) -> np.ndarray:
+        return self.encode_image(record.image_path)
+
+
+def get_embedding_backend(prefer_clip: bool | None = None):
+    prefer = (
+        prefer_clip
+        if prefer_clip is not None
+        else os.getenv("EMBEDDING_BACKEND", "clip").lower() != "local"
+    )
+    if prefer:
+        try:
+            return ClipBackend()
+        except Exception as exc:  # noqa: BLE001 - fallback is intentional for MVP
+            print(f"[embeddings] CLIP unavailable ({exc}); using local-lite")
+    return LocalLiteBackend()
+
+
+# Backward-compatible alias used by older imports.
+class EmbeddingBackend(LocalLiteBackend):
+    pass
 
 
 def build_index(
     records: list[ImageRecord],
     index_dir: Path | None = None,
-    backend: EmbeddingBackend | None = None,
+    backend=None,
 ) -> Path:
     ensure_data_dirs()
     target = index_dir or INDEX_DIR
     target.mkdir(parents=True, exist_ok=True)
-    backend = backend or EmbeddingBackend()
+    backend = backend or get_embedding_backend()
+    dim = getattr(backend, "dim", LOCAL_DIM)
 
     usable = [r for r in records if Path(r.image_path).exists()]
     if not usable:
-        # Write empty markers so UI can detect missing index cleanly.
-        meta = {"ids": [], "backend": backend.name, "dim": VECTOR_DIM}
+        meta = {"ids": [], "backend": backend.name, "dim": dim}
         (target / META_FILE).write_text(
             json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        index = faiss.IndexFlatIP(VECTOR_DIM)
+        index = faiss.IndexFlatIP(dim)
         faiss.write_index(index, str(target / INDEX_FILE))
         return target
 
     vectors = np.vstack([backend.encode_record(r) for r in usable]).astype(np.float32)
-    index = faiss.IndexFlatIP(VECTOR_DIM)
+    index = faiss.IndexFlatIP(dim)
     index.add(vectors)
     faiss.write_index(index, str(target / INDEX_FILE))
 
     meta = {
         "ids": [r.id for r in usable],
         "backend": backend.name,
-        "dim": VECTOR_DIM,
+        "dim": dim,
         "count": len(usable),
+        "image_model": CLIP_IMAGE_MODEL if backend.name.startswith("clip") else None,
+        "text_model": CLIP_TEXT_MODEL if backend.name.startswith("clip") else None,
     }
     (target / META_FILE).write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -134,7 +199,7 @@ def load_index(index_dir: Path | None = None) -> tuple[faiss.Index, list[str], d
     meta_path = target / META_FILE
     if not index_path.exists() or not meta_path.exists():
         raise FileNotFoundError(
-            f"Index not found under {target}. Build it from the Streamlit app first."
+            f"Index not found under {target}. Rebuild from the Import page first."
         )
     index = faiss.read_index(str(index_path))
     meta = json.loads(meta_path.read_text(encoding="utf-8"))

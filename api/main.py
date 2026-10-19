@@ -27,7 +27,7 @@ from src.catalog import (  # noqa: E402
     upsert_records,
 )
 from src.extract.office import extract_from_directory, extract_from_file  # noqa: E402
-from src.index.embeddings import build_index  # noqa: E402
+from src.index.embeddings import build_index, get_embedding_backend  # noqa: E402
 from src.schema import FILTER_FIELDS, FashionTags, ImageRecord  # noqa: E402
 from src.search.query import filter_records, search_by_image, search_by_text  # noqa: E402
 from src.tag.tagger import has_openai_key, tag_records  # noqa: E402
@@ -79,9 +79,16 @@ class TagJobRequest(BaseModel):
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
+    backend_name = "unknown"
+    try:
+        backend_name = get_embedding_backend().name
+    except Exception:  # noqa: BLE001
+        backend_name = "unavailable"
     return {
         "ok": True,
         "openai_ready": has_openai_key(),
+        "tagger": "gpt-4o-mini" if has_openai_key() else "mock",
+        "embedding_backend": backend_name,
         "catalog_count": len(load_catalog()),
     }
 
