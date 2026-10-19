@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -54,6 +54,13 @@ class FashionTags(BaseModel):
     细节元素: list[str] = Field(default_factory=list)
     一句话描述: str = ""
 
+    def validate_vocabulary(self) -> None:
+        for key, values in FILTER_FIELDS.items():
+            if getattr(self, key) not in values:
+                raise ValueError(f"{key}不在允许的标签范围内")
+        if any(value not in DETAILS for value in self.细节元素):
+            raise ValueError("细节元素不在允许的标签范围内")
+
     def normalized(self) -> "FashionTags":
         detail_set = set(DETAILS)
         return FashionTags(
@@ -78,6 +85,9 @@ class SourceMeta(BaseModel):
     )
 
 
+ReviewStatus = Literal["pending", "approved", "rejected"]
+
+
 class ImageRecord(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex[:12])
     image_path: str
@@ -85,6 +95,15 @@ class ImageRecord(BaseModel):
     tags: FashionTags = Field(default_factory=FashionTags)
     tags_source: str = "untagged"  # mock | openai | manual | untagged
     manually_edited: bool = False
+    # tags retains the last human-approved classification during re-tagging.
+    ai_tags: FashionTags | None = None
+    ai_tags_source: str | None = None
+    proposed_tags: FashionTags | None = None
+    review_status: ReviewStatus = "pending"
+    reviewer: str | None = None
+    reviewed_at: str | None = None
+    review_note: str = ""
+    revision: int = 0
     created_at: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -130,4 +149,7 @@ class ImageRecord(BaseModel):
             "来源位置": self.source.location,
             "打标方式": self.tags_source,
             "人工修正": self.manually_edited,
+            "审核状态": self.review_status,
+            "审核人": self.reviewer,
+            "审核时间": self.reviewed_at,
         }

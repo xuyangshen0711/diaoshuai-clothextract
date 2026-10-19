@@ -115,7 +115,7 @@ def tag_records(
     tagger = get_tagger(backend)
     total = len(records)
     for idx, record in enumerate(records, start=1):
-        if record.manually_edited and not overwrite:
+        if (record.manually_edited or record.review_status != "pending") and not overwrite:
             if progress_callback:
                 progress_callback(idx, total, record, skipped=True)
             continue
@@ -124,8 +124,15 @@ def tag_records(
             if progress_callback:
                 progress_callback(idx, total, record, skipped=True)
             continue
-        record.tags = tagger.tag(record.image_path)
-        record.tags_source = tagger.name
+        suggestion = tagger.tag(record.image_path)
+        record.ai_tags = suggestion.model_copy(deep=True)
+        record.ai_tags_source = tagger.name
+        record.proposed_tags = suggestion.model_copy(deep=True)
+        record.review_status = "pending"
+        # Keep the last human classification even when explicitly re-tagging all.
+        if record.reviewed_at is None and not record.manually_edited:
+            record.tags = suggestion.model_copy(deep=True)
+            record.tags_source = tagger.name
         record.touch()
         if progress_callback:
             progress_callback(idx, total, record, skipped=False)

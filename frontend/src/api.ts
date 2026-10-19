@@ -10,6 +10,8 @@ export type FashionTags = {
   一句话描述: string
 }
 
+export type ReviewStatus = 'pending' | 'approved' | 'rejected'
+
 export type CatalogItem = {
   id: string
   image_path: string
@@ -18,6 +20,14 @@ export type CatalogItem = {
   tags: FashionTags
   tags_source: string
   manually_edited: boolean
+  ai_tags: FashionTags | null
+  ai_tags_source: string | null
+  proposed_tags: FashionTags | null
+  review_status: ReviewStatus
+  reviewer: string | null
+  reviewed_at: string | null
+  review_note: string
+  revision: number
   source: {
     source_file: string
     source_type: string
@@ -34,7 +44,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     let detail = res.statusText
     try {
       const body = await res.json()
-      detail = body.detail || JSON.stringify(body)
+      detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail || body)
     } catch {
       /* ignore */
     }
@@ -107,11 +117,36 @@ export function retag(backend: string, overwrite: boolean) {
   })
 }
 
-export function updateRecord(id: string, tags: FashionTags) {
-  return request<CatalogItem>(`/api/records/${id}`, {
-    method: 'PATCH',
+export type ReviewSnapshot = Pick<CatalogItem, 'tags' | 'ai_tags' | 'proposed_tags' | 'review_status'>
+export type ReviewEvent = {
+  id: number
+  action: string
+  actor: string
+  note: string
+  created_at: string
+  before: ReviewSnapshot | null
+  after: ReviewSnapshot
+}
+
+export function getReviews(status: ReviewStatus, page = 1) {
+  return request<{
+    count: number
+    counts: Record<ReviewStatus, number>
+    page: number
+    items: CatalogItem[]
+  }>(`/api/reviews?status=${status}&page=${page}`)
+}
+
+export function getReviewHistory(id: string) {
+  return request<{ items: ReviewEvent[] }>(`/api/records/${id}/history`)
+}
+
+export function reviewRecord(item: CatalogItem, action: 'approve' | 'reject' | 'resubmit',
+  reviewer: string, note: string, tags?: FashionTags) {
+  return request<CatalogItem>(`/api/records/${item.id}/review`, {
+    method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ tags, mark_manual: true }),
+    body: JSON.stringify({ action, reviewer, note, tags, expected_revision: item.revision }),
   })
 }
 

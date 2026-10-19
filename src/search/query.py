@@ -7,7 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
-from src.index.embeddings import get_embedding_backend, load_index
+from src.catalog import approved_records
+from src.index.embeddings import current_index, get_embedding_backend
 from src.schema import (
     CATEGORY,
     COLOR,
@@ -68,8 +69,9 @@ def _vector_rank(
     query_vec: np.ndarray,
     top_k: int = 12,
     candidate_ids: set[str] | None = None,
+    backend=None,
 ) -> list[tuple[ImageRecord, float]]:
-    index, ids, _meta = load_index()
+    index, ids, _meta = current_index(records, backend or get_embedding_backend())
     if index.ntotal == 0 or not ids:
         return []
 
@@ -78,7 +80,7 @@ def _vector_rank(
         raise ValueError(
             f"Query dim {vec.shape[1]} != index dim {index.d}. Please rebuild the index."
         )
-    scores, indices = index.search(vec, min(max(top_k * 5, top_k), len(ids)))
+    scores, indices = index.search(vec, len(ids) if candidate_ids is not None else min(top_k, len(ids)))
     by_id = {r.id: r for r in records}
     ranked: list[tuple[ImageRecord, float]] = []
     for score, idx in zip(scores[0], indices[0]):
@@ -146,19 +148,23 @@ def search_by_text(
     query = query.strip()
     if not query:
         return []
+    records = approved_records(records)
+    pool = approved_records(filtered) if filtered is not None else records
+    if not pool:
+        return []
     backend = backend or get_embedding_backend()
-    pool = filtered if filtered is not None else records
     candidate_ids = {r.id for r in pool}
 
     # Primary: shared CLIP space (text query vs indexed image vectors).
     try:
-        vector_hits = {
+        vector_hits = {} if backend.name == "local-lite" else {
             r.id: score
             for r, score in _vector_rank(
                 records,
                 backend.encode_text(query),
                 top_k=max(top_k * 3, top_k),
                 candidate_ids=candidate_ids,
+                backend=backend,
             )
         }
     except Exception:
@@ -182,12 +188,16 @@ def search_by_image(
     backend=None,
     filtered: list[ImageRecord] | None = None,
 ) -> list[tuple[ImageRecord, float]]:
+    records = approved_records(records)
+    pool = approved_records(filtered) if filtered is not None else records
+    if not pool:
+        return []
     backend = backend or get_embedding_backend()
-    pool = filtered if filtered is not None else records
     candidate_ids = {r.id for r in pool}
     return _vector_rank(
         records,
         backend.encode_image(image_path),
         top_k=top_k,
         candidate_ids=candidate_ids,
+        backend=backend,
     )

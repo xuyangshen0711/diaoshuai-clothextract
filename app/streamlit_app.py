@@ -14,6 +14,9 @@ if str(ROOT) not in sys.path:
 
 from src.catalog import (  # noqa: E402
     EXTRACTED_DIR,
+    approved_records,
+    review_record,
+    review_history,
     RAW_DIR,
     ensure_data_dirs,
     load_catalog,
@@ -91,7 +94,7 @@ def show_gallery(items: list[tuple[ImageRecord, float | None]], empty_msg: str) 
 
 def page_library() -> None:
     st.subheader("图片库")
-    records = reload_catalog()
+    records = approved_records(reload_catalog())
     st.caption(f"当前共 {len(records)} 条记录")
     selected = render_filters("lib_")
     filtered = apply_ui_filters(records, selected)
@@ -100,7 +103,7 @@ def page_library() -> None:
 
 def page_search() -> None:
     st.subheader("检索")
-    records = reload_catalog()
+    records = approved_records(reload_catalog())
     if not records:
         st.warning("图库为空，请先导入并重建索引。")
         return
@@ -251,7 +254,7 @@ def page_import() -> None:
             )
             save_catalog(tagged)
             build_index(tagged)
-            st.success("全量重打标完成（已跳过逻辑：人工修正项也会被覆盖）。")
+            st.success("全量重打标完成，等待人工审核。上次人工分类已保留。")
 
     if run_index:
         catalog = load_catalog()
@@ -268,63 +271,76 @@ def page_import() -> None:
 
 
 def page_edit() -> None:
-    st.subheader("人工修正标签")
-    records = reload_catalog()
+    st.subheader("人工审核")
+    st.caption("审核通过后进入正式图库；重新审核期间暂时移出图库。")
+    statuses = {"待审核": "pending", "已通过": "approved", "已驳回": "rejected"}
+    selected_status = st.radio("审核状态", list(statuses), horizontal=True)
+    records = [r for r in reload_catalog() if r.review_status == statuses[selected_status]]
     if not records:
-        st.info("暂无记录可修正。")
+        st.info("当前状态下没有图片。新导入的图片会进入待审核。")
         return
-
-    options = {
-        f"{r.id} · {r.tags.一句话描述 or Path(r.image_path).name}": r.id for r in records
-    }
-    label = st.selectbox("选择图片", list(options.keys()))
-    record = next(r for r in records if r.id == options[label])
-
-    cols = st.columns([1, 2])
-    with cols[0]:
+    selected_id = st.selectbox("选择图片", [r.id for r in records],
+        format_func=lambda rid: next(f"{r.source.source_file} / {r.source.location}" for r in records if r.id == rid))
+    record = next(r for r in records if r.id == selected_id)
+    left, right = st.columns([1, 2])
+    with left:
         if Path(record.image_path).exists():
             st.image(record.image_path, use_container_width=True)
         st.caption(f"{record.source.source_file} / {record.source.location}")
-
-    with cols[1]:
-        tags = record.tags
-        品类 = st.selectbox("品类", FILTER_FIELDS["品类"], index=FILTER_FIELDS["品类"].index(tags.品类) if tags.品类 in FILTER_FIELDS["品类"] else len(FILTER_FIELDS["品类"]) - 1)
-        风格 = st.selectbox("风格", FILTER_FIELDS["风格"], index=FILTER_FIELDS["风格"].index(tags.风格) if tags.风格 in FILTER_FIELDS["风格"] else len(FILTER_FIELDS["风格"]) - 1)
-        季节 = st.selectbox("季节", FILTER_FIELDS["季节"], index=FILTER_FIELDS["季节"].index(tags.季节) if tags.季节 in FILTER_FIELDS["季节"] else len(FILTER_FIELDS["季节"]) - 1)
-        版型 = st.selectbox("版型", FILTER_FIELDS["版型"], index=FILTER_FIELDS["版型"].index(tags.版型) if tags.版型 in FILTER_FIELDS["版型"] else len(FILTER_FIELDS["版型"]) - 1)
-        颜色 = st.selectbox("颜色主色调", FILTER_FIELDS["颜色主色调"], index=FILTER_FIELDS["颜色主色调"].index(tags.颜色主色调) if tags.颜色主色调 in FILTER_FIELDS["颜色主色调"] else len(FILTER_FIELDS["颜色主色调"]) - 1)
-        领型 = st.selectbox("领型", FILTER_FIELDS["领型"], index=FILTER_FIELDS["领型"].index(tags.领型) if tags.领型 in FILTER_FIELDS["领型"] else len(FILTER_FIELDS["领型"]) - 1)
-        袖型 = st.selectbox("袖型", FILTER_FIELDS["袖型"], index=FILTER_FIELDS["袖型"].index(tags.袖型) if tags.袖型 in FILTER_FIELDS["袖型"] else len(FILTER_FIELDS["袖型"]) - 1)
-        细节 = st.text_input("细节元素（逗号分隔）", value=",".join(tags.细节元素))
-        描述 = st.text_area("一句话描述", value=tags.一句话描述)
-
-        if st.button("保存修正", type="primary"):
-            record.tags = FashionTags(
-                品类=品类,
-                风格=风格,
-                季节=季节,
-                版型=版型,
-                颜色主色调=颜色,
-                领型=领型,
-                袖型=袖型,
-                细节元素=[x.strip() for x in 细节.split(",") if x.strip()],
-                一句话描述=描述.strip(),
-            )
-            record.tags_source = "manual"
-            record.manually_edited = True
-            record.touch()
-            save_catalog(records)
-            build_index(records)
-            st.success("已保存，并重建索引。")
+        if record.ai_tags:
+            st.write("AI 建议", record.ai_tags.model_dump())
+    with right:
+        reviewer = st.text_input("审核人（手动填写）", key="reviewer")
+        note = st.text_area("审核意见 / 驳回原因（驳回必填）", key=f"note_{record.id}_{record.revision}")
+        try:
+            if record.review_status != "pending":
+                st.write("当前分类", (record.proposed_tags or record.tags).model_dump())
+                st.caption(f"上次审核：{record.reviewer or ''}，{record.reviewed_at or ''}，{record.review_note}")
+                if st.button("重新提交审核"):
+                    review_record(record.id, action="resubmit", reviewer=reviewer,
+                        note=note, expected_revision=record.revision)
+                    st.rerun()
+            else:
+                base = record.proposed_tags or record.tags
+                values = {}
+                for key, options in FILTER_FIELDS.items():
+                    current = getattr(base, key)
+                    values[key] = st.selectbox(key, options,
+                        index=options.index(current) if current in options else 0,
+                        key=f"{record.id}_{record.revision}_{key}")
+                values["细节元素"] = [x.strip() for x in st.text_input("细节元素（逗号分隔）",
+                    value=",".join(base.细节元素), key=f"details_{record.id}_{record.revision}").split(",") if x.strip()]
+                values["一句话描述"] = st.text_area("一句话描述", value=base.一句话描述,
+                    key=f"description_{record.id}_{record.revision}")
+                accept, reject = st.columns(2)
+                if accept.button("通过分类", type="primary"):
+                    review_record(record.id, action="approve", reviewer=reviewer, note=note,
+                        tags=FashionTags(**values), expected_revision=record.revision)
+                    st.rerun()
+                if reject.button("驳回"):
+                    review_record(record.id, action="reject", reviewer=reviewer, note=note,
+                        expected_revision=record.revision)
+                    st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+        with st.expander("分类与审核历史"):
+            for event in review_history(record.id):
+                action_label = {"approve": "通过", "reject": "驳回", "resubmit": "重新提交审核",
+                    "record_created": "导入分类", "classification_proposed": "提交新的分类",
+                    "legacy_imported": "迁移历史数据"}.get(event["action"], event["action"])
+                st.write(f"{action_label} / {event['actor'] or '系统'} / {event['created_at']}")
+                if event["note"]:
+                    st.caption(event["note"])
+                st.write(event["after"]["proposed_tags"] or event["after"]["tags"])
 
 
 def main() -> None:
     st.title("服装内部图片库")
-    st.caption("MVP：PPT/Excel/PDF 抽图 · GPT-4o-mini 打标 · 文字搜 / 以图搜图 · 人工修正")
+    st.caption("MVP：PPT/Excel/PDF 抽图 · GPT-4o-mini 打标 · 文字搜 / 以图搜图 · 人工审核")
 
     page = st.sidebar.radio(
         "功能",
-        ["图片库", "检索", "导入与处理", "人工修正"],
+        ["图片库", "检索", "导入与处理", "人工审核"],
     )
     st.sidebar.markdown("---")
     api_ready = has_openai_key()

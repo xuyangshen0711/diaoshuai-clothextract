@@ -27,7 +27,7 @@ async function runImport() {
   try {
     if (!files.value.length) throw new Error('请先选择文件')
     const data = await importFiles(files.value, backend.value)
-    status.value = `已入库 ${data.extracted} 张，共 ${data.catalog_count} 款`
+    status.value = `已处理 ${data.extracted} 张，等待人工审核；目录共 ${data.catalog_count} 张`
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
@@ -41,7 +41,7 @@ async function runRetag(overwrite: boolean) {
   status.value = ''
   try {
     const data = await retag(backend.value, overwrite)
-    status.value = overwrite ? `已全量重打标，共 ${data.catalog_count} 款` : `已更新未确认标签`
+    status.value = overwrite ? `已生成新的待审核分类，共 ${data.catalog_count} 张` : `已更新待审核分类`
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
@@ -70,6 +70,8 @@ async function runRebuild() {
       <p class="meta">{{ openaiReady ? 'GPT-4o-mini' : 'Mock 模式' }}</p>
     </div>
 
+    <p class="meta">AI 分类完成后进入待审核，审核通过才会出现在正式图库。全量重打会重新提交审核，并保留上次人工分类。</p>
+
     <div class="dropzone">
       <strong>上传 PDF / PPT / Excel</strong>
       <p style="margin: 8px 0 14px">把企划或商品资料拖进来，或点击选择文件</p>
@@ -94,7 +96,7 @@ async function runRebuild() {
       <button class="btn" :disabled="loading" @click="runRebuild">重建索引</button>
     </div>
 
-    <div v-if="status" class="status">{{ status }}</div>
+    <div v-if="status" class="status" role="status">{{ status }} <RouterLink to="/review" class="review-text-link">前往人工审核</RouterLink></div>
     <div v-if="error" class="error">{{ error }}</div>
   </section>
 </template>

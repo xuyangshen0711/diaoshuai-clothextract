@@ -19,3 +19,4 @@ data/processed/*
 
 # Local uploads mirror (requirements doc lives under docs/)
 uploads/
+.pytest_cache/

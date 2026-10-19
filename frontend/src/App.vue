@@ -81,7 +81,7 @@ function toggleFilters() {
         <div class="util-links">
           <RouterLink to="/search">以图搜</RouterLink>
           <RouterLink to="/import">导入</RouterLink>
-          <RouterLink to="/edit">修正</RouterLink>
+          <RouterLink to="/review">人工审核</RouterLink>
         </div>
       </div>
     </header>

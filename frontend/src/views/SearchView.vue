@@ -43,7 +43,7 @@ function onFile(e: Event) {
   <section class="panel">
     <div class="page-head">
       <h2>以图搜图</h2>
-      <p class="meta">{{ loading ? '检索中…' : searched ? `${items.length} 个结果` : '' }}</p>
+      <p class="meta">{{ loading ? '检索中…' : searched ? `${items.length} 个结果` : '仅搜索审核通过的款式' }}</p>
     </div>
 
     <div class="search-box">

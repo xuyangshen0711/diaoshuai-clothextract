@@ -54,6 +54,7 @@ def main() -> None:
     merged = upsert_records(load_catalog(), records)
     save_catalog(merged)
     print(f"catalog_count={len(merged)}")
+    print("New classifications require human approval at /review before appearing in the library.")
 
     if not args.skip_index:
         backend = get_embedding_backend()

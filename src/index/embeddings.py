@@ -9,14 +9,15 @@ from __future__ import annotations
 import json
 import os
 import re
-from functools import lru_cache
+from threading import RLock
+from functools import lru_cache, wraps
 from pathlib import Path
 
 import faiss
 import numpy as np
 from PIL import Image
 
-from src.catalog import INDEX_DIR, ensure_data_dirs
+from src.catalog import INDEX_DIR, approved_records, ensure_data_dirs
 from src.schema import ImageRecord
 
 INDEX_FILE = "faiss.index"
@@ -28,6 +29,7 @@ CLIP_TEXT_MODEL = os.getenv(
     "sentence-transformers/clip-ViT-B-32-multilingual-v1",
 )
 LOCAL_DIM = 96
+INDEX_LOCK = RLock()
 
 
 def _gray_patch_features(image: Image.Image) -> np.ndarray:
@@ -153,6 +155,15 @@ class EmbeddingBackend(LocalLiteBackend):
     pass
 
 
+def _index_locked(func):
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        with INDEX_LOCK:
+            return func(*args, **kwargs)
+    return wrapped
+
+
+@_index_locked
 def build_index(
     records: list[ImageRecord],
     index_dir: Path | None = None,
@@ -164,7 +175,7 @@ def build_index(
     backend = backend or get_embedding_backend()
     dim = getattr(backend, "dim", LOCAL_DIM)
 
-    usable = [r for r in records if Path(r.image_path).exists()]
+    usable = [r for r in approved_records(records) if Path(r.image_path).exists()]
     if not usable:
         meta = {"ids": [], "backend": backend.name, "dim": dim}
         (target / META_FILE).write_text(
@@ -193,6 +204,7 @@ def build_index(
     return target
 
 
+@_index_locked
 def load_index(index_dir: Path | None = None) -> tuple[faiss.Index, list[str], dict]:
     target = index_dir or INDEX_DIR
     index_path = target / INDEX_FILE
@@ -204,3 +216,19 @@ def load_index(index_dir: Path | None = None) -> tuple[faiss.Index, list[str], d
     index = faiss.read_index(str(index_path))
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     return index, list(meta.get("ids", [])), meta
+
+
+def current_index(records: list[ImageRecord], backend):
+    """Refresh index membership after review decisions; share one snapshot per search."""
+    with INDEX_LOCK:
+        expected = [r.id for r in approved_records(records) if Path(r.image_path).exists()]
+        try:
+            index, ids, meta = load_index()
+        except FileNotFoundError:
+            ids, meta = None, {}
+        if (ids != expected or meta.get("backend") != backend.name
+                or (backend.name.startswith("clip") and (
+                    meta.get("image_model") != CLIP_IMAGE_MODEL or meta.get("text_model") != CLIP_TEXT_MODEL))):
+            build_index(records, backend=backend)
+            index, ids, meta = load_index()
+        return index, ids, meta

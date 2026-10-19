@@ -113,10 +113,10 @@ watch([group, q, filters], load, { deep: true })
 
     <div>
       <p class="meta" style="margin: 0 0 14px">
-        {{ loading ? '加载中…' : `${count} 款` }}
+        {{ loading ? '加载中…' : `${count} 款已审核` }}
       </p>
       <div v-if="error" class="error">{{ error }}</div>
-      <div v-if="!items.length && !loading" class="empty">没有匹配的款式</div>
+      <div v-if="!items.length && !loading" class="empty">暂无已审核的匹配款式。<RouterLink to="/review" class="review-text-link">查看待审核图片</RouterLink></div>
       <div v-else class="grid">
         <article v-for="item in items" :key="item.id" class="card">
           <img
