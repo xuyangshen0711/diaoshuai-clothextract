@@ -43,7 +43,7 @@ class FashionTags(BaseModel):
 
 class SourceMeta(BaseModel):
     source_file: str
-    source_type: str  # pptx | xlsx | upload | sample
+    source_type: str  # pptx | xlsx | pdf | upload | sample
     location: str  # e.g. "slide 3" or "Sheet1!A1"
     extracted_at: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
