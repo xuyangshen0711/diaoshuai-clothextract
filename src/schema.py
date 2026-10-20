@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -37,10 +37,18 @@ FILTER_FIELDS = {
 }
 
 
-def normalize_category(value: str) -> str:
-    value = (value or "其他").strip()
-    value = CATEGORY_ALIASES.get(value, value)
-    return value if value in CATEGORY else "其他"
+# Library page tabs → categories they include.
+CATEGORY_GROUPS = {
+    "上衣": {"毛衣", "衬衫", "连衣裙", "套装"},
+    "下装": {"裤装", "半裙"},
+    "外套": {"外套"},
+}
+
+
+def taxonomy_yaml() -> str:
+    """Render the vocabulary for prompts, so prompts never drift from this file."""
+    fields = {**FILTER_FIELDS, "细节元素": DETAILS}
+    return "\n".join(f"{key}: [{', '.join(values)}]" for key, values in fields.items())
 
 
 class FashionTags(BaseModel):
@@ -62,16 +70,11 @@ class FashionTags(BaseModel):
             raise ValueError("细节元素不在允许的标签范围内")
 
     def normalized(self) -> "FashionTags":
-        detail_set = set(DETAILS)
+        values = {key: getattr(self, key).strip() for key in FILTER_FIELDS}
+        values["品类"] = CATEGORY_ALIASES.get(values["品类"], values["品类"])
         return FashionTags(
-            品类=normalize_category(self.品类),
-            风格=self.风格 if self.风格 in STYLE else "其他",
-            季节=self.季节 if self.季节 in SEASON else "其他",
-            版型=self.版型 if self.版型 in FIT else "其他",
-            颜色主色调=self.颜色主色调 if self.颜色主色调 in COLOR else "其他",
-            领型=self.领型 if self.领型 in NECKLINE else "其他",
-            袖型=self.袖型 if self.袖型 in SLEEVE else "其他",
-            细节元素=[d for d in self.细节元素 if d in detail_set],
+            **{key: value if value in FILTER_FIELDS[key] else "其他" for key, value in values.items()},
+            细节元素=[d for d in self.细节元素 if d in DETAILS],
             一句话描述=self.一句话描述.strip(),
         )
 
@@ -140,25 +143,3 @@ class ImageRecord(BaseModel):
                 self.source.location,
             ]
         ).strip()
-
-    def to_catalog_row(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "image_path": self.image_path,
-            "品类": self.tags.品类,
-            "风格": self.tags.风格,
-            "季节": self.tags.季节,
-            "版型": self.tags.版型,
-            "颜色主色调": self.tags.颜色主色调,
-            "领型": self.tags.领型,
-            "袖型": self.tags.袖型,
-            "细节元素": ", ".join(self.tags.细节元素),
-            "一句话描述": self.tags.一句话描述,
-            "来源文件": self.source.source_file,
-            "来源位置": self.source.location,
-            "打标方式": self.tags_source,
-            "人工修正": self.manually_edited,
-            "审核状态": self.review_status,
-            "审核人": self.reviewer,
-            "审核时间": self.reviewed_at,
-        }

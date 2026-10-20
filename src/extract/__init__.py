@@ -1,3 +1,3 @@
-from src.extract.office import extract_from_file, extract_from_directory
+from src.extract.office import SUPPORTED_SUFFIXES, extract_from_file
 
-__all__ = ["extract_from_file", "extract_from_directory"]
+__all__ = ["SUPPORTED_SUFFIXES", "extract_from_file"]

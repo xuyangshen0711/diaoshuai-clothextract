@@ -150,11 +150,6 @@ def get_embedding_backend(prefer_clip: bool | None = None):
     return LocalLiteBackend()
 
 
-# Backward-compatible alias used by older imports.
-class EmbeddingBackend(LocalLiteBackend):
-    pass
-
-
 def _index_locked(func):
     @wraps(func)
     def wrapped(*args, **kwargs):

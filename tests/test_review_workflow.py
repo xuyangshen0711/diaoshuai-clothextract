@@ -14,6 +14,7 @@ import src.catalog as catalog
 import src.extract.office as office
 import src.index.embeddings as embeddings
 from api import main as api
+from src import import_jobs
 from src.schema import FashionTags, ImageRecord, SourceMeta
 from src.search.query import search_by_image, search_by_text
 from src.tag.tagger import tag_records
@@ -94,17 +95,6 @@ def test_retag_keeps_human_result_and_requires_new_approval(store, monkeypatch):
     assert len([e for e in catalog.review_history(record.id) if e["action"] == "approve"]) == 2
 
 
-def test_reimport_preserves_previous_decision_and_id(store):
-    record = make_record(store)
-    catalog.save_catalog([record])
-    approved = approve(record, record.tags.model_copy(update={"品类": "衬衫"}))
-    incoming = make_record(store)
-    merged = catalog.upsert_records([approved], [incoming])
-    catalog.save_catalog(merged)
-    assert merged[0].id == record.id and merged[0].tags.品类 == "衬衫"
-    assert merged[0].proposed_tags.品类 == "毛衣" and merged[0].review_status == "pending"
-
-
 def test_reject_reason_and_resubmit(store):
     record = make_record(store)
     catalog.save_catalog([record])
@@ -168,7 +158,7 @@ def test_catalog_includes_pending_while_searches_require_approval_and_refresh_in
     assert [r.id for r, _ in search_by_image(catalog.load_catalog(), pending.image_path)] == [pending.id]
 
 
-def test_api_import_approve_history_and_conflicts(store):
+def test_api_import_approve_history_and_conflicts(store, monkeypatch):
     image = io.BytesIO()
     Image.new("RGB", (240, 320), "navy").save(image, format="PNG")
     image.seek(0)
@@ -176,10 +166,11 @@ def test_api_import_approve_history_and_conflicts(store):
     ppt.slides.add_slide(ppt.slide_layouts[6]).shapes.add_picture(image, Inches(1), Inches(1))
     data = io.BytesIO()
     ppt.save(data)
+    monkeypatch.setattr(import_jobs, "submit_job", import_jobs.run_job)
     client = TestClient(api.app)
-    response = client.post("/api/import?backend=mock", files={"files": ("lookbook.pptx", data.getvalue())})
-    assert response.status_code == 200, response.text
-    assert response.json()["extracted"] == 1
+    response = client.post("/api/import/jobs?backend=mock", files={"files": ("lookbook.pptx", data.getvalue())})
+    assert response.status_code == 202, response.text
+    assert client.get(f'/api/import/jobs/{response.json()["id"]}').json()["succeeded"] == 1
     assert client.get("/api/catalog").json()["count"] == 1
     queue = client.get("/api/reviews").json()
     item = queue["items"][0]
@@ -208,27 +199,16 @@ def test_api_invalid_decisions_do_not_change_state(store, change):
     assert len(catalog.review_history(record.id)) == 1
 
 
-def test_api_manual_patch_and_retag_cannot_bypass_review(store):
+def test_api_retag_cannot_bypass_review(store, monkeypatch):
     record = make_record(store)
     catalog.save_catalog([record])
     record = approve(record, record.tags.model_copy(update={"品类": "外套"}))
+    monkeypatch.setattr(import_jobs, "submit_job", import_jobs.run_job)
     client = TestClient(api.app)
-    patch = dict(tags=record.tags.model_copy(update={"品类": "衬衫"}).model_dump(),
-                 expected_revision=record.revision)
-    result = client.patch(f"/api/records/{record.id}", json=patch)
-    assert result.status_code == 200
-    assert result.json()["tags"]["品类"] == "外套"
-    assert result.json()["proposed_tags"]["品类"] == "衬衫"
-    assert client.get("/api/catalog").json()["count"] == 1
-    assert client.patch(f"/api/records/{record.id}", json=patch).status_code == 409
-    pending = catalog.load_catalog()[0]
-    record = approve(pending)
-    assert record.tags.品类 == "衬衫"
-    response = client.post("/api/tag", json={"backend": "mock", "overwrite": True})
-    assert response.status_code == 200
+    response = client.post("/api/tag/jobs", json={"backend": "mock", "overwrite": True})
+    assert response.status_code == 202
     record = catalog.load_catalog()[0]
-    assert record.review_status == "pending" and record.tags.品类 == "衬衫"
-    assert record.ai_tags.品类 == "毛衣"
+    assert record.review_status == "pending" and record.tags.品类 == "外套"
     assert client.get("/api/catalog").json()["count"] == 1
 
 

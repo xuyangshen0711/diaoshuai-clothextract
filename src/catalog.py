@@ -149,23 +149,6 @@ def save_catalog(records: Iterable[ImageRecord]) -> Path:
     return DATABASE_PATH
 
 
-def upsert_records(existing: list[ImageRecord], incoming: list[ImageRecord]) -> list[ImageRecord]:
-    by_path = {r.image_path: r for r in existing}
-    for record in incoming:
-        prev = by_path.get(record.image_path)
-        if prev is None:
-            by_path[record.image_path] = record
-            continue
-        # Re-import creates a new proposal, retaining the last human result and its history.
-        prev.ai_tags = record.ai_tags.model_copy(deep=True) if record.ai_tags else None
-        prev.ai_tags_source = record.ai_tags_source
-        prev.proposed_tags = (record.proposed_tags or record.tags).model_copy(deep=True)
-        prev.source = record.source
-        prev.review_status = "pending"
-        prev.touch()
-    return list(by_path.values())
-
-
 def get_by_id(records: list[ImageRecord], record_id: str) -> ImageRecord | None:
     return next((record for record in records if record.id == record_id), None)
 

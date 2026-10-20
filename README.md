@@ -12,9 +12,11 @@
 | 打标 | GPT-4o-mini + 受约束 JSON（等价于文档中的多模态 API 路径） |
 | 检索 | CLIP（多语言文本塔）+ FAISS |
 | 存储 | 本地图片 + SQLite（含审核状态与操作历史） |
-| 界面 | Vue 3 + FastAPI（文档允许轻量 Web；Streamlit 仍保留） |
+| 界面 | Vue 3 + FastAPI |
 
 ## 快速开始
+
+需要 Python 3.10 及以上。
 
 ```bash
 python3 -m venv .venv
@@ -43,6 +45,8 @@ cd frontend && npm install && npm run dev
 
 ## 标签体系（需求草稿）
 
+唯一来源是 [`src/schema.py`](src/schema.py)：打标提示词、筛选项、搜索词表都从那里生成，改标签只改这一处。
+
 ```yaml
 品类: [毛衣, 外套, 连衣裙, 衬衫, 裤装, 半裙, 套装, 其他]
 风格: [极简, 复古, 甜美, 通勤, 工装, 法式, 休闲, 其他]
@@ -59,7 +63,6 @@ cd frontend && npm install && npm run dev
 ```
 ├── api/                      # FastAPI
 ├── frontend/                 # Vue 3
-├── app/streamlit_app.py      # 可选 Streamlit
 ├── data/{raw,extracted,processed}
 ├── docs/mvp-requirements.md
 ├── prompts/tagging_prompt.md
