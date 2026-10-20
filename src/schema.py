@@ -79,6 +79,9 @@ class FashionTags(BaseModel):
 class SourceMeta(BaseModel):
     source_file: str
     source_type: str  # pptx | xlsx | pdf | upload | sample
+    batch_id: str | None = None
+    source_path: str | None = None
+    uploaded_at: str | None = None
     location: str  # e.g. "slide 3" / "Sheet1" / "page 2"
     extracted_at: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
@@ -113,6 +116,12 @@ class ImageRecord(BaseModel):
 
     def touch(self) -> None:
         self.updated_at = datetime.now(timezone.utc).isoformat()
+
+    @property
+    def display_tags(self) -> FashionTags:
+        if self.review_status == "pending":
+            return self.proposed_tags or self.ai_tags or self.tags
+        return self.tags
 
     def search_text(self) -> str:
         detail = " ".join(self.tags.细节元素)

@@ -1,6 +1,6 @@
 # 服装内部图片库（MVP）
 
-按 [`docs/mvp-requirements.md`](docs/mvp-requirements.md) 落地：把 PPT / Excel / PDF 里的女装款式图抽取、打标、归类，AI 分类后需人工审核通过，才进入正式图库，支持文字搜与以图搜图。
+按 [`docs/mvp-requirements.md`](docs/mvp-requirements.md) 落地：把 PPT / Excel / PDF 里的女装款式图抽取、打标、归类，AI 分类后即在主页归类展示并标记「未审核」，人工确认后标记「已审核」；文字搜索与以图搜图使用已审核图片。
 
 对照清单见 [`docs/mvp-checklist.md`](docs/mvp-checklist.md)。
 
@@ -33,9 +33,11 @@ cd frontend && npm install && npm run dev
 
 ## 人工审核
 
-导入 → AI 分类 → 待人工审核 → 直接通过 / 修改后通过 / 驳回。
+导入 → AI 分类并展示在主页（未审核）→ 直接通过 / 修改后通过 / 驳回。主页卡片显示来源 PDF / Excel / PPT 文件、来源位置和导入时间，可筛选审核状态；驳回图片从主页移除。
 
 打开前端「人工审核」或 `/review`。保留 AI 建议、人工最终分类、审核人、时间和操作历史；重新打标不会覆盖上次人工分类。旧 JSON 数据会自动迁入 SQLite，并进入待审核，原文件保留。
+
+导入页支持后台任务进度和失败续跑；审核页支持批次筛选、快捷操作及位置恢复；点击图库图片可查看款式详情、来源、审核记录并下载原图。
 
 详细流程、迁移和测试说明见 [人工审核与 SQLite 存储](docs/review-workflow.md)。本期审核人手动填写，尚未接入登录和角色权限。
 

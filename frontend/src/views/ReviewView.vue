@@ -1,22 +1,32 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { jobs, isActive } from '../composables/importJobs'
+import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router'
 import { getFilters, getReviews, getReviewHistory, reviewRecord, type CatalogItem,
   type FashionTags, type FilterMeta, type ReviewEvent, type ReviewStatus } from '../api'
 
+const route = useRoute()
+const router = useRouter()
 const labels: Record<ReviewStatus, string> = { pending: '待审核', approved: '已通过', rejected: '已驳回' }
 const actions: Record<string, string> = {
   record_created: '导入并生成初始分类', legacy_imported: '迁移历史数据',
   classification_proposed: '提交新的待审核分类', approve: '审核通过', reject: '驳回分类', resubmit: '重新提交审核',
 }
 const fields = ['品类', '风格', '季节', '版型', '颜色主色调', '领型', '袖型'] as const
-const state = ref<ReviewStatus>('pending')
+const queryValue = (key: string) => typeof route.query[key] === 'string' ? route.query[key] as string : ''
+const state = computed<ReviewStatus>(() => ['pending', 'approved', 'rejected'].includes(queryValue('status')) ? queryValue('status') as ReviewStatus : 'pending')
+const page = computed(() => Math.max(1, Number.parseInt(queryValue('page')) || 1))
+const batch = computed(() => queryValue('batch'))
+const source = computed(() => queryValue('source'))
+const category = computed(() => queryValue('category'))
+const facets = ref<{ batches: { id: string; label: string }[]; files: string[] }>({ batches: [], files: [] })
 const counts = reactive<Record<ReviewStatus, number>>({ pending: 0, approved: 0, rejected: 0 })
 const meta = ref<FilterMeta>({})
 const items = ref<CatalogItem[]>([])
 const total = ref(0)
-const page = ref(1)
 const selectedId = ref('')
 const current = computed(() => items.value.find(item => item.id === selectedId.value))
+const position = computed(() => (page.value - 1) * 30 + items.value.findIndex(item => item.id === selectedId.value) + 1)
 const form = reactive<FashionTags>({ 品类: '', 风格: '', 季节: '', 版型: '', 颜色主色调: '',
   领型: '', 袖型: '', 细节元素: [], 一句话描述: '' })
 const reviewer = ref(localStorage.getItem('clothextract-reviewer') || '')
@@ -27,97 +37,130 @@ const saving = ref(false)
 const error = ref('')
 const historyError = ref('')
 const message = ref('')
+const baseline = ref('')
+const signature = () => JSON.stringify({ tags: form, note: note.value })
+const editable = computed(() => current.value?.review_status === 'pending')
+const dirty = computed(() => editable.value && baseline.value !== '' && signature() !== baseline.value)
+const edited = computed(() => !current.value?.ai_tags || JSON.stringify(form) !== JSON.stringify(current.value.ai_tags))
 let loadSequence = 0
 let historySequence = 0
-const editable = computed(() => current.value?.review_status === 'pending')
-const edited = computed(() => {
-  const base = current.value?.ai_tags
-  return !base || JSON.stringify(form) !== JSON.stringify(base)
-})
+let chooseLast = false
+let ready = false
 
-function date(value: string | null) {
-  return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : ''
+function confirmLeave() {
+  if (saving.value) return false
+  return !dirty.value || window.confirm('分类修改尚未提交，是否放弃修改并离开当前图片？')
 }
-function display(value: unknown) {
-  return Array.isArray(value) ? value.join('、') || '无' : String(value || '未提供')
+onBeforeRouteLeave(confirmLeave)
+onBeforeRouteUpdate(confirmLeave)
+function beforeUnload(event: BeforeUnloadEvent) {
+  if (dirty.value) { event.preventDefault(); event.returnValue = '' }
 }
-async function load(): Promise<void> {
+function date(value: string | null) { return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '' }
+function display(value: unknown) { return Array.isArray(value) ? value.join('、') || '无' : String(value || '未提供') }
+async function load(preferId = ''): Promise<void> {
   const sequence = ++loadSequence
-  loading.value = true
-  error.value = ''
-  // Clear stale forms before fetching a different queue or page.
-  items.value = []
-  selectedId.value = ''
+  loading.value = true; error.value = ''; items.value = []; selectedId.value = ''
   try {
-    const data = await getReviews(state.value, page.value)
+    const params: Record<string, string> = {}
+    if (batch.value) params.batch = batch.value
+    if (source.value) params.source_file = source.value
+    if (category.value) params.category = category.value
+    if (queryValue('selected')) params.selected_id = queryValue('selected')
+    const data = await getReviews(state.value, page.value, params)
     if (sequence !== loadSequence) return
-    if (page.value > 1 && !data.items.length) {
-      page.value--
-      return load()
+    items.value = data.items; total.value = data.count
+    facets.value = data.facets; Object.assign(counts, data.counts)
+    const desired = preferId || queryValue('selected')
+    const match = items.value.find(item => item.id === desired)
+    const fallback = chooseLast ? items.value[items.value.length - 1] : items.value[0]
+    chooseLast = false
+    selectedId.value = match?.id || fallback?.id || ''
+    if (queryValue('selected') !== selectedId.value || page.value !== data.page) {
+      await router.replace({ query: { ...route.query, page: String(data.page), selected: selectedId.value || undefined } })
     }
-    items.value = data.items
-    Object.assign(counts, data.counts)
-    total.value = data.count
-    selectedId.value = items.value[0]?.id || ''
-  } catch (e) {
-    if (sequence === loadSequence) error.value = e instanceof Error ? e.message : String(e)
-  } finally {
-    if (sequence === loadSequence) loading.value = false
-  }
+  } catch (e) { if (sequence === loadSequence) error.value = e instanceof Error ? e.message : String(e) }
+  finally { if (sequence === loadSequence) loading.value = false }
 }
-function switchState(value: ReviewStatus) {
-  state.value = value
-  page.value = 1
-  message.value = ''
-  load()
+function setParams(values: Record<string, string | undefined>) {
+  return router.replace({ query: { ...route.query, page: '1', selected: undefined, ...values } })
 }
+function switchState(value: ReviewStatus) { message.value = ''; setParams({ status: value }) }
+function selectItem(id: string) { return router.replace({ query: { ...route.query, selected: id } }) }
+function changePage(delta: number) {
+  chooseLast = delta < 0
+  router.replace({ query: { ...route.query, page: String(page.value + delta), selected: undefined } })
+}
+async function move(delta: number, skip = false) {
+  if (saving.value || loading.value || !current.value) return
+  const index = items.value.findIndex(item => item.id === selectedId.value)
+  const target = items.value[index + delta]
+  if (target) await selectItem(target.id)
+  else if (delta > 0 && page.value * 30 < total.value) changePage(1)
+  else if (delta < 0 && page.value > 1) changePage(-1)
+  else if (skip && items.value.length > 1) await selectItem(items.value[0]!.id)
+  else if (skip) { message.value = '当前只有这一张待处理图片，已保留在待审核中'; return }
+  await nextTick()
+  if (skip && !dirty.value) message.value = '已暂时跳过，图片仍保留在待审核队列'
+}
+async function refreshQueue() {
+  if (!confirmLeave()) return
+  baseline.value = ''; await load(selectedId.value)
+}
+watch(() => jobs.value.filter(job => !isActive(job)).map(job => `${job.id}:${job.status}`).join(','), () => {
+  if (ready && !dirty.value && !saving.value && !loading.value) load(selectedId.value)
+})
+watch([state, page, batch, source, category], () => load())
+watch(() => route.query.selected, value => {
+  if (typeof value === 'string' && items.value.some(item => item.id === value)) selectedId.value = value
+})
 watch(current, async item => {
   const sequence = ++historySequence
-  history.value = []
-  historyError.value = ''
-  note.value = ''
+  baseline.value = ''; history.value = []; historyError.value = ''; note.value = ''
   if (!item) return
   Object.assign(form, JSON.parse(JSON.stringify(item.proposed_tags || item.tags)))
-  for (const key of fields) {
-    if (!meta.value[key]?.includes(form[key])) form[key] = ''
-  }
+  for (const key of fields) if (!meta.value[key]?.includes(form[key])) form[key] = ''
+  baseline.value = signature()
   try {
     const data = await getReviewHistory(item.id)
     if (sequence === historySequence) history.value = data.items
-  } catch (e) {
-    if (sequence === historySequence) historyError.value = e instanceof Error ? e.message : String(e)
-  }
+  } catch (e) { if (sequence === historySequence) historyError.value = e instanceof Error ? e.message : String(e) }
 })
-
 async function decide(action: 'approve' | 'reject' | 'resubmit') {
   const item = current.value
   if (!item || saving.value) return
-  error.value = ''
-  message.value = ''
-  if (!reviewer.value.trim()) { error.value = '请先填写审核人姓名'; return }
-  if (action === 'reject' && !note.value.trim()) { error.value = '请填写驳回原因'; return }
-  if (action === 'approve' && fields.some(key => !form[key])) {
-    error.value = '请补全分类标签后再通过'; return
-  }
+  error.value = ''; message.value = ''
+  if (!reviewer.value.trim()) { error.value = '请先填写审核人姓名'; document.getElementById('reviewer')?.focus(); return }
+  if (action === 'reject' && !note.value.trim()) { error.value = '请填写驳回原因'; document.getElementById('review-note')?.focus(); return }
+  if (action === 'approve' && fields.some(key => !form[key])) { error.value = '请补全分类标签后再通过'; return }
+  const index = items.value.findIndex(candidate => candidate.id === item.id)
+  const nextId = items.value[index + 1]?.id || items.value[index - 1]?.id || ''
   saving.value = true
   try {
     await reviewRecord(item, action, reviewer.value.trim(), note.value.trim(),
-      action === 'approve' ? structuredClone({ ...form, 细节元素: [...form.细节元素] }) : undefined)
+      action === 'approve' ? JSON.parse(JSON.stringify(form)) : undefined)
     localStorage.setItem('clothextract-reviewer', reviewer.value.trim())
-    message.value = action === 'approve' ? '已通过，图片已进入正式图库' :
-      action === 'reject' ? '已驳回，图片不会出现在正式图库' : '已重新提交，请在待审核中确认分类'
-    await load()
-  } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e)
-  } finally {
-    saving.value = false
-  }
+    message.value = action === 'approve' ? '已通过，主页已标记为已审核' :
+      action === 'reject' ? '已驳回，图片已从主页移除' : '已重新提交，请在待审核中确认分类'
+    baseline.value = ''; saving.value = false
+    await load(nextId)
+  } catch (e) { error.value = e instanceof Error ? e.message : String(e) }
+  finally { saving.value = false }
 }
-
+function onKey(event: KeyboardEvent) {
+  const target = event.target as HTMLElement
+  if (event.ctrlKey || event.metaKey || event.altKey || target.closest('input, textarea, select, [contenteditable="true"]')) return
+  if (event.key === 'ArrowRight') { event.preventDefault(); move(1) }
+  if (event.key === 'ArrowLeft') { event.preventDefault(); move(-1) }
+  if (event.key.toLowerCase() === 's' && editable.value) { event.preventDefault(); move(1, true) }
+  if (event.key.toLowerCase() === 'a' && editable.value) { event.preventDefault(); decide('approve') }
+}
 onMounted(async () => {
-  try { meta.value = await getFilters(); await load() }
+  window.addEventListener('keydown', onKey); window.addEventListener('beforeunload', beforeUnload)
+  try { meta.value = await getFilters(); await load(); ready = true }
   catch (e) { error.value = e instanceof Error ? e.message : String(e) }
 })
+onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeEventListener('beforeunload', beforeUnload) })
 </script>
 
 <template>
@@ -125,9 +168,9 @@ onMounted(async () => {
     <div class="page-head review-heading">
       <div>
         <h2>人工审核</h2>
-        <p class="meta">逐张确认 AI 分类，审核通过后进入正式图库。</p>
+        <p class="meta">确认或修正 AI 分类；未审核图片已在主页标注。</p>
       </div>
-      <button class="btn" :disabled="loading || saving" @click="load">刷新队列</button>
+      <button class="btn" :disabled="loading || saving" @click="refreshQueue">刷新队列</button>
     </div>
     <div class="review-tabs" role="group" aria-label="审核状态">
       <button v-for="(label, key) in labels" :key="key" type="button"
@@ -136,6 +179,12 @@ onMounted(async () => {
         {{ label }} <span>{{ counts[key] }}</span>
       </button>
     </div>
+    <div class="review-filterbar">
+      <div class="field"><label for="review-batch">导入批次</label><select id="review-batch" :value="batch" :disabled="saving" @change="setParams({ batch: ($event.target as HTMLSelectElement).value || undefined })"><option value="">全部批次</option><option v-for="item in facets.batches" :key="item.id" :value="item.id">{{ item.label }}</option></select></div>
+      <div class="field"><label for="review-source">来源文件</label><select id="review-source" :value="source" :disabled="saving" @change="setParams({ source: ($event.target as HTMLSelectElement).value || undefined })"><option value="">全部文件</option><option v-for="item in facets.files" :key="item" :value="item">{{ item }}</option></select></div>
+      <div class="field"><label for="review-category">服装品类</label><select id="review-category" :value="category" :disabled="saving" @change="setParams({ category: ($event.target as HTMLSelectElement).value || undefined })"><option value="">全部品类</option><option v-for="item in meta['品类'] || []" :key="item" :value="item">{{ item }}</option></select></div>
+      <button v-if="batch || source || category" class="btn" :disabled="saving" @click="setParams({ batch: undefined, source: undefined, category: undefined })">清除筛选</button>
+    </div>
     <p v-if="message" class="review-notice" role="status">{{ message }}</p>
     <p v-if="error" class="error" role="alert">{{ error }}</p>
     <p v-if="loading" class="empty" role="status">正在加载审核队列…</p>
@@ -143,24 +192,30 @@ onMounted(async () => {
       <h3>{{ state === 'pending' ? '待审核图片已处理完' : `暂无${labels[state]}的图片` }}</h3>
       <p>新导入的图片和重新分类的图片会进入待审核队列。</p>
       <RouterLink to="/import" class="btn">导入资料</RouterLink>
-      <RouterLink to="/" class="btn">查看正式图库</RouterLink>
+      <RouterLink to="/" class="btn">查看主页图库</RouterLink>
     </div>
     <div v-else-if="items.length" class="review-workspace">
       <aside class="review-queue" aria-label="图片审核队列">
         <p class="meta">共 {{ total }} 张，第 {{ page }} 页</p>
         <button v-for="item in items" :key="item.id" class="review-queue-item"
           :class="{ selected: selectedId === item.id }" :aria-pressed="selectedId === item.id"
-          :disabled="saving" @click="selectedId = item.id">
+          :disabled="saving" @click="selectItem(item.id)">
           <img :src="item.image_url" alt="" loading="lazy" />
           <span><strong>{{ (item.proposed_tags || item.tags).品类 }}</strong>
             <small>{{ item.source.source_file }}</small><small>{{ item.source.location }}</small></span>
         </button>
         <div class="toolbar review-pagination">
-          <button class="btn" :disabled="page === 1 || saving" @click="page--; load()">上一页</button>
-          <button class="btn" :disabled="page * 30 >= total || saving" @click="page++; load()">下一页</button>
+          <button class="btn" :disabled="page === 1 || saving" @click="changePage(-1)">上一页</button>
+          <button class="btn" :disabled="page * 30 >= total || saving" @click="changePage(1)">下一页</button>
         </div>
       </aside>
-      <div v-if="current" class="review-detail" :key="current.id">
+      <div v-if="current" class="review-content">
+        <div class="review-navigation"><span>第 {{ position }} / {{ total }} 张<span v-if="dirty" class="unsaved-mark"> · 有未提交修改</span></span><div class="toolbar">
+          <button class="btn" :disabled="saving || position <= 1" @click="move(-1)">上一张</button><button class="btn" :disabled="saving || position >= total" @click="move(1)">下一张</button>
+          <RouterLink class="btn" :to="{ name: 'record', params: { id: current.id }, query: { from: route.fullPath } }">款式详情</RouterLink>
+        </div></div>
+        <p class="meta review-shortcuts">← / → 切图 · A 通过 · S 暂时跳过（在输入框外使用）</p>
+        <div class="review-detail" :key="current.id">
         <div class="review-image-panel">
           <a :href="current.image_url" target="_blank" rel="noopener" aria-label="打开完整原图">
             <img class="review-original" :src="current.image_url" :alt="current.tags.一句话描述 || '待审核服装原图'" />
@@ -204,10 +259,11 @@ onMounted(async () => {
               <textarea id="review-note" v-model="note" rows="2" maxlength="2000" :disabled="saving" placeholder="例如：图片不是服装款式图" /></div>
             <div v-if="editable" class="toolbar">
               <button class="btn primary" type="submit" :disabled="saving">{{ saving ? '提交中…' : edited ? '修改后通过' : '直接通过' }}</button>
+              <button class="btn" type="button" :disabled="saving" @click="move(1, true)">暂时跳过</button>
               <button class="btn review-reject" type="button" :disabled="saving" @click="decide('reject')">驳回</button>
             </div>
             <template v-else>
-              <p class="meta">{{ current.review_status === 'approved' ? '已通过的分类如需修改，可重新提交审核。重新审核期间将暂时移出正式图库。' : '修正后可重新提交审核，通过后进入正式图库。' }}</p>
+              <p class="meta">{{ current.review_status === 'approved' ? '已通过的分类如需修改，可重新提交审核。重新审核期间将在主页标记为未审核。' : '修正后可重新提交审核，并在主页显示为未审核。' }}</p>
               <button class="btn" type="button" :disabled="saving" @click="decide('resubmit')">重新提交审核</button>
             </template>
           </div>
@@ -223,6 +279,7 @@ onMounted(async () => {
             </details>
           </section>
         </form>
+        </div>
       </div>
     </div>
   </main>

@@ -106,6 +106,18 @@ def get_tagger(backend: str | None = None):
     raise ValueError(f"Unknown tagger backend: {choice}")
 
 
+def apply_suggestion(record: ImageRecord, suggestion: FashionTags, backend_name: str) -> None:
+    record.ai_tags = suggestion.model_copy(deep=True)
+    record.ai_tags_source = backend_name
+    record.proposed_tags = suggestion.model_copy(deep=True)
+    record.review_status = "pending"
+    # Keep the last human classification even when explicitly re-tagging all.
+    if record.reviewed_at is None and not record.manually_edited:
+        record.tags = suggestion.model_copy(deep=True)
+        record.tags_source = backend_name
+    record.touch()
+
+
 def tag_records(
     records: list[ImageRecord],
     backend: str | None = None,
@@ -125,15 +137,7 @@ def tag_records(
                 progress_callback(idx, total, record, skipped=True)
             continue
         suggestion = tagger.tag(record.image_path)
-        record.ai_tags = suggestion.model_copy(deep=True)
-        record.ai_tags_source = tagger.name
-        record.proposed_tags = suggestion.model_copy(deep=True)
-        record.review_status = "pending"
-        # Keep the last human classification even when explicitly re-tagging all.
-        if record.reviewed_at is None and not record.manually_edited:
-            record.tags = suggestion.model_copy(deep=True)
-            record.tags_source = tagger.name
-        record.touch()
+        apply_suggestion(record, suggestion, tagger.name)
         if progress_callback:
             progress_callback(idx, total, record, skipped=False)
     return records

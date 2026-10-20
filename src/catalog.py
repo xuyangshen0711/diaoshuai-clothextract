@@ -110,6 +110,13 @@ def approved_records(records: Iterable[ImageRecord]) -> list[ImageRecord]:
     return [r for r in records if r.review_status == "approved"]
 
 
+def library_records(records: Iterable[ImageRecord]) -> list[ImageRecord]:
+    return [r for r in records if r.review_status != "rejected" and (
+        r.review_status == "approved" or r.proposed_tags is not None
+        or r.ai_tags is not None or r.tags_source != "untagged"
+    )]
+
+
 def _save(conn, record: ImageRecord, action: str | None = None, actor="", note="") -> int:
     row = conn.execute("SELECT payload FROM records WHERE id=?", (record.id,)).fetchone()
     previous = ImageRecord.model_validate_json(row[0]) if row else None

@@ -145,14 +145,14 @@ def test_stale_catalog_write_rolls_back_all_changes(store):
     assert records[0].review_status == "approved" and records[1].tags.品类 == "连衣裙"
 
 
-def test_catalog_and_both_searches_only_include_approved_and_refresh_index(store):
+def test_catalog_includes_pending_while_searches_require_approval_and_refresh_index(store):
     pending, rejected, good = (make_record(store, name, color) for name, color in
         [("sweater", "navy"), ("dress", "red"), ("pants", "black")])
     catalog.save_catalog([pending, rejected, good])
     catalog.review_record(rejected.id, action="reject", reviewer="甲", note="无效图", expected_revision=rejected.revision)
     good = approve(good)
     client = TestClient(api.app)
-    assert [x["id"] for x in client.get("/api/catalog").json()["items"]] == [good.id]
+    assert [x["id"] for x in client.get("/api/catalog").json()["items"]] == [pending.id, good.id]
     records = catalog.load_catalog()
     assert all(r.review_status == "approved" for r, _ in search_by_text(records, "裤装"))
     image_hits = search_by_image(records, good.image_path)
@@ -160,7 +160,7 @@ def test_catalog_and_both_searches_only_include_approved_and_refresh_index(store
     _, ids, _ = embeddings.load_index()
     assert ids == [good.id]
     catalog.review_record(good.id, action="resubmit", reviewer="甲", expected_revision=good.revision)
-    assert client.get("/api/catalog").json()["count"] == 0
+    assert client.get("/api/catalog").json()["count"] == 2
     assert search_by_image(catalog.load_catalog(), good.image_path) == []
     assert search_by_text(catalog.load_catalog(), "裤装") == []
     # Old index entries cannot leak into search even before an explicit rebuild.
@@ -180,7 +180,7 @@ def test_api_import_approve_history_and_conflicts(store):
     response = client.post("/api/import?backend=mock", files={"files": ("lookbook.pptx", data.getvalue())})
     assert response.status_code == 200, response.text
     assert response.json()["extracted"] == 1
-    assert client.get("/api/catalog").json()["count"] == 0
+    assert client.get("/api/catalog").json()["count"] == 1
     queue = client.get("/api/reviews").json()
     item = queue["items"][0]
     assert queue["counts"]["pending"] == 1
@@ -219,7 +219,7 @@ def test_api_manual_patch_and_retag_cannot_bypass_review(store):
     assert result.status_code == 200
     assert result.json()["tags"]["品类"] == "外套"
     assert result.json()["proposed_tags"]["品类"] == "衬衫"
-    assert client.get("/api/catalog").json()["count"] == 0
+    assert client.get("/api/catalog").json()["count"] == 1
     assert client.patch(f"/api/records/{record.id}", json=patch).status_code == 409
     pending = catalog.load_catalog()[0]
     record = approve(pending)
@@ -229,7 +229,55 @@ def test_api_manual_patch_and_retag_cannot_bypass_review(store):
     record = catalog.load_catalog()[0]
     assert record.review_status == "pending" and record.tags.品类 == "衬衫"
     assert record.ai_tags.品类 == "毛衣"
+    assert client.get("/api/catalog").json()["count"] == 1
+
+
+def test_library_uses_pending_proposal_for_display_and_every_filter_without_changing_history(store):
+    record = make_record(store)
+    record.source.source_file = "冬季款式.xlsx"
+    record.source.source_type = "xlsx"
+    record.source.uploaded_at = "2026-10-20T03:00:00+00:00"
+    catalog.save_catalog([record])
+    record = approve(record, record.tags.model_copy(update={"品类": "外套"}))
+    tag_records([record], backend="mock", overwrite=True)
+    record.proposed_tags = record.proposed_tags.model_copy(update={
+        "品类": "裤装", "颜色主色调": "红色", "风格": "复古", "一句话描述": "本轮新的红色裤装",
+    })
+    catalog.save_catalog([record])
+    before = catalog.get_by_id(catalog.load_catalog(), record.id).model_dump()
+    history_count = len(catalog.review_history(record.id))
+    client = TestClient(api.app)
+    visible = client.get("/api/catalog", params={"review_status": "pending", "group": "下装",
+        "category": "裤装", "color": "红色", "style": "复古", "q": "本轮新的"}).json()
+    assert visible["count"] == 1
+    item = visible["items"][0]
+    assert item["display_tags"]["品类"] == "裤装" and item["tags"]["品类"] == "外套"
+    assert item["source"]["source_file"] == "冬季款式.xlsx"
+    assert item["source"]["source_type"] == "xlsx"
+    assert item["source"]["uploaded_at"] == "2026-10-20T03:00:00+00:00"
+    assert client.get("/api/catalog?category=外套").json()["count"] == 0
+    assert client.get("/api/catalog?review_status=approved").json()["count"] == 0
+    assert client.get("/api/catalog?review_status=rejected").status_code == 422
+    assert catalog.get_by_id(catalog.load_catalog(), record.id).model_dump() == before
+    assert len(catalog.review_history(record.id)) == history_count
+    approved = approve(record, record.tags.model_copy(update={"品类": "衬衫"}))
+    result = client.get("/api/catalog?review_status=approved&category=衬衫").json()["items"][0]
+    assert result["display_tags"]["品类"] == "衬衫"
+    assert result["source"] == item["source"]
+    pending = catalog.review_record(approved.id, action="resubmit", reviewer="甲", expected_revision=approved.revision)
+    catalog.review_record(pending.id, action="reject", reviewer="甲", note="图片重复",
+                          expected_revision=pending.revision)
     assert client.get("/api/catalog").json()["count"] == 0
+
+
+def test_library_hides_untagged_images_and_exposes_legacy_import_time(store):
+    record = make_record(store)
+    untagged = ImageRecord(image_path=record.image_path + ".untagged", source=record.source)
+    catalog.save_catalog([record, untagged])
+    item = TestClient(api.app).get("/api/catalog").json()["items"]
+    assert len(item) == 1 and item[0]["id"] == record.id
+    assert item[0]["source"]["uploaded_at"] is None
+    assert item[0]["source"]["extracted_at"] == record.source.extracted_at
 
 
 def test_filtered_image_search_finds_candidates_beyond_global_top_k(store):

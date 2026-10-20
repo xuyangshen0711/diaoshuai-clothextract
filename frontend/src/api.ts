@@ -18,6 +18,7 @@ export type CatalogItem = {
   image_url: string
   score?: number
   tags: FashionTags
+  display_tags: FashionTags
   tags_source: string
   manually_edited: boolean
   ai_tags: FashionTags | null
@@ -32,7 +33,11 @@ export type CatalogItem = {
     source_file: string
     source_type: string
     location: string
+    batch_id: string | null
+    uploaded_at: string | null
+    extracted_at: string
   }
+  source_url?: string | null
   row: Record<string, unknown>
 }
 
@@ -100,21 +105,54 @@ export async function searchImage(file: File, params: Record<string, string>) {
   })
 }
 
+export type ImportJob = {
+  id: string
+  kind: 'import' | 'retag'
+  backend: string
+  status: 'queued' | 'extracting' | 'tagging' | 'completed' | 'partial' | 'failed' | 'interrupted'
+  name: string
+  created_at: string
+  updated_at: string
+  total: number
+  processed: number
+  succeeded: number
+  failed: number
+  files_total: number
+  files_processed: number
+  elapsed_seconds: number
+  eta_seconds: number | null
+  current_file: string
+  message: string
+  errors: { name: string; message: string }[]
+}
+
 export async function importFiles(files: File[], backend: string) {
   const body = new FormData()
-  files.forEach((f) => body.append('files', f))
-  return request<{ extracted: number; catalog_count: number; backend: string }>(
-    `/api/import?backend=${encodeURIComponent(backend)}`,
-    { method: 'POST', body },
-  )
+  files.forEach(f => body.append('files', f))
+  return request<ImportJob>(`/api/import/jobs?backend=${encodeURIComponent(backend)}`, { method: 'POST', body })
 }
 
 export function retag(backend: string, overwrite: boolean) {
-  return request<{ catalog_count: number }>('/api/tag', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+  return request<ImportJob>('/api/tag/jobs', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ backend, overwrite }),
   })
+}
+
+export function getJobs() {
+  return request<{ items: ImportJob[] }>('/api/import/jobs')
+}
+
+export function retryJob(id: string) {
+  return request<ImportJob>(`/api/import/jobs/${id}/retry`, { method: 'POST' })
+}
+
+export function getRecord(id: string) {
+  return request<CatalogItem>(`/api/records/${encodeURIComponent(id)}`)
+}
+
+export function getSimilarRecords(id: string) {
+  return request<{ count: number; items: CatalogItem[] }>(`/api/records/${encodeURIComponent(id)}/similar`)
 }
 
 export type ReviewSnapshot = Pick<CatalogItem, 'tags' | 'ai_tags' | 'proposed_tags' | 'review_status'>
@@ -128,13 +166,15 @@ export type ReviewEvent = {
   after: ReviewSnapshot
 }
 
-export function getReviews(status: ReviewStatus, page = 1) {
+export function getReviews(status: ReviewStatus, page = 1, params: Record<string, string> = {}) {
+  const qs = new URLSearchParams({ status, page: String(page), ...params })
   return request<{
     count: number
     counts: Record<ReviewStatus, number>
     page: number
+    facets: { batches: { id: string; label: string }[]; files: string[] }
     items: CatalogItem[]
-  }>(`/api/reviews?status=${status}&page=${page}`)
+  }>(`/api/reviews?${qs}`)
 }
 
 export function getReviewHistory(id: string) {

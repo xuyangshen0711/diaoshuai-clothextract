@@ -12,7 +12,7 @@
 | 以图搜图 | ✅ | CLIP + FAISS |
 | 基础筛选 | ✅ | Vue 图库 / 搜索页 |
 | 可用界面 | ✅ | Vue 3（`frontend/`）；Streamlit 备选 `app/streamlit_app.py` |
-| 一级人工审核 | ✅ | `/review`：直接通过 / 修改后通过 / 驳回；通过后入正式图库 |
+| 一级人工审核 | ✅ | `/review`：直接通过 / 修改后通过 / 驳回；AI 分类后在主页标记未审核，通过后确认分类，驳回后移除 |
 | 审核记录与持久化 | ✅ | SQLite；AI 建议、人工结果、审核人、时间、意见与历史快照 |
 | 优先复用开源、不自训模型 | ✅ | python-pptx / openpyxl / pymupdf / CLIP / FAISS / OpenAI |
 | 项目目录结构 | ✅ | 与文档第 5 节一致，额外含 `api/`、`frontend/` |

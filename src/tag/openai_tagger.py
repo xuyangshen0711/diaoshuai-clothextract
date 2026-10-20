@@ -114,7 +114,7 @@ class OpenAITagger:
             raise RuntimeError(
                 "缺少 OPENAI_API_KEY。请在项目根目录创建 .env，或导出环境变量后再打标。"
             )
-        kwargs = {"api_key": key}
+        kwargs = {"api_key": key, "timeout": 60.0, "max_retries": 1}
         url = base_url or os.getenv("OPENAI_BASE_URL")
         if url:
             kwargs["base_url"] = url

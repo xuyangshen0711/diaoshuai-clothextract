@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 from src.catalog import (  # noqa: E402
     EXTRACTED_DIR,
     approved_records,
+    library_records,
     review_record,
     review_history,
     RAW_DIR,
@@ -81,6 +82,7 @@ def show_gallery(items: list[tuple[ImageRecord, float | None]], empty_msg: str) 
                 st.caption(f"{caption}\n\n{meta}\n相似分 {score:.3f}")
             else:
                 st.caption(f"{caption}\n\n{meta}")
+            st.caption(f"{'已审核' if record.review_status == 'approved' else '未审核'} · {record.source.source_type.upper()}\n\n{record.source.source_file} / {record.source.location}\n\n导入时间：{record.source.uploaded_at or record.source.extracted_at}")
             with st.expander("来源 / 标签"):
                 st.write(
                     {
@@ -94,8 +96,8 @@ def show_gallery(items: list[tuple[ImageRecord, float | None]], empty_msg: str) 
 
 def page_library() -> None:
     st.subheader("图片库")
-    records = approved_records(reload_catalog())
-    st.caption(f"当前共 {len(records)} 条记录")
+    records = [r.model_copy(update={"tags": r.display_tags}) for r in library_records(reload_catalog())]
+    st.caption(f"当前共 {len(records)} 条记录（含未审核）")
     selected = render_filters("lib_")
     filtered = apply_ui_filters(records, selected)
     show_gallery([(r, None) for r in filtered], "暂无图片。请先在「导入」页上传 PPT/Excel，或运行样本脚本。")
@@ -272,7 +274,7 @@ def page_import() -> None:
 
 def page_edit() -> None:
     st.subheader("人工审核")
-    st.caption("审核通过后进入正式图库；重新审核期间暂时移出图库。")
+    st.caption("未审核图片已在主页展示；审核通过后确认分类，驳回后从主页移除。")
     statuses = {"待审核": "pending", "已通过": "approved", "已驳回": "rejected"}
     selected_status = st.radio("审核状态", list(statuses), horizontal=True)
     records = [r for r in reload_catalog() if r.review_status == statuses[selected_status]]
