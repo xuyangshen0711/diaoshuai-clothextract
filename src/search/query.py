@@ -9,59 +9,34 @@ import numpy as np
 
 from src.catalog import approved_records
 from src.index.embeddings import current_index, get_embedding_backend
-from src.schema import (
-    CATEGORY,
-    COLOR,
-    DETAILS,
-    FIT,
-    ImageRecord,
-    NECKLINE,
-    SEASON,
-    SLEEVE,
-    STYLE,
-)
+from src.schema import DETAILS, FILTER_FIELDS, ImageRecord
 
 _TOKEN_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]+")
 _VOCAB = sorted(
-    {
-        *CATEGORY,
-        *STYLE,
-        *SEASON,
-        *FIT,
-        *COLOR,
-        *NECKLINE,
-        *SLEEVE,
-        *DETAILS,
-        "宽松",
-        "高领",
-        "复古感",
-    },
+    {*(v for values in FILTER_FIELDS.values() for v in values), *DETAILS, "复古感"},
     key=len,
     reverse=True,
 )
 
 
-def filter_records(
-    records: list[ImageRecord],
-    *,
-    category: str | None = None,
-    style: str | None = None,
-    season: str | None = None,
-    color: str | None = None,
-    fit: str | None = None,
-) -> list[ImageRecord]:
-    result = records
-    checks = [
-        (category, lambda r: r.tags.品类),
-        (style, lambda r: r.tags.风格),
-        (season, lambda r: r.tags.季节),
-        (color, lambda r: r.tags.颜色主色调),
-        (fit, lambda r: r.tags.版型),
-    ]
-    for value, getter in checks:
+# Query-string name → tag field, for every single-valued tag in FILTER_FIELDS.
+FILTER_PARAMS = {
+    "category": "品类",
+    "style": "风格",
+    "season": "季节",
+    "fit": "版型",
+    "color": "颜色主色调",
+    "neckline": "领型",
+    "sleeve": "袖型",
+}
+
+
+def filter_records(records: list[ImageRecord], **filters: str | None) -> list[ImageRecord]:
+    for param, value in filters.items():
         if value and value != "全部":
-            result = [r for r in result if getter(r) == value]
-    return result
+            field = FILTER_PARAMS[param]
+            records = [r for r in records if getattr(r.tags, field) == value]
+    return records
 
 
 def _vector_rank(

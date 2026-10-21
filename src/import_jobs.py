@@ -12,7 +12,7 @@ from src import catalog
 from src.catalog import CatalogConflict
 from src.extract.office import extract_from_file
 from src.schema import ImageRecord
-from src.tag.tagger import apply_suggestion, get_tagger
+from src.tag.tagger import apply_suggestion, get_tagger, needs_tagging
 
 ACTIVE = {"queued", "extracting", "tagging"}
 RETRYABLE = {"failed", "partial", "interrupted"}
@@ -97,16 +97,12 @@ def create_import(files: list[Path], backend: str, job_id=None):
     return job
 
 
-def create_retag(backend: str, overwrite: bool, source_type: str | None = None):
+def create_retag(backend: str, overwrite: bool, source_type: str | None = None, limit: int = 0):
     job = _base("retag", backend, "全量重新分类" if overwrite else "补充未确认分类")
-    for record in catalog.load_catalog():
-        if source_type and record.source.source_type != source_type:
-            continue
-        if not overwrite and (record.manually_edited or record.review_status != "pending"
-                              or record.tags_source not in {"untagged", "mock"}):
-            continue
-        job["items"].append({"record": record.model_dump(), "name": record.source.source_file + " / " + record.source.location,
-                             "state": "pending", "error": ""})
+    targets = [r for r in catalog.load_catalog()
+               if (not source_type or r.source.source_type == source_type) and needs_tagging(r, overwrite)]
+    job["items"] = [{"record": r.model_dump(), "name": r.source.source_file + " / " + r.source.location,
+                     "state": "pending", "error": ""} for r in targets[:limit or None]]
     with catalog._database() as conn:
         _table(conn)
         _put(conn, job)

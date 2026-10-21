@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
 import tempfile
-import shutil
 from contextlib import asynccontextmanager
-from uuid import uuid4
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -20,23 +20,21 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.catalog import (  # noqa: E402
-    CatalogConflict,
-    library_records,
-    review_record,
-    review_history,
     RAW_DIR,
+    CatalogConflict,
     ensure_data_dirs,
     get_by_id,
+    library_records,
     load_catalog,
-    save_catalog,
-    upsert_records,
+    review_history,
+    review_record,
 )
-from src import catalog as catalog_store, import_jobs
-from src.extract.office import extract_from_directory, extract_from_file  # noqa: E402
+from src import catalog as catalog_store, import_jobs  # noqa: E402
+from src.extract.office import SUPPORTED_SUFFIXES  # noqa: E402
 from src.index.embeddings import build_index, get_embedding_backend  # noqa: E402
-from src.schema import FILTER_FIELDS, DETAILS, FashionTags, ImageRecord, ReviewStatus  # noqa: E402
+from src.schema import CATEGORY_GROUPS, DETAILS, FILTER_FIELDS, FashionTags, ImageRecord, ReviewStatus  # noqa: E402
 from src.search.query import filter_records, search_by_image, search_by_text  # noqa: E402
-from src.tag.tagger import has_openai_key, tag_records  # noqa: E402
+from src.tag.tagger import has_openai_key  # noqa: E402
 
 ensure_data_dirs()
 
@@ -66,15 +64,22 @@ def _serialize(record: ImageRecord, score: float | None = None) -> dict[str, Any
     payload = record.model_dump()
     payload["image_url"] = f"/api/records/{record.id}/image"
     payload["display_tags"] = record.display_tags.model_dump()
-    payload["row"] = record.to_catalog_row()
     if score is not None:
         payload["score"] = score
     return payload
 
 
-class TagUpdate(BaseModel):
-    tags: FashionTags
-    expected_revision: int = Field(ge=1)
+def tag_filters(
+    category: str | None = None,
+    style: str | None = None,
+    season: str | None = None,
+    fit: str | None = None,
+    color: str | None = None,
+    neckline: str | None = None,
+    sleeve: str | None = None,
+) -> dict[str, str | None]:
+    return dict(category=category, style=style, season=season, fit=fit,
+                color=color, neckline=neckline, sleeve=sleeve)
 
 
 class TagJobRequest(BaseModel):
@@ -107,11 +112,7 @@ def meta_filters() -> dict[str, list[str]]:
 
 @app.get("/api/catalog")
 def catalog(
-    category: str | None = None,
-    style: str | None = None,
-    season: str | None = None,
-    color: str | None = None,
-    fit: str | None = None,
+    filters: dict = Depends(tag_filters),
     group: str | None = None,
     exclude_samples: bool = True,
     q: str | None = None,
@@ -125,22 +126,9 @@ def catalog(
     # Filter on the current proposal without replacing stored human decisions.
     originals = {r.id: r for r in records}
     records = [r.model_copy(update={"tags": r.display_tags}) for r in records]
-    group_map = {
-        "上衣": {"毛衣", "衬衫", "连衣裙", "套装"},
-        "下装": {"裤装", "半裙"},
-        "外套": {"外套"},
-    }
-    if group and group != "全部" and group in group_map:
-        allowed = group_map[group]
-        records = [r for r in records if r.tags.品类 in allowed]
-    records = filter_records(
-        records,
-        category=category,
-        style=style,
-        season=season,
-        color=color,
-        fit=fit,
-    )
+    if group in CATEGORY_GROUPS:
+        records = [r for r in records if r.tags.品类 in CATEGORY_GROUPS[group]]
+    records = filter_records(records, **filters)
     if q and q.strip():
         needle = q.strip().lower()
         records = [r for r in records if needle in r.search_text().lower()]
@@ -151,21 +139,10 @@ def catalog(
 def search_text(
     q: str = Query(..., min_length=1),
     top_k: int = Query(24, ge=1, le=100),
-    category: str | None = None,
-    style: str | None = None,
-    season: str | None = None,
-    color: str | None = None,
-    fit: str | None = None,
+    filters: dict = Depends(tag_filters),
 ) -> dict[str, Any]:
     records = load_catalog()
-    filtered = filter_records(
-        records,
-        category=category,
-        style=style,
-        season=season,
-        color=color,
-        fit=fit,
-    )
+    filtered = filter_records(records, **filters)
     try:
         hits = search_by_text(records, q, top_k=top_k, filtered=filtered)
     except FileNotFoundError as exc:
@@ -180,11 +157,7 @@ def search_text(
 def search_image(
     file: UploadFile = File(...),
     top_k: int = Query(24, ge=1, le=100),
-    category: str | None = None,
-    style: str | None = None,
-    season: str | None = None,
-    color: str | None = None,
-    fit: str | None = None,
+    filters: dict = Depends(tag_filters),
 ) -> dict[str, Any]:
     suffix = Path(file.filename or "query.jpg").suffix or ".jpg"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -192,14 +165,7 @@ def search_image(
         tmp_path = Path(tmp.name)
     try:
         records = load_catalog()
-        filtered = filter_records(
-            records,
-            category=category,
-            style=style,
-            season=season,
-            color=color,
-            fit=fit,
-        )
+        filtered = filter_records(records, **filters)
         hits = search_by_image(records, tmp_path, top_k=top_k, filtered=filtered)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -208,45 +174,6 @@ def search_image(
     return {
         "count": len(hits),
         "items": [_serialize(record, score) for record, score in hits],
-    }
-
-
-@app.post("/api/import")
-def import_files(
-    files: list[UploadFile] = File(default=[]),
-    use_raw_dir: bool = False,
-    backend: Literal["openai", "mock"] = "openai",
-) -> dict[str, Any]:
-    if backend == "openai" and not has_openai_key():
-        raise HTTPException(status_code=400, detail="缺少 OPENAI_API_KEY")
-
-    ensure_data_dirs()
-    new_records: list[ImageRecord] = []
-
-    if files:
-        for upload in files:
-            name = Path(upload.filename or "upload.bin").name
-            dest = RAW_DIR / name
-            dest.write_bytes(upload.file.read())
-            new_records.extend(extract_from_file(dest))
-    elif use_raw_dir:
-        new_records.extend(extract_from_directory(RAW_DIR))
-    else:
-        raise HTTPException(status_code=400, detail="请上传文件，或设置 use_raw_dir=true")
-
-    if not new_records:
-        return {"extracted": 0, "catalog_count": len(load_catalog()), "items": []}
-
-    tagged = tag_records(new_records, backend=backend, overwrite=True)
-    merged = upsert_records(load_catalog(), tagged)
-    save_catalog(merged)
-    imported_paths = {item.image_path for item in tagged}
-    return {
-        "extracted": len(tagged),
-        "pending": sum(r.review_status == "pending" for r in merged),
-        "catalog_count": len(merged),
-        "backend": backend,
-        "items": [_serialize(r) for r in merged if r.image_path in imported_paths][:20],
     }
 
 
@@ -262,7 +189,7 @@ def start_import_job(files: list[UploadFile] = File(...), backend: Literal["open
     if not files:
         raise HTTPException(status_code=422, detail="请选择文件")
     names = [Path(f.filename or "upload.bin").name for f in files]
-    if any(Path(name).suffix.lower() not in {".pdf", ".pptx", ".xlsx", ".xlsm"} for name in names):
+    if any(Path(name).suffix.lower() not in SUPPORTED_SUFFIXES for name in names):
         raise HTTPException(status_code=422, detail="仅支持 PDF、PPTX、XLSX、XLSM 文件")
     if len({name.casefold() for name in names}) != len(names):
         raise HTTPException(status_code=422, detail="同一批次有重名文件，请重命名后上传")
@@ -305,24 +232,6 @@ def retry_import_job(job_id: str):
         raise HTTPException(status_code=404, detail="任务不存在") from exc
     import_jobs.submit_job(job_id)
     return import_jobs.public_job(job)
-
-
-@app.post("/api/tag")
-def retag(req: TagJobRequest) -> dict[str, Any]:
-    if req.backend == "openai" and not has_openai_key():
-        raise HTTPException(status_code=400, detail="缺少 OPENAI_API_KEY")
-    catalog = load_catalog()
-    targets = catalog
-    if req.source_type:
-        targets = [r for r in catalog if r.source.source_type == req.source_type]
-        # tag only targets but save full catalog merge
-        tagged_targets = tag_records(targets, backend=req.backend, overwrite=req.overwrite)
-        by_id = {r.id: r for r in tagged_targets}
-        merged = [by_id.get(r.id, r) for r in catalog]
-    else:
-        merged = tag_records(catalog, backend=req.backend, overwrite=req.overwrite)
-    save_catalog(merged)
-    return {"catalog_count": len(merged), "backend": req.backend, "overwrite": req.overwrite}
 
 
 @app.get("/api/reviews")
@@ -389,25 +298,6 @@ def record_history(record_id: str) -> dict[str, Any]:
     if get_by_id(load_catalog(), record_id) is None:
         raise HTTPException(status_code=404, detail="记录不存在")
     return {"items": review_history(record_id)}
-
-
-@app.patch("/api/records/{record_id}")
-def update_record(record_id: str, body: TagUpdate) -> dict[str, Any]:
-    catalog = load_catalog()
-    record = get_by_id(catalog, record_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="记录不存在")
-    if record.revision != body.expected_revision:
-        raise CatalogConflict("记录已更新，请刷新")
-    try:
-        body.tags.validate_vocabulary()
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    record.proposed_tags = body.tags.model_copy(deep=True)
-    record.review_status = "pending"
-    record.touch()
-    save_catalog([record])
-    return _serialize(record)
 
 
 @app.post("/api/index/rebuild")

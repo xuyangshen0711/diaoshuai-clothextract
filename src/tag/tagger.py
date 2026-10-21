@@ -118,28 +118,18 @@ def apply_suggestion(record: ImageRecord, suggestion: FashionTags, backend_name:
     record.touch()
 
 
-def tag_records(
-    records: list[ImageRecord],
-    backend: str | None = None,
-    overwrite: bool = False,
-    progress_callback=None,
-) -> list[ImageRecord]:
+def needs_tagging(record: ImageRecord, overwrite: bool = False) -> bool:
+    # Without overwrite, only fill untagged / mock placeholders still awaiting review.
+    return overwrite or (not record.manually_edited and record.review_status == "pending"
+                         and record.tags_source in {"untagged", "mock"})
+
+
+def tag_records(records: list[ImageRecord], backend: str | None = None, overwrite: bool = False) -> list[ImageRecord]:
+    """Tag in memory without saving; imports and re-tags go through src.import_jobs."""
     tagger = get_tagger(backend)
-    total = len(records)
-    for idx, record in enumerate(records, start=1):
-        if (record.manually_edited or record.review_status != "pending") and not overwrite:
-            if progress_callback:
-                progress_callback(idx, total, record, skipped=True)
-            continue
-        # Without overwrite: only fill untagged / mock placeholders.
-        if not overwrite and record.tags_source not in {"untagged", "mock"}:
-            if progress_callback:
-                progress_callback(idx, total, record, skipped=True)
-            continue
-        suggestion = tagger.tag(record.image_path)
-        apply_suggestion(record, suggestion, tagger.name)
-        if progress_callback:
-            progress_callback(idx, total, record, skipped=False)
+    for record in records:
+        if needs_tagging(record, overwrite):
+            apply_suggestion(record, tagger.tag(record.image_path), tagger.name)
     return records
 
 

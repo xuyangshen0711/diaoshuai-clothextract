@@ -38,7 +38,6 @@ export type CatalogItem = {
     extracted_at: string
   }
   source_url?: string | null
-  row: Record<string, unknown>
 }
 
 export type FilterMeta = Record<string, string[]>

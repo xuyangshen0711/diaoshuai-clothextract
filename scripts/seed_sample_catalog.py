@@ -66,7 +66,7 @@ def main() -> None:
     save_catalog(tagged)
     build_index(tagged)
     print(f"Seeded {len(tagged)} sample images → data/processed/catalog.json")
-    print("Run: streamlit run app/streamlit_app.py --server.port 8517")
+    print("Run: uvicorn api.main:app --port 8520  (then npm run dev in frontend/)")
 
 
 if __name__ == "__main__":

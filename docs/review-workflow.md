@@ -50,7 +50,7 @@ npm run build
 
 可用 `CLOTHEXTRACT_DATA_DIR=/absolute/path` 指定独立数据目录。测试通过临时目录运行，不修改真实图库，也不调用付费 AI 接口。
 
-Streamlit 备选界面也使用相同数据库、审核服务和主页展示规则。旧 `/edit` 地址自动跳转到 `/review`。
+旧 `/edit` 地址自动跳转到 `/review`。
 
 默认端口被占用时，可指定独立端口（不要把测试资料导入已有服务）：
 

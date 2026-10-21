@@ -1,6 +1,5 @@
 from src.index.embeddings import (
     ClipBackend,
-    EmbeddingBackend,
     LocalLiteBackend,
     build_index,
     get_embedding_backend,
@@ -9,7 +8,6 @@ from src.index.embeddings import (
 
 __all__ = [
     "ClipBackend",
-    "EmbeddingBackend",
     "LocalLiteBackend",
     "build_index",
     "get_embedding_backend",

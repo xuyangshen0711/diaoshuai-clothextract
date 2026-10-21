@@ -16,6 +16,7 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 from src.catalog import EXTRACTED_DIR, ensure_data_dirs
 from src.schema import ImageRecord, SourceMeta
 
+SUPPORTED_SUFFIXES = {".pptx", ".xlsx", ".xlsm", ".pdf"}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 # Skip tiny icons / logos commonly embedded in lookbooks.
 MIN_IMAGE_SIDE = 120
@@ -293,25 +294,3 @@ def extract_from_file(path: Path | str, out_dir: Path | None = None) -> list[Ima
     if suffix == ".pdf":
         return extract_from_pdf(source, target)
     raise ValueError(f"Unsupported file type: {suffix}. Use .pptx, .xlsx, or .pdf")
-
-
-def extract_from_directory(
-    directory: Path | str,
-    out_dir: Path | None = None,
-) -> list[ImageRecord]:
-    root = Path(directory)
-    if not root.exists():
-        raise FileNotFoundError(root)
-
-    records: list[ImageRecord] = []
-    files = sorted(
-        [
-            *root.glob("*.pptx"),
-            *root.glob("*.xlsx"),
-            *root.glob("*.xlsm"),
-            *root.glob("*.pdf"),
-        ]
-    )
-    for file_path in files:
-        records.extend(extract_from_file(file_path, out_dir=out_dir))
-    return records

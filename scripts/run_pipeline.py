@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end MVP pipeline: extract → tag (gpt-4o-mini) → CLIP index.
+"""Import pptx/xlsx/pdf from the command line, using the same job flow as the web Import page.
 
 Example:
   python scripts/run_pipeline.py --input data/raw --backend openai
@@ -14,54 +14,35 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.catalog import RAW_DIR, load_catalog, save_catalog, upsert_records  # noqa: E402
-from src.extract.office import extract_from_directory, extract_from_file  # noqa: E402
-from src.index.embeddings import build_index, get_embedding_backend  # noqa: E402
-from src.tag.tagger import has_openai_key, tag_records  # noqa: E402
+from src import import_jobs  # noqa: E402
+from src.catalog import RAW_DIR  # noqa: E402
+from src.extract.office import SUPPORTED_SUFFIXES  # noqa: E402
+from src.tag.tagger import has_openai_key  # noqa: E402
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fashion image library pipeline")
-    parser.add_argument(
-        "--input",
-        default=str(RAW_DIR),
-        help="File or directory of pptx/xlsx/pdf (default: data/raw)",
-    )
+    parser.add_argument("--input", default=str(RAW_DIR), help="File or directory of pptx/xlsx/pdf (default: data/raw)")
     parser.add_argument("--backend", default="openai", choices=["openai", "mock"])
-    parser.add_argument("--skip-tag", action="store_true")
-    parser.add_argument("--skip-index", action="store_true")
     args = parser.parse_args()
 
     source = Path(args.input)
     if not source.exists():
         raise SystemExit(f"Input not found: {source}")
+    files = [source] if source.is_file() else sorted(
+        p for p in source.iterdir() if p.suffix.lower() in SUPPORTED_SUFFIXES)
+    if not files:
+        raise SystemExit("No pptx/xlsx/pdf files found.")
+    if args.backend == "openai" and not has_openai_key():
+        raise SystemExit("OPENAI_API_KEY missing; use --backend mock or set .env")
 
-    if source.is_file():
-        records = extract_from_file(source)
-    else:
-        records = extract_from_directory(source)
-    print(f"extracted={len(records)}")
-
-    if not records:
-        raise SystemExit("No images extracted.")
-
-    if not args.skip_tag:
-        if args.backend == "openai" and not has_openai_key():
-            raise SystemExit("OPENAI_API_KEY missing; use --backend mock or set .env")
-        records = tag_records(records, backend=args.backend, overwrite=True)
-        print(f"tagged_with={args.backend}")
-
-    merged = upsert_records(load_catalog(), records)
-    save_catalog(merged)
-    print(f"catalog_count={len(merged)}")
-    print("New classifications require human approval at /review before appearing in the library.")
-
-    if not args.skip_index:
-        backend = get_embedding_backend()
-        build_index(merged, backend=backend)
-        print(f"index_backend={backend.name} dim={backend.dim}")
-
-    print("pipeline_done")
+    job = import_jobs.create_import(files, args.backend)
+    import_jobs.run_job(job["id"])
+    result = import_jobs.public_job(import_jobs.get_job(job["id"]))
+    print(f"{result['status']}: {result['succeeded']}/{result['total']} images tagged — {result['message']}")
+    for error in result["errors"]:
+        print(f"  ! {error['name']}: {error['message']}")
+    print("New classifications require human approval at /review before they are searchable.")
 
 
 if __name__ == "__main__":
