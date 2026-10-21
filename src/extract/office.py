@@ -14,7 +14,8 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 from src.catalog import EXTRACTED_DIR, ensure_data_dirs
-from src.schema import ImageRecord, SourceMeta
+from src.extract.pdf_notes import page_notes
+from src.schema import DesignNotes, ImageRecord, SourceMeta
 
 SUPPORTED_SUFFIXES = {".pptx", ".xlsx", ".xlsm", ".pdf"}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
@@ -125,7 +126,9 @@ def extract_from_pdf(path: Path, out_dir: Path) -> list[ImageRecord]:
             infos = [(pymupdf.Rect(info["bbox"]) & page.rect, info) for info in page.get_image_info()]
             infos = [(rect, info) for rect, info in infos if not rect.is_empty]
             page_area = page.rect.width * page.rect.height
-            for image_idx, region in enumerate(_stacked_groups([rect for rect, _ in infos]), start=1):
+            regions = _stacked_groups([rect for rect, _ in infos])
+            notes = page_notes(page, regions)
+            for image_idx, region in enumerate(regions, start=1):
                 if max(region.width, region.height) / max(1, min(region.width, region.height)) > PDF_MAX_ASPECT:
                     continue  # banners and divider strips
                 if region.width * region.height > PDF_MAX_PAGE_SHARE * page_area:
@@ -145,6 +148,7 @@ def extract_from_pdf(path: Path, out_dir: Path) -> list[ImageRecord]:
                 records.append(ImageRecord(
                     image_path=str(saved.resolve()),
                     source=SourceMeta(source_file=path.name, source_type="pdf", location=f"page {page_idx + 1}"),
+                    notes=notes.get(image_idx - 1, DesignNotes()),
                 ))
     return records
 

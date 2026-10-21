@@ -47,7 +47,7 @@ class MockTagger:
 
     name = "mock"
 
-    def tag(self, image_path: str | Path) -> FashionTags:
+    def tag(self, image_path: str | Path, context: str = "") -> FashionTags:
         path = Path(image_path)
         color = _dominant_color_name(path)
         if color not in COLOR:
@@ -131,7 +131,7 @@ def tag_records(records: list[ImageRecord], backend: str | None = None, overwrit
     """
     tagger = get_tagger(backend)
     for record in records:
-        if needs_tagging(record, overwrite) and (suggestion := tagger.tag(record.image_path)):
+        if needs_tagging(record, overwrite) and (suggestion := tagger.tag(record.image_path, record.notes.text())):
             apply_suggestion(record, suggestion, tagger.name)
     return records
 

@@ -56,8 +56,8 @@ class NotGarmentFor(MockTagger):
     def __init__(self, marker):
         self.marker = marker
 
-    def tag(self, image_path):
-        return None if self.marker in str(image_path) else super().tag(image_path)
+    def tag(self, image_path, context=''):
+        return None if self.marker in str(image_path) else super().tag(image_path, context)
 
 
 def test_import_discards_non_garments(store, monkeypatch):

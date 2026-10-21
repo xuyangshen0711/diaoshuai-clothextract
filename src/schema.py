@@ -79,6 +79,26 @@ class FashionTags(BaseModel):
         )
 
 
+class DesignNotes(BaseModel):
+    """Free text printed next to the picture in the source document (not a controlled tag)."""
+
+    款号: str = ""
+    价格: str = ""
+    成分: str = ""
+    材质说明: str = ""
+    灵感价值: str = ""
+    版型特点: str = ""
+    工艺细节: str = ""
+    其他说明: str = ""
+    图注: str = ""
+    系列: str = ""
+    分组: str = ""
+
+    def text(self) -> str:
+        """Labelled lines for search and for the tagging prompt; empty fields omitted."""
+        return "\n".join(f"{key}：{value}" for key, value in self.model_dump().items() if value)
+
+
 class SourceMeta(BaseModel):
     source_file: str
     source_type: str  # pptx | xlsx | pdf | upload | sample
@@ -99,6 +119,7 @@ class ImageRecord(BaseModel):
     image_path: str
     source: SourceMeta
     tags: FashionTags = Field(default_factory=FashionTags)
+    notes: DesignNotes = Field(default_factory=DesignNotes)
     tags_source: str = "untagged"  # mock | openai | manual | untagged
     manually_edited: bool = False
     # tags retains the last human-approved classification during re-tagging.
@@ -139,6 +160,7 @@ class ImageRecord(BaseModel):
                 self.tags.领型,
                 self.tags.袖型,
                 detail,
+                self.notes.text(),
                 self.source.source_file,
                 self.source.location,
             ]

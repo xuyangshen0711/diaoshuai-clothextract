@@ -2,6 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { getRecord, type CatalogItem } from '../api'
+import DesignNotesList from '../components/DesignNotesList.vue'
 import RecordHistory from '../components/RecordHistory.vue'
 import { formatTime, importTime, sourceType } from '../utils/source'
 const route = useRoute()
@@ -34,7 +35,7 @@ watch(() => route.params.id, async id => {
         <div class="toolbar"><a class="btn" :href="`${item.image_url}?download=true`" download>下载原图</a><RouterLink class="btn primary" :to="{ name: 'search', query: { record: item.id } }">找相似款</RouterLink></div>
       </section>
       <section class="record-information" aria-label="款式信息">
-        <div class="record-title"><h2>{{ tags.品类 }}</h2><span class="task-state" :class="item.review_status">{{ labels[item.review_status] }}</span></div>
+        <div class="record-title"><h2>{{ tags.品类 }}<small v-if="item.notes?.款号" class="record-style-no">{{ item.notes.款号 }}</small></h2><span class="task-state" :class="item.review_status">{{ labels[item.review_status] }}</span></div>
         <p class="record-description">{{ tags.一句话描述 || '暂无款式描述' }}</p>
         <p v-if="item.review_status === 'pending'" class="meta">当前分类已在主页展示，尚待人工审核确认。文字与以图检索仅返回已审核图片。</p>
         <p v-else-if="item.review_status === 'rejected'" class="meta">此图片已驳回，不在主页或搜索结果中展示。</p>
@@ -44,6 +45,7 @@ watch(() => route.params.id, async id => {
         <div class="record-tag-table"><table><caption>分类标签对照</caption><thead><tr><th scope="col">标签</th><th scope="col">AI 建议{{ item.ai_tags_source === 'mock' ? '（模拟）' : '' }}</th><th scope="col">{{ item.review_status === 'approved' ? '最终分类' : '待审核分类' }}</th></tr></thead><tbody>
           <tr v-for="(value, key) in tags" :key="key" :class="{ changed: item.ai_tags && display(item.ai_tags[key]) !== display(value) }"><th scope="row">{{ key }}</th><td>{{ display(item.ai_tags?.[key]) }}</td><td>{{ display(value) }}</td></tr>
         </tbody></table></div>
+        <DesignNotesList :notes="item.notes" />
         <RecordHistory :id="item.id" />
       </section>
     </div>

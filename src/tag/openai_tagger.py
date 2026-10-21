@@ -63,6 +63,14 @@ def _coerce_tags(data: dict) -> FashionTags | None:
     ).normalized()
 
 
+def _user_text(context: str) -> str:
+    text = "请为这张女装商品图打标，只返回 JSON。"
+    if context:
+        # Source documents often name the garment outright (e.g. "版型特点：中式灯笼袖外套").
+        text += f"\n\n资料中印在这张图旁边的文字如下，可作为判断参考；与图片不符时以图片为准：\n{context}"
+    return text
+
+
 class OpenAITagger:
     name = "openai"
 
@@ -86,7 +94,7 @@ class OpenAITagger:
         self.model = model or os.getenv("OPENAI_VISION_MODEL", DEFAULT_MODEL)
         self.system_prompt = _load_system_prompt()
 
-    def tag(self, image_path: str | Path) -> FashionTags | None:
+    def tag(self, image_path: str | Path, context: str = "") -> FashionTags | None:
         path = Path(image_path)
         if not path.exists():
             raise FileNotFoundError(path)
@@ -102,7 +110,7 @@ class OpenAITagger:
                     "content": [
                         {
                             "type": "text",
-                            "text": "请为这张女装商品图打标，只返回 JSON。",
+                            "text": _user_text(context),
                         },
                         {
                             "type": "image_url",

@@ -2,7 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { jobs, isActive } from '../composables/importJobs'
 import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router'
-import { getFilters, getReviews, getReviewHistory, reviewRecord, type CatalogItem,
+import { NOTE_FIELDS, getFilters, getReviews, getReviewHistory, reviewRecord, type CatalogItem, type DesignNotes,
   type FashionTags, type FilterMeta, type ReviewEvent, type ReviewStatus } from '../api'
 
 const route = useRoute()
@@ -11,6 +11,7 @@ const labels: Record<ReviewStatus, string> = { pending: '待审核', approved: '
 const actions: Record<string, string> = {
   record_created: '导入并生成初始分类', legacy_imported: '迁移历史数据',
   classification_proposed: '提交新的待审核分类', approve: '审核通过', reject: '驳回分类', resubmit: '重新提交审核',
+  auto_rejected: 'AI 判断非款式图，自动移除',
 }
 const fields = ['品类', '风格', '季节', '版型', '颜色主色调', '领型', '袖型'] as const
 const queryValue = (key: string) => typeof route.query[key] === 'string' ? route.query[key] as string : ''
@@ -38,7 +39,10 @@ const error = ref('')
 const historyError = ref('')
 const message = ref('')
 const baseline = ref('')
-const signature = () => JSON.stringify({ tags: form, note: note.value })
+const notesForm = reactive<DesignNotes>(Object.fromEntries(NOTE_FIELDS.map(key => [key, ''])) as DesignNotes)
+const filledNotes = computed(() => NOTE_FIELDS.filter(key => current.value?.notes?.[key]))
+const emptyNotes = computed(() => NOTE_FIELDS.filter(key => !current.value?.notes?.[key]))
+const signature = () => JSON.stringify({ tags: form, notes: notesForm, note: note.value })
 const editable = computed(() => current.value?.review_status === 'pending')
 const dirty = computed(() => editable.value && baseline.value !== '' && signature() !== baseline.value)
 const edited = computed(() => !current.value?.ai_tags || JSON.stringify(form) !== JSON.stringify(current.value.ai_tags))
@@ -119,6 +123,7 @@ watch(current, async item => {
   baseline.value = ''; history.value = []; historyError.value = ''; note.value = ''
   if (!item) return
   Object.assign(form, JSON.parse(JSON.stringify(item.proposed_tags || item.tags)))
+  for (const key of NOTE_FIELDS) notesForm[key] = item.notes?.[key] || ''
   for (const key of fields) if (!meta.value[key]?.includes(form[key])) form[key] = ''
   baseline.value = signature()
   try {
@@ -138,7 +143,8 @@ async function decide(action: 'approve' | 'reject' | 'resubmit') {
   saving.value = true
   try {
     await reviewRecord(item, action, reviewer.value.trim(), note.value.trim(),
-      action === 'approve' ? JSON.parse(JSON.stringify(form)) : undefined)
+      action === 'approve' ? JSON.parse(JSON.stringify(form)) : undefined,
+      action === 'approve' ? { ...notesForm } : undefined)
     localStorage.setItem('clothextract-reviewer', reviewer.value.trim())
     message.value = action === 'approve' ? '已通过，主页已标记为已审核' :
       action === 'reject' ? '已驳回，图片已从主页移除' : '已重新提交，请在待审核中确认分类'
@@ -250,6 +256,21 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
               <label for="review-description">一句话描述</label>
               <p class="meta">AI：{{ current.ai_tags?.一句话描述 || '未提供' }}</p>
               <textarea id="review-description" v-model="form.一句话描述" rows="2" />
+            </div>
+            <div class="review-notes">
+              <strong>设计说明（资料原文，可修改）</strong>
+              <p v-if="!filledNotes.length" class="meta">资料中没有找到这张图旁边的文字说明。</p>
+              <div v-for="key in filledNotes" :key="key" class="review-description">
+                <label :for="`note-${key}`">{{ key }}</label>
+                <textarea :id="`note-${key}`" v-model="notesForm[key]" :rows="notesForm[key].length > 60 ? 4 : 1" />
+              </div>
+              <details v-if="emptyNotes.length">
+                <summary>补充其他字段</summary>
+                <div v-for="key in emptyNotes" :key="key" class="review-description">
+                  <label :for="`note-${key}`">{{ key }}</label>
+                  <textarea :id="`note-${key}`" v-model="notesForm[key]" rows="1" />
+                </div>
+              </details>
             </div>
           </fieldset>
           <div class="review-decision">

@@ -33,11 +33,11 @@ def test_partial_task_retries_only_failed_items(store, monkeypatch):
     paths = fixture_sources(store, monkeypatch)
     calls = []
     class OnceFailTagger(MockTagger):
-        def tag(self, image_path):
+        def tag(self, image_path, context=''):
             calls.append(image_path)
             if 'file-1' in image_path and calls.count(image_path) == 1:
                 raise TimeoutError('Sensitive upstream error should not be exposed')
-            return super().tag(image_path)
+            return super().tag(image_path, context)
     monkeypatch.setattr(tasks, 'get_tagger', lambda _: OnceFailTagger())
     job = tasks.create_import(paths, 'mock')
     tasks.run_job(job['id'])
@@ -60,10 +60,10 @@ def test_live_progress_does_not_block_catalog(store, monkeypatch):
     paths = fixture_sources(store, monkeypatch, count=1)
     entered, release = Event(), Event()
     class BlockingTagger(MockTagger):
-        def tag(self, path):
+        def tag(self, path, context=''):
             entered.set()
             assert release.wait(5)
-            return super().tag(path)
+            return super().tag(path, context)
     monkeypatch.setattr(tasks, 'get_tagger', lambda _: BlockingTagger())
     job = tasks.create_import(paths, 'mock')
     with ThreadPoolExecutor(max_workers=1) as pool:
@@ -126,7 +126,7 @@ def test_quota_error_stops_batch_and_redacts_credentials(store, monkeypatch):
     class QuotaError(Exception):
         status_code, code = 429, 'insufficient_quota'
     class NoQuota(MockTagger):
-        def tag(self, path):
+        def tag(self, path, context=''):
             raise QuotaError('secret-key-material')
     monkeypatch.setattr(tasks, 'get_tagger', lambda _: NoQuota())
     job = tasks.create_import(paths, 'mock')
@@ -183,7 +183,7 @@ def test_stale_retag_target_fails_before_paid_model_call(store, monkeypatch):
     job = tasks.create_retag('mock', True)
     approve(record)
     class MustNotCall(MockTagger):
-        def tag(self, path):
+        def tag(self, path, context=''):
             raise AssertionError('Stale target must be checked before invoking the model')
     monkeypatch.setattr(tasks, 'get_tagger', lambda _: MustNotCall())
     tasks.run_job(job['id'])
@@ -196,10 +196,10 @@ def test_immediate_retry_cannot_get_stuck_behind_finishing_worker(store, monkeyp
     paths = fixture_sources(store, monkeypatch, 1)
     calls, completed = [], Event()
     class OnceFail(MockTagger):
-        def tag(self, path):
+        def tag(self, path, context=''):
             calls.append(path)
             if len(calls) == 1: raise TimeoutError('transient')
-            return super().tag(path)
+            return super().tag(path, context)
     monkeypatch.setattr(tasks, 'get_tagger', lambda _: OnceFail())
     original_finish = tasks._finish
     def finish_then_retry(job, status, message, end=None):

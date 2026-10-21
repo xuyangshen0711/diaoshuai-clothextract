@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from src.schema import FashionTags, ImageRecord
+from src.schema import DesignNotes, FashionTags, ImageRecord
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = Path(os.getenv("CLOTHEXTRACT_DATA_DIR", str(ROOT / "data"))).resolve()
@@ -154,7 +154,8 @@ def get_by_id(records: list[ImageRecord], record_id: str) -> ImageRecord | None:
 
 
 def review_record(record_id: str, *, action: str, reviewer: str, expected_revision: int,
-                  tags: FashionTags | None = None, note: str = "") -> ImageRecord:
+                  tags: FashionTags | None = None, note: str = "",
+                  notes: DesignNotes | None = None) -> ImageRecord:
     reviewer, note = reviewer.strip(), note.strip()
     if not reviewer:
         raise ValueError("请填写审核人")
@@ -181,6 +182,8 @@ def review_record(record_id: str, *, action: str, reviewer: str, expected_revisi
                 final = tags or record.proposed_tags or record.tags
                 final.validate_vocabulary()
                 record.tags = final.model_copy(deep=True)
+                if notes is not None:
+                    record.notes = notes.model_copy(deep=True)
                 record.proposed_tags = None
                 record.manually_edited = record.ai_tags is None or final != record.ai_tags
                 record.tags_source = "manual" if record.manually_edited else (record.ai_tags_source or "openai")

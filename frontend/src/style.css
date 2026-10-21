@@ -695,3 +695,14 @@ a {
   .topbar { grid-template-columns: 1fr; }
   .header-actions { grid-row: 3; grid-column: 1; justify-content: flex-start; }
 }
+
+/* Design notes: free text captured from the source document */
+.design-notes { padding: 18px 0; border-top: 1px solid #d8d5cf; font-size: 14px; }
+.design-notes h3 { margin: 0 0 8px; font-size: 15px; }
+.design-notes dl { margin: 0; }
+.design-notes dl > div { display: grid; grid-template-columns: 80px 1fr; gap: 16px; margin: 10px 0; }
+.design-notes dt { color: #666; }
+.design-notes dd { margin: 0; white-space: pre-line; line-height: 1.7; overflow-wrap: anywhere; }
+.record-style-no { margin-left: 10px; font-size: 13px; font-weight: 400; color: #666; }
+.review-notes { margin: 16px 0; padding-top: 12px; border-top: 1px solid #ece9e3; }
+.review-notes details summary { cursor: pointer; color: #666; font-size: 13px; }

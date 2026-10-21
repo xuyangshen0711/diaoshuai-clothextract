@@ -200,7 +200,7 @@ def run_job(job_id):
                     current = conn.execute("SELECT revision FROM records WHERE id=?", (record.id,)).fetchone()
                     if current and current[0] != record.revision:
                         raise CatalogConflict("这张图片已更新，请检查后重试")
-                suggestion = tagger.tag(record.image_path)
+                suggestion = tagger.tag(record.image_path, record.notes.text())
                 # Commit the image and its task checkpoint together: retries never re-bill completed items.
                 with catalog._database() as conn:
                     if suggestion is None:

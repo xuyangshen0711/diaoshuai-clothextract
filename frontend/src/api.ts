@@ -10,6 +10,11 @@ export type FashionTags = {
   一句话描述: string
 }
 
+// Free text printed next to the picture in the source document; order = display order.
+export const NOTE_FIELDS = ['款号', '价格', '成分', '材质说明', '灵感价值', '版型特点', '工艺细节',
+  '其他说明', '图注', '系列', '分组'] as const
+export type DesignNotes = Record<(typeof NOTE_FIELDS)[number], string>
+
 export type ReviewStatus = 'pending' | 'approved' | 'rejected'
 
 export type CatalogItem = {
@@ -18,6 +23,7 @@ export type CatalogItem = {
   image_url: string
   score?: number
   tags: FashionTags
+  notes: DesignNotes
   display_tags: FashionTags
   tags_source: string
   manually_edited: boolean
@@ -182,11 +188,11 @@ export function getReviewHistory(id: string) {
 }
 
 export function reviewRecord(item: CatalogItem, action: 'approve' | 'reject' | 'resubmit',
-  reviewer: string, note: string, tags?: FashionTags) {
+  reviewer: string, note: string, tags?: FashionTags, notes?: DesignNotes) {
   return request<CatalogItem>(`/api/records/${item.id}/review`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action, reviewer, note, tags, expected_revision: item.revision }),
+    body: JSON.stringify({ action, reviewer, note, tags, notes, expected_revision: item.revision }),
   })
 }
 

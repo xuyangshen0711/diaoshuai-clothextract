@@ -32,7 +32,7 @@ from src.catalog import (  # noqa: E402
 from src import catalog as catalog_store, import_jobs  # noqa: E402
 from src.extract.office import SUPPORTED_SUFFIXES  # noqa: E402
 from src.index.embeddings import build_index, get_embedding_backend  # noqa: E402
-from src.schema import CATEGORY_GROUPS, DETAILS, FILTER_FIELDS, FashionTags, ImageRecord, ReviewStatus  # noqa: E402
+from src.schema import CATEGORY_GROUPS, DETAILS, FILTER_FIELDS, DesignNotes, FashionTags, ImageRecord, ReviewStatus  # noqa: E402
 from src.search.query import filter_records, search_by_image, search_by_text  # noqa: E402
 from src.tag.tagger import has_openai_key  # noqa: E402
 
@@ -277,13 +277,15 @@ class ReviewDecision(BaseModel):
     reviewer: str = Field(min_length=1, max_length=100)
     expected_revision: int = Field(ge=1)
     tags: FashionTags | None = None
+    notes: DesignNotes | None = None
     note: str = Field(default="", max_length=2000)
 
 
 @app.post("/api/records/{record_id}/review")
 def decide_review(record_id: str, body: ReviewDecision) -> dict[str, Any]:
     try:
-        record = review_record(record_id, **body.model_dump(exclude={"tags"}), tags=body.tags)
+        record = review_record(record_id, **body.model_dump(exclude={"tags", "notes"}), tags=body.tags,
+                               notes=body.notes)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="记录不存在") from exc
     except CatalogConflict:
