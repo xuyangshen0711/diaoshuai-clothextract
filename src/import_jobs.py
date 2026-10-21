@@ -16,6 +16,7 @@ from src.tag.tagger import apply_suggestion, get_tagger, needs_tagging
 
 ACTIVE = {"queued", "extracting", "tagging"}
 RETRYABLE = {"failed", "partial", "interrupted"}
+NON_GARMENT_NOTE = "AI 判断不是服装款式图，已自动移除"
 _executor: ThreadPoolExecutor | None = None
 _lock = Lock()
 
@@ -63,6 +64,7 @@ def list_jobs(limit=50):
 
 def public_job(job):
     done = sum(item["state"] == "done" for item in job["items"])
+    filtered = sum(item["state"] == "done" and item.get("filtered", False) for item in job["items"])
     failed = sum(item["state"] == "failed" for item in job["items"])
     processed = done + failed
     elapsed = job.get("elapsed", 0) + (seconds(job.get("run_started_at")) if job["status"] in ACTIVE else 0)
@@ -73,7 +75,8 @@ def public_job(job):
     return {
         "id": job["id"], "kind": job["kind"], "backend": job["backend"], "status": job["status"],
         "name": job["name"], "created_at": job["created_at"], "updated_at": job["updated_at"],
-        "total": len(job["items"]), "processed": processed, "succeeded": done, "failed": failed,
+        "total": len(job["items"]), "processed": processed, "succeeded": done - filtered,
+        "filtered": filtered, "failed": failed,
         "files_total": len(job["files"]), "files_processed": sum(f["state"] != "pending" for f in job["files"]),
         "elapsed_seconds": round(elapsed), "eta_seconds": eta, "current_file": job.get("current_file", ""),
         "message": job.get("message", ""),
@@ -138,6 +141,17 @@ def _finish(job, status, message, end=None):
         _put(conn, job)
 
 
+def _drop_non_garment(conn, record: ImageRecord, existing: bool):
+    """New images are discarded; already-catalogued ones are rejected so their history survives."""
+    if not existing:
+        Path(record.image_path).unlink(missing_ok=True)
+        return
+    record.review_status, record.reviewer = "rejected", "AI"
+    record.reviewed_at, record.review_note = now(), NON_GARMENT_NOTE
+    record.touch()
+    record.revision = catalog._save(conn, record, "auto_rejected", "AI", NON_GARMENT_NOTE)
+
+
 def run_job(job_id):
     try:
         job = get_job(job_id)
@@ -186,11 +200,15 @@ def run_job(job_id):
                     current = conn.execute("SELECT revision FROM records WHERE id=?", (record.id,)).fetchone()
                     if current and current[0] != record.revision:
                         raise CatalogConflict("这张图片已更新，请检查后重试")
-                apply_suggestion(record, tagger.tag(record.image_path), tagger.name)
+                suggestion = tagger.tag(record.image_path)
                 # Commit the image and its task checkpoint together: retries never re-bill completed items.
                 with catalog._database() as conn:
-                    record.revision = catalog._save(conn, record)
-                    item.update(state="done", error="", record=record.model_dump())
+                    if suggestion is None:
+                        _drop_non_garment(conn, record, existing=current is not None)
+                    else:
+                        apply_suggestion(record, suggestion, tagger.name)
+                        record.revision = catalog._save(conn, record)
+                    item.update(state="done", error="", filtered=suggestion is None, record=record.model_dump())
                     _put(conn, job)
             except Exception as exc:
                 item["state"], item["error"] = "failed", friendly_error(exc)
@@ -201,9 +219,13 @@ def run_job(job_id):
                     break
         has_errors = bool(blocked) or any(i["state"] != "done" for i in [*job["items"], *job["files"]])
         successes = sum(i["state"] == "done" for i in job["items"])
+        filtered = sum(i["state"] == "done" and i.get("filtered", False) for i in job["items"])
         state = ("partial" if successes else "failed") if has_errors else "completed"
         message = blocked or ("已保存成功结果，可重试剩余项目" if has_errors else
-                   "分类完成，图片已在主页展示，等待人工审核" if successes else "未找到需要处理的图片，请检查资料内容")
+                   "分类完成，图片已在主页展示，等待人工审核" if successes > filtered else
+                   "图片均不是服装款式图，已全部过滤" if successes else "未找到需要处理的图片，请检查资料内容")
+        if filtered and not blocked:
+            message += f"（已自动过滤 {filtered} 张非款式图）"
         _finish(job, state, message)
     except Exception as exc:
         job = get_job(job_id)

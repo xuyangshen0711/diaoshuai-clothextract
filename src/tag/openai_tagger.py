@@ -47,7 +47,10 @@ def _extract_json(text: str) -> dict:
         return json.loads(match.group(0))
 
 
-def _coerce_tags(data: dict) -> FashionTags:
+def _coerce_tags(data: dict) -> FashionTags | None:
+    """None means the model judged the image is not a garment (fabric close-up, logo, text card…)."""
+    if data.get("服装款式图") is False:
+        return None
     details = data.get("细节元素") or []
     if isinstance(details, str):
         details = details.split(",")
@@ -83,7 +86,7 @@ class OpenAITagger:
         self.model = model or os.getenv("OPENAI_VISION_MODEL", DEFAULT_MODEL)
         self.system_prompt = _load_system_prompt()
 
-    def tag(self, image_path: str | Path) -> FashionTags:
+    def tag(self, image_path: str | Path) -> FashionTags | None:
         path = Path(image_path)
         if not path.exists():
             raise FileNotFoundError(path)

@@ -21,6 +21,13 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 # Skip tiny icons / logos commonly embedded in lookbooks.
 MIN_IMAGE_SIDE = 120
 MIN_IMAGE_PIXELS = 20_000
+# PDF regions (points): merge tolerance, banner aspect cut-off, background page share.
+PDF_TOLERANCE = 2.0
+PDF_MAX_ASPECT = 3.5
+PDF_MAX_PAGE_SHARE = 0.6
+# Catalogue tables embed product shots as small as ~110x170 px.
+PDF_MIN_SIDE = 96
+PDF_MIN_PIXELS = 15_000
 
 
 def _safe_stem(name: str) -> str:
@@ -33,32 +40,11 @@ def _unique_path(directory: Path, stem: str, suffix: str, content: bytes) -> Pat
     return candidate
 
 
-def _apply_pdf_orientation(image: Image.Image, transform: tuple | list | None) -> Image.Image:
-    """Match on-page orientation. Many lookbook PDFs store images with a Y flip."""
-    if not transform or len(transform) < 4:
-        return image
-    a, b, c, d = (float(transform[0]), float(transform[1]), float(transform[2]), float(transform[3]))
-    # Axis-aligned cases only (typical for exported PPT/PDF lookbooks).
-    if abs(b) > 1e-3 or abs(c) > 1e-3:
-        return image
-    flip_h = a < 0
-    flip_v = d < 0
-    if flip_h and flip_v:
-        return image.transpose(Image.Transpose.ROTATE_180)
-    if flip_v:
-        return image.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-    if flip_h:
-        return image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-    return image
-
-
 def _save_image_bytes(
     content: bytes,
     out_dir: Path,
     stem: str,
     preferred_suffix: str = ".png",
-    transform: tuple | list | None = None,
-    overwrite: bool = False,
 ) -> Path | None:
     try:
         image = Image.open(io.BytesIO(content))
@@ -70,7 +56,6 @@ def _save_image_bytes(
         return None
 
     original_fmt = (image.format or "").upper()
-    image = _apply_pdf_orientation(image, transform)
     # Bake EXIF orientation if present, then drop orientation tag.
     try:
         from PIL import ImageOps
@@ -95,7 +80,7 @@ def _save_image_bytes(
         image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
 
     path = _unique_path(out_dir, stem, suffix, content)
-    if path.exists() and not overwrite:
+    if path.exists():
         return path
 
     if suffix in {".jpg", ".jpeg"} and image.mode == "RGBA":
@@ -104,61 +89,63 @@ def _save_image_bytes(
     return path
 
 
+def _stacked_groups(rects: list[pymupdf.Rect], tol: float = PDF_TOLERANCE) -> list[pymupdf.Rect]:
+    """Union image tiles that share left/right edges and touch vertically.
+
+    Lookbook exporters often slice one model photo into horizontal strips; side-by-side
+    images are left alone because they are usually separate thumbnails.
+    """
+    parent = list(range(len(rects)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, a in enumerate(rects):
+        for j in range(i + 1, len(rects)):
+            b = rects[j]
+            if (abs(a.x0 - b.x0) < tol and abs(a.x1 - b.x1) < tol
+                    and min(abs(a.y1 - b.y0), abs(b.y1 - a.y0)) < tol):
+                parent[find(i)] = find(j)
+    merged: dict[int, pymupdf.Rect] = {}
+    for i, rect in enumerate(rects):
+        merged.setdefault(find(i), pymupdf.Rect(rect)).include_rect(rect)
+    return list(merged.values())
+
+
 def extract_from_pdf(path: Path, out_dir: Path) -> list[ImageRecord]:
-    """Extract embedded images from PDF via PyMuPDF."""
+    """Render each on-page picture region, so sliced, flipped or masked images come out as shown."""
     records: list[ImageRecord] = []
     stem = _safe_stem(path.stem)
-    doc = pymupdf.open(path)
-    seen_xrefs: set[int] = set()
-
-    try:
-        for page_idx in range(doc.page_count):
-            page = doc[page_idx]
-            transform_by_xref: dict[int, tuple] = {}
-            for info in page.get_image_info(xrefs=True):
-                xref = info.get("xref")
-                transform = info.get("transform")
-                if xref is not None and transform is not None:
-                    transform_by_xref[int(xref)] = tuple(transform)
-
-            images = page.get_images(full=True)
-            image_idx = 0
-            for img in images:
-                xref = img[0]
-                if xref in seen_xrefs:
+    seen: set[str] = set()
+    with pymupdf.open(path) as doc:
+        for page_idx, page in enumerate(doc):
+            infos = [(pymupdf.Rect(info["bbox"]) & page.rect, info) for info in page.get_image_info()]
+            infos = [(rect, info) for rect, info in infos if not rect.is_empty]
+            page_area = page.rect.width * page.rect.height
+            for image_idx, region in enumerate(_stacked_groups([rect for rect, _ in infos]), start=1):
+                if max(region.width, region.height) / max(1, min(region.width, region.height)) > PDF_MAX_ASPECT:
+                    continue  # banners and divider strips
+                if region.width * region.height > PDF_MAX_PAGE_SHARE * page_area:
+                    continue  # full-page backgrounds
+                # Render at the source images' own resolution so quality matches the embedded file.
+                scale = max((max(info["width"], info["height"]) / max(rect.width, rect.height)
+                             for rect, info in infos if region.contains(rect)), default=1)
+                pix = page.get_pixmap(clip=region, matrix=pymupdf.Matrix(*[min(max(scale, 1), 4)] * 2))
+                if min(pix.width, pix.height) < PDF_MIN_SIDE or pix.width * pix.height < PDF_MIN_PIXELS:
                     continue
-                seen_xrefs.add(xref)
-                try:
-                    extracted = doc.extract_image(xref)
-                except Exception:
+                digest = hashlib.md5(pix.samples).hexdigest()
+                if digest in seen:
                     continue
-                content = extracted.get("image")
-                if not content:
-                    continue
-                ext = f".{(extracted.get('ext') or 'png').lstrip('.')}"
-                image_idx += 1
-                saved = _save_image_bytes(
-                    content,
-                    out_dir,
-                    f"{stem}_page{page_idx + 1}_{image_idx:02d}",
-                    preferred_suffix=ext,
-                    transform=transform_by_xref.get(xref),
-                    overwrite=True,
-                )
-                if saved is None:
-                    continue
-                records.append(
-                    ImageRecord(
-                        image_path=str(saved.resolve()),
-                        source=SourceMeta(
-                            source_file=path.name,
-                            source_type="pdf",
-                            location=f"page {page_idx + 1}",
-                        ),
-                    )
-                )
-    finally:
-        doc.close()
+                seen.add(digest)
+                saved = out_dir / f"{stem}_page{page_idx + 1}_{image_idx:02d}_{digest[:8]}.jpg"
+                Image.frombytes("RGB", (pix.width, pix.height), pix.samples).save(saved, quality=92)
+                records.append(ImageRecord(
+                    image_path=str(saved.resolve()),
+                    source=SourceMeta(source_file=path.name, source_type="pdf", location=f"page {page_idx + 1}"),
+                ))
     return records
 
 

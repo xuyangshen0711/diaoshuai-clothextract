@@ -105,7 +105,7 @@ onMounted(async () => {
         <p class="meta">{{ time(job.created_at) }} · {{ job.backend === 'mock' ? '模拟分类' : 'AI 分类' }} · 已用 {{ duration(job.elapsed_seconds) }}<span v-if="job.eta_seconds !== null && job.eta_seconds > 0"> · 预计剩余约 {{ duration(job.eta_seconds) }}</span></p>
         <template v-if="job.status === 'queued'"><p class="meta">前序任务完成后自动开始，无需重复提交。</p></template>
         <template v-else-if="job.status === 'extracting'"><progress :value="job.files_processed" :max="job.files_total || 1" aria-label="文件抽图进度" /><p class="meta">抽图 {{ job.files_processed }} / {{ job.files_total }} 份资料 · {{ job.current_file }}</p></template>
-        <template v-else-if="job.total"><progress :value="job.processed" :max="job.total || 1" :aria-label="`${job.name}分类进度`" /><p class="meta">已处理 {{ job.processed }} / {{ job.total }} 张，成功 {{ job.succeeded }} 张，失败 {{ job.failed }} 张<span v-if="job.status === 'tagging'"> · {{ job.current_file }}</span></p></template>
+        <template v-else-if="job.total"><progress :value="job.processed" :max="job.total || 1" :aria-label="`${job.name}分类进度`" /><p class="meta">已处理 {{ job.processed }} / {{ job.total }} 张，成功 {{ job.succeeded }} 张，<template v-if="job.filtered">过滤非款式图 {{ job.filtered }} 张，</template>失败 {{ job.failed }} 张<span v-if="job.status === 'tagging'"> · {{ job.current_file }}</span></p></template>
         <p v-if="!job.total && !isActive(job)" class="meta">未生成可分类的图片。</p>
         <p v-if="!isActive(job)" class="task-message" role="status">{{ job.message }}</p>
         <div class="toolbar"><RouterLink v-if="job.succeeded" class="btn" :to="{ path: '/review', query: job.kind === 'import' ? { batch: job.id } : {} }">审核本批图片</RouterLink>

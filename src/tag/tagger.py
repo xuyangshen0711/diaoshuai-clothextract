@@ -125,11 +125,14 @@ def needs_tagging(record: ImageRecord, overwrite: bool = False) -> bool:
 
 
 def tag_records(records: list[ImageRecord], backend: str | None = None, overwrite: bool = False) -> list[ImageRecord]:
-    """Tag in memory without saving; imports and re-tags go through src.import_jobs."""
+    """Tag in memory without saving; imports and re-tags go through src.import_jobs.
+
+    Records the tagger judges are not garments are left unchanged.
+    """
     tagger = get_tagger(backend)
     for record in records:
-        if needs_tagging(record, overwrite):
-            apply_suggestion(record, tagger.tag(record.image_path), tagger.name)
+        if needs_tagging(record, overwrite) and (suggestion := tagger.tag(record.image_path)):
+            apply_suggestion(record, suggestion, tagger.name)
     return records
 
 

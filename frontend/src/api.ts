@@ -115,6 +115,7 @@ export type ImportJob = {
   total: number
   processed: number
   succeeded: number
+  filtered: number
   failed: number
   files_total: number
   files_processed: number
