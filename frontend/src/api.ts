@@ -21,6 +21,10 @@ export type CatalogItem = {
   id: string
   image_path: string
   image_url: string
+  thumbnail_url: string
+  download_url: string
+  image_width: number | null
+  image_height: number | null
   score?: number
   tags: FashionTags
   notes: DesignNotes

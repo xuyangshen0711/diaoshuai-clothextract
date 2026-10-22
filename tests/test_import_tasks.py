@@ -114,7 +114,7 @@ def test_job_endpoint_upload_source_detail_and_download(store, monkeypatch):
     assert detail['source']['batch_id'] == job_id and detail['source_url']
     assert detail['source']['uploaded_at'] == response.json()['created_at']
     assert client.get(detail['source_url']).content == payload.getvalue()
-    downloaded = client.get(detail['image_url'] + '?download=true')
+    downloaded = client.get(detail['download_url'])
     assert downloaded.status_code == 200 and 'attachment' in downloaded.headers['content-disposition']
     queue = client.get('/api/reviews', params={'batch': job_id}).json()
     assert queue['count'] == 1 and queue['facets']['batches'][0]['id'] == job_id

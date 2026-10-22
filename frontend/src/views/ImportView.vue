@@ -81,7 +81,7 @@ onMounted(async () => {
     <section class="import-upload" aria-label="上传资料">
       <div class="dropzone" :class="{ dragging }" @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false" @drop.prevent="onDrop">
         <strong>拖入 PDF / PPT / Excel 资料</strong>
-        <p class="meta">支持多文件，分类任务提交后可离开页面。</p>
+        <p class="meta">支持多文件，尽量保留来源图片清晰度；分类任务提交后可离开页面。</p>
         <label for="import-files" class="upload-label">选择资料文件</label>
         <input id="import-files" type="file" multiple accept=".pdf,.pptx,.xlsx,.xlsm" :disabled="uploading" @change="onFiles" />
       </div>

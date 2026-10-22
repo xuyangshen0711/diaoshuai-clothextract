@@ -206,7 +206,7 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
         <button v-for="item in items" :key="item.id" class="review-queue-item"
           :class="{ selected: selectedId === item.id }" :aria-pressed="selectedId === item.id"
           :disabled="saving" @click="selectItem(item.id)">
-          <img :src="item.image_url" alt="" loading="lazy" />
+          <img :src="item.thumbnail_url || item.image_url" alt="" loading="lazy" />
           <span><strong>{{ (item.proposed_tags || item.tags).品类 }}</strong>
             <small>{{ item.source.source_file }}</small><small>{{ item.source.location }}</small></span>
         </button>

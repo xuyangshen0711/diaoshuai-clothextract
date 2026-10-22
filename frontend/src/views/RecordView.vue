@@ -31,8 +31,9 @@ watch(() => route.params.id, async id => {
     <p v-if="loading" class="empty" role="status">正在读取款式…</p><p v-if="error" class="error" role="alert">{{ error }} <RouterLink to="/">返回图库</RouterLink></p>
     <div v-if="item && tags" class="record-layout">
       <section class="record-image-panel" aria-label="款式原图"><a :href="item.image_url" target="_blank" rel="noopener"><img :src="item.image_url" :alt="tags.一句话描述 || tags.品类" width="600" height="800" /></a>
-        <p class="meta">点击图片查看完整原图，保留原始比例。</p>
-        <div class="toolbar"><a class="btn" :href="`${item.image_url}?download=true`" download>下载原图</a><RouterLink class="btn primary" :to="{ name: 'search', query: { record: item.id } }">找相似款</RouterLink></div>
+        <p class="meta">点击图片查看完整原图，保留原始比例。<span v-if="item.image_width && item.image_height"> {{ item.image_width }} × {{ item.image_height }} 像素</span></p>
+        <p v-if="item.image_width && item.image_height && Math.max(item.image_width, item.image_height) < 600" class="meta">来源图片分辨率较低，放大可能模糊。建议上传更高清的原始资料。</p>
+        <div class="toolbar"><a class="btn" :href="item.download_url || item.image_url" download>下载原图</a><RouterLink class="btn primary" :to="{ name: 'search', query: { record: item.id } }">找相似款</RouterLink></div>
       </section>
       <section class="record-information" aria-label="款式信息">
         <div class="record-title"><h2>{{ tags.品类 }}<small v-if="item.notes?.款号" class="record-style-no">{{ item.notes.款号 }}</small></h2><span class="task-state" :class="item.review_status">{{ labels[item.review_status] }}</span></div>

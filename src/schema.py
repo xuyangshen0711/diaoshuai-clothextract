@@ -104,6 +104,7 @@ class SourceMeta(BaseModel):
     source_type: str  # pptx | xlsx | pdf | upload | sample
     batch_id: str | None = None
     source_path: str | None = None
+    pdf_image_index: int | None = None
     uploaded_at: str | None = None
     location: str  # e.g. "slide 3" / "Sheet1" / "page 2"
     extracted_at: str = Field(

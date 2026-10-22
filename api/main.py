@@ -35,6 +35,7 @@ from src.index.embeddings import build_index, get_embedding_backend  # noqa: E40
 from src.schema import CATEGORY_GROUPS, DETAILS, FILTER_FIELDS, DesignNotes, FashionTags, ImageRecord, ReviewStatus  # noqa: E402
 from src.search.query import filter_records, search_by_image, search_by_text  # noqa: E402
 from src.tag.tagger import has_openai_key  # noqa: E402
+from src.images import image_metadata, image_version, thumbnail_path  # noqa: E402
 
 ensure_data_dirs()
 
@@ -62,7 +63,13 @@ async def catalog_conflict_handler(_request, exc):
 
 def _serialize(record: ImageRecord, score: float | None = None) -> dict[str, Any]:
     payload = record.model_dump()
-    payload["image_url"] = f"/api/records/{record.id}/image"
+    metadata = image_metadata(Path(record.image_path))
+    url = f"/api/records/{record.id}/image"
+    version = metadata.pop("version")
+    payload.update(metadata)
+    payload["image_url"] = f"{url}?v={version}"
+    payload["thumbnail_url"] = f"{url}?variant=thumbnail&v={version}"
+    payload["download_url"] = f"{url}?download=true&v={version}"
     payload["display_tags"] = record.display_tags.model_dump()
     if score is not None:
         payload["score"] = score
@@ -310,11 +317,15 @@ def rebuild_index() -> dict[str, Any]:
 
 
 @app.get("/api/records/{record_id}/image")
-def record_image(record_id: str, download: bool = False):
+def record_image(record_id: str, download: bool = False,
+                 variant: Literal["original", "thumbnail"] = "original", v: str | None = None):
     record = get_by_id(load_catalog(), record_id)
     if record is None or not Path(record.image_path).exists():
         raise HTTPException(status_code=404, detail="图片不存在")
-    return FileResponse(record.image_path, filename=Path(record.image_path).name if download else None)
+    original = Path(record.image_path)
+    path = thumbnail_path(record.id, original) if variant == "thumbnail" and not download else original
+    cache = "private, max-age=31536000, immutable" if v == image_version(original) else "no-cache"
+    return FileResponse(path, filename=original.name if download else None, headers={"Cache-Control": cache})
 
 
 def _source_path(record: ImageRecord) -> Path | None:

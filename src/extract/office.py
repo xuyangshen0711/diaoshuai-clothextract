@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import math
 import zipfile
 from pathlib import Path
 
@@ -29,6 +30,8 @@ PDF_MAX_PAGE_SHARE = 0.6
 # Catalogue tables embed product shots as small as ~110x170 px.
 PDF_MIN_SIDE = 96
 PDF_MIN_PIXELS = 15_000
+PDF_MAX_RENDER_PIXELS = 20_000_000
+PDF_MAX_RENDER_SIDE = 8192
 
 
 def _safe_stem(name: str) -> str:
@@ -57,36 +60,33 @@ def _save_image_bytes(
         return None
 
     original_fmt = (image.format or "").upper()
+    orientation = None
     # Bake EXIF orientation if present, then drop orientation tag.
     try:
         from PIL import ImageOps
 
+        orientation = image.getexif().get(274, 1)
         image = ImageOps.exif_transpose(image) or image
     except Exception:
         pass
 
-    suffix = preferred_suffix if preferred_suffix.startswith(".") else f".{preferred_suffix}"
-    if suffix.lower() not in IMAGE_SUFFIXES:
-        fmt = original_fmt or "PNG"
-        suffix = {
-            "JPEG": ".jpg",
-            "JPG": ".jpg",
-            "PNG": ".png",
-            "WEBP": ".webp",
-            "GIF": ".gif",
-            "BMP": ".bmp",
-        }.get(fmt, ".png")
+    suffix = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp",
+              "GIF": ".gif", "BMP": ".bmp"}.get(original_fmt, ".png")
+    if orientation != 1:
+        suffix = ".png"  # Store corrected pixels losslessly, including rotated JPEGs.
+    path = _unique_path(out_dir, stem, suffix, content)
+    if path.exists():
+        return path
+    # Keep embedded photo bytes exactly when orientation needs no correction.
+    # Re-saving JPEGs with Pillow defaults used to introduce a second lossy encode.
+    if original_fmt in {"JPEG", "PNG", "WEBP", "GIF", "BMP"} and orientation == 1:
+        path.write_bytes(content)
+        return path
 
     if image.mode not in ("RGB", "RGBA"):
         image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
 
-    path = _unique_path(out_dir, stem, suffix, content)
-    if path.exists():
-        return path
-
-    if suffix in {".jpg", ".jpeg"} and image.mode == "RGBA":
-        image = image.convert("RGB")
-    image.save(path)
+    image.save(path, format="PNG")
     return path
 
 
@@ -116,6 +116,22 @@ def _stacked_groups(rects: list[pymupdf.Rect], tol: float = PDF_TOLERANCE) -> li
     return list(merged.values())
 
 
+def pdf_render_scale(region: pymupdf.Rect, infos: list[tuple[pymupdf.Rect, dict]]) -> float:
+    """Preserve source sampling even for rotated, cropped or very small on-page photos."""
+    densities = [1.0]
+    for rect, info in infos:
+        if not region.contains(rect):
+            continue
+        a, b, c, d, *_ = info["transform"]
+        # Transform axes describe the full image, unlike the clipped bounding box.
+        x_points, y_points = math.hypot(a, b), math.hypot(c, d)
+        if x_points > 0 and y_points > 0:
+            densities.append(max(info["width"] / x_points, info["height"] / y_points))
+    return min(max(densities),
+               math.sqrt(PDF_MAX_RENDER_PIXELS / (region.width * region.height)),
+               PDF_MAX_RENDER_SIDE / max(region.width, region.height))
+
+
 def extract_from_pdf(path: Path, out_dir: Path) -> list[ImageRecord]:
     """Render each on-page picture region, so sliced, flipped or masked images come out as shown."""
     records: list[ImageRecord] = []
@@ -129,25 +145,27 @@ def extract_from_pdf(path: Path, out_dir: Path) -> list[ImageRecord]:
             regions = _stacked_groups([rect for rect, _ in infos])
             notes = page_notes(page, regions)
             for image_idx, region in enumerate(regions, start=1):
+                if min(region.width, region.height) < 12:
+                    continue  # tiny layout icons must not become large photos at native resolution
                 if max(region.width, region.height) / max(1, min(region.width, region.height)) > PDF_MAX_ASPECT:
                     continue  # banners and divider strips
                 if region.width * region.height > PDF_MAX_PAGE_SHARE * page_area:
                     continue  # full-page backgrounds
-                # Render at the source images' own resolution so quality matches the embedded file.
-                scale = max((max(info["width"], info["height"]) / max(rect.width, rect.height)
-                             for rect, info in infos if region.contains(rect)), default=1)
-                pix = page.get_pixmap(clip=region, matrix=pymupdf.Matrix(*[min(max(scale, 1), 4)] * 2))
+                scale = pdf_render_scale(region, infos)
+                pix = page.get_pixmap(clip=region, matrix=pymupdf.Matrix(scale, scale),
+                                      colorspace=pymupdf.csRGB, alpha=False)
                 if min(pix.width, pix.height) < PDF_MIN_SIDE or pix.width * pix.height < PDF_MIN_PIXELS:
                     continue
                 digest = hashlib.md5(pix.samples).hexdigest()
                 if digest in seen:
                     continue
                 seen.add(digest)
-                saved = out_dir / f"{stem}_page{page_idx + 1}_{image_idx:02d}_{digest[:8]}.jpg"
-                Image.frombytes("RGB", (pix.width, pix.height), pix.samples).save(saved, quality=92)
+                saved = out_dir / f"{stem}_page{page_idx + 1}_{image_idx:02d}_{digest[:8]}.png"
+                saved.write_bytes(pix.tobytes("png"))
                 records.append(ImageRecord(
                     image_path=str(saved.resolve()),
-                    source=SourceMeta(source_file=path.name, source_type="pdf", location=f"page {page_idx + 1}"),
+                    source=SourceMeta(source_file=path.name, source_type="pdf", location=f"page {page_idx + 1}",
+                                      pdf_image_index=image_idx),
                     notes=notes.get(image_idx - 1, DesignNotes()),
                 ))
     return records

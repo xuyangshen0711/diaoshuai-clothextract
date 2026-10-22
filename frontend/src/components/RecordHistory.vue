@@ -5,7 +5,7 @@ const props = defineProps<{ id: string }>()
 const events = ref<ReviewEvent[]>([])
 const error = ref('')
 const actions: Record<string, string> = { approve: '审核通过', reject: '驳回分类', resubmit: '重新提交审核',
-  record_created: '导入并生成分类', classification_proposed: '提交新的分类', legacy_imported: '迁移历史资料' }
+  record_created: '导入并生成分类', classification_proposed: '提交新的分类', legacy_imported: '迁移历史资料', image_refreshed: '恢复图片清晰度' }
 const describe = (tags: FashionTags) => Object.entries(tags).map(([key, value]) => `${key}：${Array.isArray(value) ? value.join('、') || '无' : value || '未提供'}`).join('；')
 let latest = 0
 watch(() => props.id, async id => {

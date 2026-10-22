@@ -138,7 +138,7 @@ watch([group, q, filters, reviewStatus], load, { deep: true })
         <article v-for="item in items" :key="item.id" class="card">
           <RouterLink class="card-link" :to="{ name: 'record', params: { id: item.id }, query: { from: route.fullPath } }">
           <img
-            :src="item.image_url"
+            :src="item.thumbnail_url || item.image_url"
             :alt="item.display_tags.一句话描述 || item.display_tags.品类"
             loading="lazy"
             width="180"
