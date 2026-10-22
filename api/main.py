@@ -34,6 +34,7 @@ from src.extract.office import SUPPORTED_SUFFIXES  # noqa: E402
 from src.index.embeddings import build_index, get_embedding_backend  # noqa: E402
 from src.schema import CATEGORY_GROUPS, DETAILS, FILTER_FIELDS, DesignNotes, FashionTags, ImageRecord, ReviewStatus  # noqa: E402
 from src.search.query import filter_records, search_by_image, search_by_text  # noqa: E402
+from src.search.inspiration import parse_inspiration  # noqa: E402
 from src.tag.tagger import has_openai_key  # noqa: E402
 from src.images import image_metadata, image_version, thumbnail_path  # noqa: E402
 
@@ -42,6 +43,8 @@ ensure_data_dirs()
 @asynccontextmanager
 async def lifespan(_app):
     import_jobs.recover_interrupted()
+    # Initialize local models on the main thread before accepting concurrent searches.
+    get_embedding_backend()
     yield
     import_jobs.shutdown_worker()
 
@@ -144,19 +147,26 @@ def catalog(
 
 @app.get("/api/search/text")
 def search_text(
-    q: str = Query(..., min_length=1),
+    q: str = Query(..., min_length=1, max_length=500),
     top_k: int = Query(24, ge=1, le=100),
     filters: dict = Depends(tag_filters),
+    include_pending: bool = False,
+    exclude_samples: bool = True,
 ) -> dict[str, Any]:
     records = load_catalog()
-    filtered = filter_records(records, **filters)
+    candidates = [r for r in records if not exclude_samples or r.source.source_type != "sample"]
+    projected = [r.model_copy(update={"tags": r.display_tags}) for r in candidates]
+    filtered = filter_records(projected, **filters)
     try:
-        hits = search_by_text(records, q, top_k=top_k, filtered=filtered)
+        backend = get_embedding_backend()
+        hits = search_by_text(records, q, top_k=top_k, filtered=filtered, backend=backend, include_pending=include_pending)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
         "count": len(hits),
         "items": [_serialize(record, score) for record, score in hits],
+        "search_info": {"engine": backend.name, "local_only": True, "include_pending": include_pending,
+                        "concepts": parse_inspiration(q).labels},
     }
 
 
@@ -165,6 +175,8 @@ def search_image(
     file: UploadFile = File(...),
     top_k: int = Query(24, ge=1, le=100),
     filters: dict = Depends(tag_filters),
+    include_pending: bool = False,
+    exclude_samples: bool = True,
 ) -> dict[str, Any]:
     suffix = Path(file.filename or "query.jpg").suffix or ".jpg"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -172,8 +184,10 @@ def search_image(
         tmp_path = Path(tmp.name)
     try:
         records = load_catalog()
-        filtered = filter_records(records, **filters)
-        hits = search_by_image(records, tmp_path, top_k=top_k, filtered=filtered)
+        candidates = [r for r in records if not exclude_samples or r.source.source_type != "sample"]
+        projected = [r.model_copy(update={"tags": r.display_tags}) for r in candidates]
+        filtered = filter_records(projected, **filters)
+        hits = search_by_image(records, tmp_path, top_k=top_k, filtered=filtered, include_pending=include_pending)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
@@ -312,7 +326,9 @@ def record_history(record_id: str) -> dict[str, Any]:
 @app.post("/api/index/rebuild")
 def rebuild_index() -> dict[str, Any]:
     catalog = load_catalog()
-    build_index(catalog)
+    backend = get_embedding_backend()
+    build_index(catalog, backend=backend)
+    build_index(catalog, backend=backend, include_pending=True)
     return {"catalog_count": len(catalog), "ok": True}
 
 
@@ -357,11 +373,12 @@ def source_document(record_id: str):
 
 
 @app.get("/api/records/{record_id}/similar")
-def similar_records(record_id: str):
+def similar_records(record_id: str, include_pending: bool = False):
     records = load_catalog()
     record = get_by_id(records, record_id)
     if record is None or not Path(record.image_path).is_file():
         raise HTTPException(status_code=404, detail="款式图片不存在")
     hits = search_by_image(records, record.image_path, top_k=24,
-                           filtered=[r for r in records if r.id != record_id and r.source.source_type != "sample"])
+                           filtered=[r for r in records if r.id != record_id and r.source.source_type != "sample"],
+                           include_pending=include_pending)
     return {"count": len(hits), "items": [_serialize(r, score) for r, score in hits]}

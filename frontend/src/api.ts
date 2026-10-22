@@ -92,20 +92,22 @@ export function getCatalog(params: Record<string, string | boolean>) {
   return request<{ count: number; items: CatalogItem[] }>(`/api/catalog${suffix}`)
 }
 
-export function searchText(q: string, params: Record<string, string>) {
+export type SearchInfo = { engine: string; local_only: boolean; include_pending: boolean; concepts: string[] }
+
+export function searchText(q: string, params: Record<string, string | boolean>) {
   const qs = new URLSearchParams({ q })
   Object.entries(params).forEach(([k, v]) => {
-    if (v && v !== '全部') qs.set(k, v)
+    if (v !== '' && v !== '全部') qs.set(k, String(v))
   })
-  return request<{ count: number; items: CatalogItem[] }>(`/api/search/text?${qs}`)
+  return request<{ count: number; items: CatalogItem[]; search_info: SearchInfo }>(`/api/search/text?${qs}`)
 }
 
-export async function searchImage(file: File, params: Record<string, string>) {
+export async function searchImage(file: File, params: Record<string, string | boolean>) {
   const body = new FormData()
   body.append('file', file)
   const qs = new URLSearchParams()
   Object.entries(params).forEach(([k, v]) => {
-    if (v && v !== '全部') qs.set(k, v)
+    if (v !== '' && v !== '全部') qs.set(k, String(v))
   })
   const suffix = qs.toString() ? `?${qs}` : ''
   return request<{ count: number; items: CatalogItem[] }>(`/api/search/image${suffix}`, {
@@ -161,8 +163,8 @@ export function getRecord(id: string) {
   return request<CatalogItem>(`/api/records/${encodeURIComponent(id)}`)
 }
 
-export function getSimilarRecords(id: string) {
-  return request<{ count: number; items: CatalogItem[] }>(`/api/records/${encodeURIComponent(id)}/similar`)
+export function getSimilarRecords(id: string, includePending = false) {
+  return request<{ count: number; items: CatalogItem[] }>(`/api/records/${encodeURIComponent(id)}/similar?include_pending=${includePending}`)
 }
 
 export type ReviewSnapshot = Pick<CatalogItem, 'tags' | 'ai_tags' | 'proposed_tags' | 'review_status'>

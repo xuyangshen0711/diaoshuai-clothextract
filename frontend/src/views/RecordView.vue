@@ -38,7 +38,7 @@ watch(() => route.params.id, async id => {
       <section class="record-information" aria-label="款式信息">
         <div class="record-title"><h2>{{ tags.品类 }}<small v-if="item.notes?.款号" class="record-style-no">{{ item.notes.款号 }}</small></h2><span class="task-state" :class="item.review_status">{{ labels[item.review_status] }}</span></div>
         <p class="record-description">{{ tags.一句话描述 || '暂无款式描述' }}</p>
-        <p v-if="item.review_status === 'pending'" class="meta">当前分类已在主页展示，尚待人工审核确认。文字与以图检索仅返回已审核图片。</p>
+        <p v-if="item.review_status === 'pending'" class="meta">当前分类已在主页展示，尚待人工审核确认。搜索时可选择是否包含未审核图片。</p>
         <p v-else-if="item.review_status === 'rejected'" class="meta">此图片已驳回，不在主页或搜索结果中展示。</p>
         <dl class="record-source"><div><dt>资料类型</dt><dd>{{ sourceType(item.source) }}</dd></div><div><dt>导入时间</dt><dd><time :datetime="importTime(item.source)">{{ formatTime(importTime(item.source)) }}</time></dd></div></dl>
         <dl class="record-source"><div><dt>来源资料</dt><dd>{{ item.source.source_file }}</dd></div><div><dt>所在位置</dt><dd>{{ item.source.location }}</dd></div><div v-if="item.reviewer"><dt>上次审核</dt><dd>{{ item.reviewer }} · {{ item.reviewed_at ? new Date(item.reviewed_at).toLocaleString('zh-CN', { hour12: false }) : '' }}</dd></div><div v-if="item.review_note"><dt>审核意见</dt><dd>{{ item.review_note }}</dd></div></dl>

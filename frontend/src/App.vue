@@ -24,14 +24,7 @@ function selectGroup(value: string) {
 watch(() => route.query.q, value => { query.value = typeof value === 'string' ? value : '' }, { immediate: true })
 
 function submitSearch() {
-  router.push({
-    name: 'library',
-    query: {
-      ...route.query,
-      q: query.value.trim() || undefined,
-      group: group.value === '全部' ? undefined : group.value,
-    },
-  })
+  if (query.value.trim()) router.push({ name: 'search', query: { mode: 'text', q: query.value.trim() } })
 }
 
 function goHome() {
@@ -76,7 +69,7 @@ function toggleFilters() {
             <circle cx="11" cy="11" r="7" />
             <path d="M20 20l-3.5-3.5" />
           </svg>
-          <input v-model="query" aria-label="搜索品类或颜色" placeholder="搜索品类或颜色…" />
+          <input v-model="query" aria-label="搜索款式或灵感" placeholder="搜索款式或灵感…" />
         </form>
         <button class="icon-btn" type="button" @click="toggleFilters">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
@@ -85,7 +78,8 @@ function toggleFilters() {
           筛选
         </button>
         <div class="util-links">
-          <RouterLink to="/search">以图搜</RouterLink>
+          <RouterLink to="/search?mode=text">灵感找款</RouterLink>
+          <RouterLink to="/search?mode=image">以图搜</RouterLink>
           <RouterLink to="/import">导入任务<span v-if="activeJobCount" class="nav-count">{{ activeJobCount }}</span></RouterLink>
           <RouterLink to="/review">人工审核</RouterLink>
         </div>

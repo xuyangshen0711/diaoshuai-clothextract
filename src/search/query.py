@@ -7,7 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
-from src.catalog import approved_records
+from src.catalog import approved_records, library_records
+from src.search.inspiration import parse_inspiration
 from src.index.embeddings import current_index, get_embedding_backend
 from src.schema import DETAILS, FILTER_FIELDS, ImageRecord
 
@@ -45,8 +46,9 @@ def _vector_rank(
     top_k: int = 12,
     candidate_ids: set[str] | None = None,
     backend=None,
+    include_pending: bool = False,
 ) -> list[tuple[ImageRecord, float]]:
-    index, ids, _meta = current_index(records, backend or get_embedding_backend())
+    index, ids, _meta = current_index(records, backend or get_embedding_backend(), include_pending=include_pending)
     if index.ntotal == 0 or not ids:
         return []
 
@@ -55,7 +57,15 @@ def _vector_rank(
         raise ValueError(
             f"Query dim {vec.shape[1]} != index dim {index.d}. Please rebuild the index."
         )
-    scores, indices = index.search(vec, len(ids) if candidate_ids is not None else min(top_k, len(ids)))
+    # IndexFlatIP stores exact vectors. Rank their inner products with NumPy:
+    # FAISS's OpenMP search can abort in worker threads beside macOS PyTorch.
+    # This preserves the same cosine ranking without a second parallel runtime.
+    vectors = index.reconstruct_n(0, index.ntotal)
+    similarities = np.asarray(vectors @ vec[0], dtype=np.float32)
+    order = np.argsort(-similarities, kind="stable")
+    if candidate_ids is None:
+        order = order[:top_k]
+    scores, indices = similarities[order][None, :], order[None, :]
     by_id = {r.id: r for r in records}
     ranked: list[tuple[ImageRecord, float]] = []
     for score, idx in zip(scores[0], indices[0]):
@@ -92,6 +102,7 @@ def _query_terms(query: str) -> list[str]:
 
 
 def _lexical_score(query: str, record: ImageRecord) -> float:
+    record = record.model_copy(update={"tags": record.display_tags})
     hay = record.search_text().lower()
     tokens = _query_terms(query)
     if not tokens:
@@ -118,13 +129,18 @@ def search_by_text(
     top_k: int = 12,
     backend=None,
     filtered: list[ImageRecord] | None = None,
+    include_pending: bool = False,
 ) -> list[tuple[ImageRecord, float]]:
     """CLIP text→image search, boosted by Chinese tag lexical matches."""
     query = query.strip()
     if not query:
         return []
-    records = approved_records(records)
-    pool = approved_records(filtered) if filtered is not None else records
+    visible = library_records if include_pending else approved_records
+    records = visible(records)
+    allowed_ids = {r.id for r in filtered} if filtered is not None else None
+    pool = [r for r in records if allowed_ids is None or r.id in allowed_ids]
+    intent = parse_inspiration(query)
+    pool = [r for r in pool if intent.accepts(r)]
     if not pool:
         return []
     backend = backend or get_embedding_backend()
@@ -132,25 +148,28 @@ def search_by_text(
 
     # Primary: shared CLIP space (text query vs indexed image vectors).
     try:
-        vector_hits = {} if backend.name == "local-lite" else {
+        vector_hits = {} if backend.name == "local-lite" or not (intent.preferences or intent.terms) else {
             r.id: score
             for r, score in _vector_rank(
                 records,
-                backend.encode_text(query),
+                backend.encode_text(intent.expanded_text),
                 top_k=max(top_k * 3, top_k),
                 candidate_ids=candidate_ids,
                 backend=backend,
+                include_pending=include_pending,
             )
         }
     except Exception:
         vector_hits = {}
 
     scored: list[tuple[ImageRecord, float]] = []
+    positive_text = " ".join([*intent.terms, *(v for values in intent.preferences.values() for v in sorted(values))])
     for record in pool:
-        lex = _lexical_score(query, record)
+        lex = _lexical_score(positive_text, record)
+        preference = intent.score(record)
         clip = max(vector_hits.get(record.id, 0.0), 0.0)
-        score = clip * 1.0 + lex * 1.25
-        if score > 0:
+        score = max(clip - 0.15, 0) * 2 + lex * 0.5 + preference
+        if score > 0 and (preference > 0 or lex > 0 or clip >= 0.22):
             scored.append((record, score))
     scored.sort(key=lambda item: item[1], reverse=True)
     return scored[:top_k]
@@ -162,9 +181,12 @@ def search_by_image(
     top_k: int = 12,
     backend=None,
     filtered: list[ImageRecord] | None = None,
+    include_pending: bool = False,
 ) -> list[tuple[ImageRecord, float]]:
-    records = approved_records(records)
-    pool = approved_records(filtered) if filtered is not None else records
+    visible = library_records if include_pending else approved_records
+    records = visible(records)
+    allowed_ids = {r.id for r in filtered} if filtered is not None else None
+    pool = [r for r in records if allowed_ids is None or r.id in allowed_ids]
     if not pool:
         return []
     backend = backend or get_embedding_backend()
@@ -175,4 +197,5 @@ def search_by_image(
         top_k=top_k,
         candidate_ids=candidate_ids,
         backend=backend,
+        include_pending=include_pending,
     )

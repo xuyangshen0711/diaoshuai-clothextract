@@ -60,7 +60,7 @@ async function retry(job: ImportJob) {
 }
 async function runRebuild() {
   uploading.value = true; error.value = ''
-  try { await rebuildIndex(); status.value = '已刷新审核通过图片的检索索引' }
+  try { await rebuildIndex(); status.value = '已刷新已审核与包含未审核的两种搜索索引' }
   catch (e) { error.value = e instanceof Error ? e.message : String(e) }
   finally { uploading.value = false }
 }

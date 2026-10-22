@@ -1,6 +1,6 @@
 # 服装内部图片库（MVP）
 
-按 [`docs/mvp-requirements.md`](docs/mvp-requirements.md) 落地：把 PPT / Excel / PDF 里的女装款式图抽取、打标、归类，AI 分类后即在主页归类展示并标记「未审核」，人工确认后标记「已审核」；文字搜索与以图搜图使用已审核图片。
+按 [`docs/mvp-requirements.md`](docs/mvp-requirements.md) 落地：把 PPT / Excel / PDF 里的女装款式图抽取、打标、归类，AI 分类后即在主页归类展示并标记「未审核」，人工确认后标记「已审核」；灵感搜索与以图找款可以选择是否包含未审核图片。
 
 对照清单见 [`docs/mvp-checklist.md`](docs/mvp-checklist.md)。
 

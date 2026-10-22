@@ -669,6 +669,27 @@ a {
 .search-reference { display: flex; align-items: center; gap: 20px; padding-bottom: 22px; margin-bottom: 20px; border-bottom: 1px solid #d8d5cf; }
 .search-reference img { width: 90px; height: 120px; object-fit: contain; background: #eae7e0; }
 .search-reference > div { min-width: 0; overflow-wrap: anywhere; }
+.inspiration-modes { display: flex; gap: 8px; margin: 20px 0 14px; }
+.inspiration-modes [aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: white; }
+.inspiration-form { display: flex; gap: 10px; align-items: stretch; }
+.inspiration-form > input { flex: 1; min-width: 0; border: 1px solid #d8d5cf; background: white; border-radius: 8px; padding: 14px 16px; color: var(--ink); font: inherit; }
+.inspiration-form > button { flex-shrink: 0; border-radius: 8px; }
+.inspiration-examples { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin: 12px 0 20px; font-size: 12px; color: #666; }
+.inspiration-examples button { border: 0; border-bottom: 1px dashed #a7a197; padding: 3px 0; background: none; color: #57534b; cursor: pointer; font: inherit; text-align: left; }
+.inspiration-options { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 14px 0; border-top: 1px solid var(--line); }
+.inspiration-options label { display: flex; gap: 8px; align-items: center; font-size: 13px; cursor: pointer; }
+.inspiration-options input { accent-color: #33312d; width: 16px; height: 16px; }
+.inspiration-options .meta { margin: 0; }
+.inspiration-concepts { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 4px 0 16px; font-size: 12px; color: #666; }
+.inspiration-concept { background: #eae7df; color: #514b43; padding: 4px 9px; border-radius: 4px; }
+@media (min-width: 901px) and (max-width: 1200px) {
+  .topbar { grid-template-columns: 1fr auto; }
+  .header-actions { grid-column: 1 / -1; justify-content: flex-start; }
+}
+@media (max-width: 560px) {
+  .inspiration-form { flex-direction: column; }
+  .inspiration-form > button { min-height: 44px; }
+}
 .import-page :focus-visible, .record-page :focus-visible, .search-page :focus-visible { outline: 2px solid #546d8c; outline-offset: 3px; }
 @media (max-width: 700px) {
   .record-layout { grid-template-columns: 1fr; gap: 24px; }
