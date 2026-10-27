@@ -22,6 +22,7 @@ input,
 select,
 textarea {
   font: inherit;
+  letter-spacing: inherit;
 }
 
 a {
@@ -1103,6 +1104,7 @@ a {
 .text-button,
 .suffix-hint,
 .unsaved-mark { color: var(--link); }
+.text-button { font-size: 14.5px; }
 
 .library-search input,
 .sort-field select,
