@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from src.schema import DesignNotes, FashionTags, ImageRecord
+from src.schema import DesignNotes, FashionTags, ImageRecord, coerce_source_category
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = Path(os.getenv("CLOTHEXTRACT_DATA_DIR", str(ROOT / "data"))).resolve()
@@ -71,6 +71,8 @@ def _database():
             CREATE INDEX IF NOT EXISTS events_record ON review_events(record_id, id);
             CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY);
         """)
+        from src.factory.tables import ensure_factory, migrate_source_categories
+        ensure_factory(conn)
         conn.execute("BEGIN IMMEDIATE")
         if not conn.execute("SELECT 1 FROM migrations WHERE name='legacy_json'").fetchone():
             if CATALOG_PATH.exists():
@@ -90,6 +92,7 @@ def _database():
                     )
                     _event(conn, record, "legacy_imported", note="历史 JSON 导入，等待人工审核")
             conn.execute("INSERT INTO migrations VALUES ('legacy_json')")
+        migrate_source_categories(conn)
         yield conn
         conn.commit()
     except Exception:
@@ -128,6 +131,14 @@ def _save(conn, record: ImageRecord, action: str | None = None, actor="", note="
         raise CatalogConflict("记录已不存在，请刷新")
     stored = record.model_copy(deep=True)
     stored.revision = (previous.revision if previous else 0) + 1
+    if stored.source_category == "本厂产品" and stored.style_code:
+        clash = conn.execute(
+            "SELECT id FROM records WHERE id != ? AND json_extract(payload, '$.source_category') = '本厂产品' "
+            "AND json_extract(payload, '$.style_code') = ?",
+            (stored.id, stored.style_code),
+        ).fetchone()
+        if clash:
+            raise CatalogConflict(f"款号 {stored.style_code} 已有图片")
     conn.execute(
         "INSERT INTO records VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
         "image_path=excluded.image_path, review_status=excluded.review_status, "
@@ -159,10 +170,11 @@ def review_record(record_id: str, *, action: str, reviewer: str, expected_revisi
     reviewer, note = reviewer.strip(), note.strip()
     if not reviewer:
         raise ValueError("请填写审核人")
-    if action not in {"approve", "reject", "resubmit"}:
+    if action not in {"approve", "reject", "resubmit", "keep_image"}:
         raise ValueError("未知审核操作")
     if action == "reject" and not note:
         raise ValueError("驳回时请填写原因")
+    dropped_image = None
     with _database() as conn:
         row = conn.execute("SELECT payload FROM records WHERE id=?", (record_id,)).fetchone()
         if not row:
@@ -175,6 +187,31 @@ def review_record(record_id: str, *, action: str, reviewer: str, expected_revisi
                 raise CatalogConflict("记录已在待审核队列中")
             record.review_status = "pending"
             record.proposed_tags = (record.proposed_tags or record.tags).model_copy(deep=True)
+        elif action == "keep_image":
+            if not record.pending_image_path:
+                raise ValueError("没有待确认的新图片")
+            dropped_image = record.pending_image_path
+            previous_row = conn.execute(
+                "SELECT before_json FROM review_events WHERE record_id=? AND action='image_replacement_proposed' "
+                "ORDER BY id DESC LIMIT 1",
+                (record_id,),
+            ).fetchone()
+            if previous_row and previous_row[0]:
+                previous = ImageRecord.model_validate_json(previous_row[0])
+                record.review_status = previous.review_status
+                record.proposed_tags = previous.proposed_tags
+                record.ai_tags = previous.ai_tags
+                record.ai_tags_source = previous.ai_tags_source
+                record.tags = previous.tags
+                record.tags_source = previous.tags_source
+                record.manually_edited = previous.manually_edited
+                record.reviewer = previous.reviewer
+                record.reviewed_at = previous.reviewed_at
+                record.review_note = previous.review_note
+            elif record.reviewed_at:
+                record.review_status = "approved"
+                record.proposed_tags = None
+            record.pending_image_path = None
         else:
             if record.review_status != "pending":
                 raise CatalogConflict("记录已完成审核，请勿重复提交")
@@ -188,6 +225,8 @@ def review_record(record_id: str, *, action: str, reviewer: str, expected_revisi
                 record.manually_edited = record.ai_tags is None or final != record.ai_tags
                 record.tags_source = "manual" if record.manually_edited else (record.ai_tags_source or "openai")
                 record.review_status = "approved"
+                if record.pending_image_path:
+                    _adopt_pending_image(record)
             else:
                 record.review_status = "rejected"
             record.reviewer = reviewer
@@ -196,7 +235,66 @@ def review_record(record_id: str, *, action: str, reviewer: str, expected_revisi
         record.touch()
         revision = _save(conn, record, action, reviewer, note)
     record.revision = revision
+    if dropped_image:
+        discard_unreferenced_image(dropped_image, record)
     return record
+
+
+def _adopt_pending_image(record: ImageRecord) -> None:
+    pending = record.pending_image_path or ""
+    path = Path(pending)
+    if not path.is_file():
+        raise ValueError("待确认的新图片文件已缺失")
+    record.image_history.append({
+        "image_path": record.image_path,
+        "archived_at": datetime.now(timezone.utc).isoformat(),
+        "note": "替换前保留的原图",
+    })
+    record.image_path = str(path.resolve())
+    record.pending_image_path = None
+
+
+def discard_unreferenced_image(path_str: str, record: ImageRecord) -> None:
+    if not path_str:
+        return
+    path = Path(path_str)
+    referenced = {str(Path(item).resolve()) for item in [record.image_path, *(
+        entry.get("image_path") for entry in record.image_history
+    )] if item and Path(item).exists()}
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(EXTRACTED_DIR.resolve())
+    except ValueError:
+        return
+    if str(resolved) in referenced:
+        return
+    path.unlink(missing_ok=True)
+
+
+def assign_source_category(ids: list[str], category: str) -> list[ImageRecord]:
+    from src.factory.codes import image_style_code, parse_style_code
+
+    category = coerce_source_category(category, required=True)
+    if not ids:
+        raise ValueError("请选择要修改的图片")
+    updated: list[ImageRecord] = []
+    with _database() as conn:
+        for record_id in ids:
+            row = conn.execute("SELECT payload FROM records WHERE id=?", (record_id,)).fetchone()
+            if not row:
+                raise KeyError(record_id)
+            record = ImageRecord.model_validate_json(row[0])
+            record.source_category = category
+            if category == "本厂产品" and not record.style_code and record.source.source_type == "image":
+                parsed = parse_style_code(image_style_code(record.source.source_file))
+                if parsed and not parsed.suffix:
+                    record.style_code = parsed.base
+                    if not record.notes.款号:
+                        record.notes.款号 = parsed.base
+            record.touch()
+            record.revision = _save(conn, record, "source_category_changed", note=f"资料大类改为{category}")
+            updated.append(record)
+    return updated
 
 
 def review_history(record_id: str) -> list[dict]:

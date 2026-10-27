@@ -24,7 +24,10 @@ function selectGroup(value: string) {
 watch(() => route.query.q, value => { query.value = typeof value === 'string' ? value : '' }, { immediate: true })
 
 function submitSearch() {
-  if (query.value.trim()) router.push({ name: 'search', query: { mode: 'text', q: query.value.trim() } })
+  if (query.value.trim()) {
+    const source = onLibrary.value && typeof route.query.source_category === 'string' ? route.query.source_category : undefined
+    router.push({ name: 'search', query: { mode: 'text', q: query.value.trim(), source_category: source } })
+  }
 }
 
 function goHome() {

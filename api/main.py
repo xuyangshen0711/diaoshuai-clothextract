@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
 from src.catalog import (  # noqa: E402
     RAW_DIR,
     CatalogConflict,
+    assign_source_category,
     ensure_data_dirs,
     get_by_id,
     library_records,
@@ -32,7 +33,30 @@ from src.catalog import (  # noqa: E402
 from src import catalog as catalog_store, import_jobs  # noqa: E402
 from src.extract.office import SUPPORTED_SUFFIXES  # noqa: E402
 from src.index.embeddings import build_index, get_embedding_backend  # noqa: E402
-from src.schema import CATEGORY_GROUPS, DETAILS, FILTER_FIELDS, DesignNotes, FashionTags, ImageRecord, ReviewStatus  # noqa: E402
+from src.factory.archive import import_archive  # noqa: E402
+from src.factory.context import reset_search_blobs  # noqa: E402
+from src.factory.library import (  # noqa: E402
+    card_fields,
+    detail_fields,
+    display_categories,
+    in_group,
+    load_index,
+    matches_factory,
+    prime_search,
+)
+from src.factory.sales import import_sales  # noqa: E402
+from src.schema import (  # noqa: E402
+    CATEGORY_GROUPS,
+    DETAILS,
+    FILTER_FIELDS,
+    SOURCE_CATEGORIES,
+    UNCLASSIFIED_SOURCE,
+    DesignNotes,
+    FashionTags,
+    ImageRecord,
+    ReviewStatus,
+    coerce_source_category,
+)
 from src.search.query import filter_records, search_by_image, search_by_text  # noqa: E402
 from src.search.inspiration import parse_inspiration  # noqa: E402
 from src.tag.tagger import has_openai_key  # noqa: E402
@@ -64,7 +88,7 @@ async def catalog_conflict_handler(_request, exc):
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
-def _serialize(record: ImageRecord, score: float | None = None) -> dict[str, Any]:
+def _serialize(record: ImageRecord, score: float | None = None, index=None) -> dict[str, Any]:
     payload = record.model_dump()
     metadata = image_metadata(Path(record.image_path))
     url = f"/api/records/{record.id}/image"
@@ -74,9 +98,50 @@ def _serialize(record: ImageRecord, score: float | None = None) -> dict[str, Any
     payload["thumbnail_url"] = f"{url}?variant=thumbnail&v={version}"
     payload["download_url"] = f"{url}?download=true&v={version}"
     payload["display_tags"] = record.display_tags.model_dump()
+    factory = index if index is not None else load_index()
+    payload.update(card_fields(record, factory))
+    pending = Path(record.pending_image_path) if record.pending_image_path else None
+    if pending and pending.is_file():
+        payload["pending_image_url"] = f"{url}?variant=pending&v={image_version(pending)}"
+    else:
+        payload["pending_image_url"] = None
     if score is not None:
         payload["score"] = score
     return payload
+
+
+def _factory_filters(
+    color_family: str | None = None,
+    size: str | None = None,
+    series: str | None = None,
+    needle: str | None = None,
+    customer: str | None = None,
+    archive_season: str | None = None,
+) -> dict[str, str | None]:
+    return dict(color_family=color_family, size=size, series=series, needle=needle,
+                customer=customer, archive_season=archive_season)
+
+
+def _narrow(records: list[ImageRecord], *, filters: dict, group: str | None, q: str | None,
+            source_category: str | None, factory_filters: dict, index) -> list[ImageRecord]:
+    if source_category and source_category not in {"", "全部"}:
+        records = [record for record in records if record.source_category == source_category]
+    by_id = {record.id: record for record in records}
+    category = filters.get("category")
+    projected = [record.model_copy(update={"tags": record.display_tags}) for record in records]
+    if group in CATEGORY_GROUPS:
+        projected = [record for record in projected if in_group(by_id[record.id], group, index)]
+    projected = filter_records(projected, **{key: value for key, value in filters.items() if key != "category"})
+    if category and category != "全部":
+        projected = [record for record in projected if category in display_categories(by_id[record.id], index)]
+    chosen = [by_id[record.id] for record in projected
+              if matches_factory(by_id[record.id], index, **factory_filters)]
+    if q and q.strip():
+        needle = q.strip().lower()
+        # Match the proposal the library is showing, and the archive text primed for this request.
+        chosen = [record for record in chosen if needle in record.model_copy(
+            update={"tags": record.display_tags}).search_text().lower()]
+    return chosen
 
 
 def tag_filters(
@@ -120,29 +185,45 @@ def meta_filters() -> dict[str, list[str]]:
     return {**FILTER_FIELDS, "细节元素": DETAILS}
 
 
+@app.get("/api/meta/library")
+def library_meta() -> dict[str, Any]:
+    index = load_index()
+    return {
+        "source_categories": list(SOURCE_CATEGORIES),
+        "unclassified": UNCLASSIFIED_SOURCE,
+        "factory": index.facets,
+    }
+
+
 @app.get("/api/catalog")
 def catalog(
     filters: dict = Depends(tag_filters),
+    factory_filters: dict = Depends(_factory_filters),
     group: str | None = None,
     exclude_samples: bool = True,
     q: str | None = None,
     review_status: Literal["pending", "approved"] | None = None,
+    source_category: str | None = None,
+    sort: str | None = None,
 ) -> dict[str, Any]:
-    records = library_records(load_catalog())
-    if exclude_samples:
-        records = [r for r in records if r.source.source_type != "sample"]
-    if review_status:
-        records = [r for r in records if r.review_status == review_status]
-    # Filter on the current proposal without replacing stored human decisions.
-    originals = {r.id: r for r in records}
-    records = [r.model_copy(update={"tags": r.display_tags}) for r in records]
-    if group in CATEGORY_GROUPS:
-        records = [r for r in records if r.tags.品类 in CATEGORY_GROUPS[group]]
-    records = filter_records(records, **filters)
-    if q and q.strip():
-        needle = q.strip().lower()
-        records = [r for r in records if needle in r.search_text().lower()]
-    return {"count": len(records), "items": [_serialize(originals[r.id]) for r in records]}
+    index = load_index()
+    token = prime_search(index)
+    try:
+        records = library_records(load_catalog())
+        if exclude_samples:
+            records = [r for r in records if r.source.source_type != "sample"]
+        if review_status:
+            records = [r for r in records if r.review_status == review_status]
+        records = _narrow(records, filters=filters, group=group, q=q, source_category=source_category,
+                          factory_filters=factory_filters, index=index)
+        if sort == "sales":
+            records.sort(key=lambda record: (
+                -(index.sales_totals(record.style_code)[0] if record.source_category == "本厂产品" else 0),
+                record.style_code, record.id,
+            ))
+        return {"count": len(records), "items": [_serialize(record, index=index) for record in records]}
+    finally:
+        reset_search_blobs(token)
 
 
 @app.get("/api/search/text")
@@ -152,22 +233,29 @@ def search_text(
     filters: dict = Depends(tag_filters),
     include_pending: bool = False,
     exclude_samples: bool = True,
+    source_category: str | None = None,
+    factory_filters: dict = Depends(_factory_filters),
 ) -> dict[str, Any]:
-    records = load_catalog()
-    candidates = [r for r in records if not exclude_samples or r.source.source_type != "sample"]
-    projected = [r.model_copy(update={"tags": r.display_tags}) for r in candidates]
-    filtered = filter_records(projected, **filters)
+    index = load_index()
+    token = prime_search(index)
     try:
-        backend = get_embedding_backend()
-        hits = search_by_text(records, q, top_k=top_k, filtered=filtered, backend=backend, include_pending=include_pending)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {
-        "count": len(hits),
-        "items": [_serialize(record, score) for record, score in hits],
-        "search_info": {"engine": backend.name, "local_only": True, "include_pending": include_pending,
-                        "concepts": parse_inspiration(q).labels},
-    }
+        records = load_catalog()
+        candidates = [r for r in records if not exclude_samples or r.source.source_type != "sample"]
+        filtered = _narrow(candidates, filters=filters, group=None, q=None, source_category=source_category,
+                           factory_filters=factory_filters, index=index)
+        try:
+            backend = get_embedding_backend()
+            hits = search_by_text(records, q, top_k=top_k, filtered=filtered, backend=backend, include_pending=include_pending)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "count": len(hits),
+            "items": [_serialize(record, score, index) for record, score in hits],
+            "search_info": {"engine": backend.name, "local_only": True, "include_pending": include_pending,
+                            "concepts": parse_inspiration(q).labels},
+        }
+    finally:
+        reset_search_blobs(token)
 
 
 @app.post("/api/search/image")
@@ -177,24 +265,29 @@ def search_image(
     filters: dict = Depends(tag_filters),
     include_pending: bool = False,
     exclude_samples: bool = True,
+    source_category: str | None = None,
+    factory_filters: dict = Depends(_factory_filters),
 ) -> dict[str, Any]:
     suffix = Path(file.filename or "query.jpg").suffix or ".jpg"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(file.file.read())
         tmp_path = Path(tmp.name)
+    index = load_index()
+    token = prime_search(index)
     try:
         records = load_catalog()
         candidates = [r for r in records if not exclude_samples or r.source.source_type != "sample"]
-        projected = [r.model_copy(update={"tags": r.display_tags}) for r in candidates]
-        filtered = filter_records(projected, **filters)
+        filtered = _narrow(candidates, filters=filters, group=None, q=None, source_category=source_category,
+                           factory_filters=factory_filters, index=index)
         hits = search_by_image(records, tmp_path, top_k=top_k, filtered=filtered, include_pending=include_pending)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         tmp_path.unlink(missing_ok=True)
+        reset_search_blobs(token)
     return {
         "count": len(hits),
-        "items": [_serialize(record, score) for record, score in hits],
+        "items": [_serialize(record, score, index) for record, score in hits],
     }
 
 
@@ -203,29 +296,85 @@ def import_job_list():
     return {"items": [import_jobs.public_job(job) for job in import_jobs.list_jobs()]}
 
 
+def _safe_relative(filename: str) -> str:
+    raw = (filename or "upload.bin").replace("\\", "/")
+    parts = [part for part in Path(raw).parts if part not in {"", ".", ".."}]
+    if not parts:
+        raise HTTPException(status_code=422, detail="文件名无效")
+    return "/".join(parts)
+
+
 @app.post("/api/import/jobs", status_code=202)
-def start_import_job(files: list[UploadFile] = File(...), backend: Literal["openai", "mock"] = "openai"):
+def start_import_job(
+    files: list[UploadFile] = File(...),
+    backend: Literal["openai", "mock"] = "openai",
+    source_categories: list[str] | None = Form(default=None),
+):
     if backend == "openai" and not has_openai_key():
         raise HTTPException(status_code=400, detail="请先在本地配置 OPENAI_API_KEY")
     if not files:
         raise HTTPException(status_code=422, detail="请选择文件")
-    names = [Path(f.filename or "upload.bin").name for f in files]
+    names = [_safe_relative(upload.filename or "upload.bin") for upload in files]
     if any(Path(name).suffix.lower() not in SUPPORTED_SUFFIXES for name in names):
-        raise HTTPException(status_code=422, detail="仅支持 PDF、PPTX、XLSX、XLSM 文件")
+        raise HTTPException(status_code=422, detail="仅支持 PDF、PPTX、Excel 和图片（JPG、PNG、WEBP 等）")
     if len({name.casefold() for name in names}) != len(names):
         raise HTTPException(status_code=422, detail="同一批次有重名文件，请重命名后上传")
+    if source_categories:
+        if len(source_categories) != len(files):
+            raise HTTPException(status_code=422, detail="每个文件都要选择资料大类")
+        try:
+            categories = [coerce_source_category(value, required=True) for value in source_categories]
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    else:
+        categories = [UNCLASSIFIED_SOURCE] * len(files)
     job_id = uuid4().hex
     folder = catalog_store.RAW_DIR / "batches" / job_id
     folder.mkdir(parents=True, exist_ok=True)
     paths = []
     for upload, name in zip(files, names):
         dest = folder / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
         with dest.open("wb") as out:
             shutil.copyfileobj(upload.file, out)
         paths.append(dest)
-    job = import_jobs.create_import(paths, backend, job_id)
+    job = import_jobs.create_import(paths, backend, job_id, source_categories=categories, display_names=names)
     import_jobs.submit_job(job_id)
     return import_jobs.public_job(job)
+
+
+def _save_table_upload(file: UploadFile) -> tuple[Path, str]:
+    name = Path(file.filename or "upload.xlsx").name
+    if Path(name).suffix.lower() not in {".xlsx", ".xlsm"}:
+        raise HTTPException(status_code=422, detail="请上传 Excel 文件（.xlsx 或 .xlsm）")
+    folder = catalog_store.RAW_DIR / "tables"
+    folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / f"{uuid4().hex[:8]}_{name}"
+    with dest.open("wb") as out:
+        shutil.copyfileobj(file.file, out)
+    return dest, name
+
+
+@app.post("/api/import/style-archive")
+def import_style_archive(file: UploadFile = File(...)):
+    dest, name = _save_table_upload(file)
+    try:
+        report = import_archive(dest, source_name=name)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    report["source_file"] = name
+    return report
+
+
+@app.post("/api/import/sales")
+def import_sales_sheet(file: UploadFile = File(...)):
+    dest, name = _save_table_upload(file)
+    try:
+        report = import_sales(dest, source_name=name)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    report["source_file"] = name
+    return report
 
 
 @app.post("/api/tag/jobs", status_code=202)
@@ -294,7 +443,7 @@ def review_queue(
 
 
 class ReviewDecision(BaseModel):
-    action: Literal["approve", "reject", "resubmit"]
+    action: Literal["approve", "reject", "resubmit", "keep_image"]
     reviewer: str = Field(min_length=1, max_length=100)
     expected_revision: int = Field(ge=1)
     tags: FashionTags | None = None
@@ -334,9 +483,24 @@ def rebuild_index() -> dict[str, Any]:
 
 @app.get("/api/records/{record_id}/image")
 def record_image(record_id: str, download: bool = False,
-                 variant: Literal["original", "thumbnail"] = "original", v: str | None = None):
+                 variant: Literal["original", "thumbnail", "pending", "history"] = "original",
+                 index: int = 0, v: str | None = None):
     record = get_by_id(load_catalog(), record_id)
-    if record is None or not Path(record.image_path).exists():
+    if record is None:
+        raise HTTPException(status_code=404, detail="图片不存在")
+    if variant == "pending":
+        path = Path(record.pending_image_path) if record.pending_image_path else None
+        if path is None or not path.is_file():
+            raise HTTPException(status_code=404, detail="没有待确认的新图片")
+        return FileResponse(path, headers={"Cache-Control": "no-cache"})
+    if variant == "history":
+        if index < 0 or index >= len(record.image_history):
+            raise HTTPException(status_code=404, detail="历史图片不存在")
+        path = Path(record.image_history[index].get("image_path") or "")
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="历史图片不存在")
+        return FileResponse(path, headers={"Cache-Control": "no-cache"})
+    if not Path(record.image_path).exists():
         raise HTTPException(status_code=404, detail="图片不存在")
     original = Path(record.image_path)
     path = thumbnail_path(record.id, original) if variant == "thumbnail" and not download else original
@@ -353,14 +517,50 @@ def _source_path(record: ImageRecord) -> Path | None:
     return path if path.is_file() else None
 
 
+class SourceCategoryUpdate(BaseModel):
+    source_category: str
+    ids: list[str] = Field(min_length=1, max_length=500)
+
+
+@app.post("/api/records/source-category")
+def update_source_category(body: SourceCategoryUpdate):
+    try:
+        records = assign_source_category(body.ids, body.source_category)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="记录不存在") from exc
+    except CatalogConflict:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    index = load_index()
+    return {"count": len(records), "items": [_serialize(record, index=index) for record in records]}
+
+
 @app.get("/api/records/{record_id}")
 def record_detail(record_id: str):
     record = get_by_id(load_catalog(), record_id)
     if record is None:
         raise HTTPException(status_code=404, detail="款式不存在")
-    payload = _serialize(record)
-    payload["source_url"] = f"/api/records/{record_id}/source" if _source_path(record) else None
-    return payload
+    index = load_index()
+    token = prime_search(index)
+    try:
+        payload = _serialize(record, index=index)
+        payload["source_url"] = f"/api/records/{record_id}/source" if _source_path(record) else None
+        payload.update(detail_fields(record, index))
+        history = []
+        for position, item in enumerate(record.image_history):
+            path = Path(item.get("image_path") or "")
+            if not path.is_file():
+                continue
+            history.append({
+                "url": f"/api/records/{record_id}/image?variant=history&index={position}",
+                "archived_at": item.get("archived_at"),
+                "note": item.get("note") or "替换前保留的原图",
+            })
+        payload["image_history"] = history
+        return payload
+    finally:
+        reset_search_blobs(token)
 
 
 @app.get("/api/records/{record_id}/source")

@@ -17,13 +17,16 @@ sys.path.insert(0, str(ROOT))
 from src import import_jobs  # noqa: E402
 from src.catalog import RAW_DIR  # noqa: E402
 from src.extract.office import SUPPORTED_SUFFIXES  # noqa: E402
+from src.schema import SOURCE_CATEGORIES, UNCLASSIFIED_SOURCE  # noqa: E402
 from src.tag.tagger import has_openai_key  # noqa: E402
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fashion image library pipeline")
-    parser.add_argument("--input", default=str(RAW_DIR), help="File or directory of pptx/xlsx/pdf (default: data/raw)")
+    parser.add_argument("--input", default=str(RAW_DIR), help="File or directory of pptx/xlsx/pdf/images (default: data/raw)")
     parser.add_argument("--backend", default="openai", choices=["openai", "mock"])
+    parser.add_argument("--source-category", default="", choices=["", *SOURCE_CATEGORIES],
+                        help="资料大类，作用于本次全部文件。图片文件名（本厂产品）会当作款号。")
     args = parser.parse_args()
 
     source = Path(args.input)
@@ -32,11 +35,12 @@ def main() -> None:
     files = [source] if source.is_file() else sorted(
         p for p in source.iterdir() if p.suffix.lower() in SUPPORTED_SUFFIXES)
     if not files:
-        raise SystemExit("No pptx/xlsx/pdf files found.")
+        raise SystemExit("No pptx/xlsx/pdf/image files found.")
     if args.backend == "openai" and not has_openai_key():
         raise SystemExit("OPENAI_API_KEY missing; use --backend mock or set .env")
 
-    job = import_jobs.create_import(files, args.backend)
+    categories = [args.source_category or UNCLASSIFIED_SOURCE] * len(files) if args.source_category else None
+    job = import_jobs.create_import(files, args.backend, source_categories=categories)
     import_jobs.run_job(job["id"])
     result = import_jobs.public_job(import_jobs.get_job(job["id"]))
     print(f"{result['status']}: {result['succeeded']}/{result['total']} images tagged — {result['message']}")

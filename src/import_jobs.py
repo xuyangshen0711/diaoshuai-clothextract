@@ -1,6 +1,7 @@
 """Persisted, resumable import tasks. Run the API with one worker process."""
 from __future__ import annotations
 
+import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -11,7 +12,9 @@ from uuid import uuid4
 from src import catalog
 from src.catalog import CatalogConflict
 from src.extract.office import extract_from_file
-from src.schema import ImageRecord
+from src.factory.codes import image_style_code
+from src.factory.tables import find_own_factory
+from src.schema import UNCLASSIFIED_SOURCE, ImageRecord
 from src.tag.tagger import apply_suggestion, get_tagger, needs_tagging
 
 ACTIVE = {"queued", "extracting", "tagging"}
@@ -65,6 +68,7 @@ def list_jobs(limit=50):
 def public_job(job):
     done = sum(item["state"] == "done" for item in job["items"])
     filtered = sum(item["state"] == "done" and item.get("filtered", False) for item in job["items"])
+    skipped = sum(bool(item.get("skipped")) for item in job["items"])
     failed = sum(item["state"] == "failed" for item in job["items"])
     processed = done + failed
     elapsed = job.get("elapsed", 0) + (seconds(job.get("run_started_at")) if job["status"] in ACTIVE else 0)
@@ -75,8 +79,8 @@ def public_job(job):
     return {
         "id": job["id"], "kind": job["kind"], "backend": job["backend"], "status": job["status"],
         "name": job["name"], "created_at": job["created_at"], "updated_at": job["updated_at"],
-        "total": len(job["items"]), "processed": processed, "succeeded": done - filtered,
-        "filtered": filtered, "failed": failed,
+        "total": len(job["items"]), "processed": processed, "succeeded": done - filtered - skipped,
+        "filtered": filtered, "skipped": skipped, "failed": failed,
         "files_total": len(job["files"]), "files_processed": sum(f["state"] != "pending" for f in job["files"]),
         "elapsed_seconds": round(elapsed), "eta_seconds": eta, "current_file": job.get("current_file", ""),
         "message": job.get("message", ""),
@@ -91,9 +95,19 @@ def _base(kind, backend, name, job_id=None):
             "elapsed": 0, "message": "等待处理"}
 
 
-def create_import(files: list[Path], backend: str, job_id=None):
-    job = _base("import", backend, "、".join(p.name for p in files), job_id)
-    job["files"] = [{"path": str(p), "name": p.name, "state": "pending", "error": ""} for p in files]
+def create_import(files: list[Path], backend: str, job_id=None, source_categories=None, display_names=None):
+    names = list(display_names or [p.name for p in files])
+    if source_categories is not None and len(list(source_categories)) != len(files):
+        raise ValueError("每个文件都要有对应的资料大类")
+    categories = list(source_categories) if source_categories is not None else [UNCLASSIFIED_SOURCE] * len(files)
+    label = "、".join(names)
+    if len(names) > 4:
+        label = "、".join(names[:3]) + f" 等 {len(names)} 个文件"
+    job = _base("import", backend, label or "导入", job_id)
+    job["files"] = [{
+        "path": str(path), "name": name, "display_name": name, "state": "pending", "error": "",
+        "source_category": category,
+    } for path, name, category in zip(files, names, categories)]
     with catalog._database() as conn:
         _table(conn)
         _put(conn, job)
@@ -114,7 +128,8 @@ def create_retag(backend: str, overwrite: bool, source_type: str | None = None, 
 
 def friendly_error(exc):
     if isinstance(exc, CatalogConflict):
-        return "这张图片已被其他操作修改，请刷新检查后重试"
+        text = str(exc)
+        return text if text.startswith("款号") else "这张图片已被其他操作修改，请刷新检查后重试"
     code, status = getattr(exc, "code", None), getattr(exc, "status_code", None)
     if code == "insufficient_quota":
         return "AI 账户余额或额度不足，请检查计费设置后重试"
@@ -136,9 +151,71 @@ def friendly_error(exc):
 def _finish(job, status, message, end=None):
     job["elapsed"] += seconds(job.get("run_started_at"), end)
     job["run_started_at"] = None
+    skipped = sum(bool(item.get("skipped")) for item in job.get("items", []))
+    if skipped and status in {"completed", "partial"} and "已跳过" not in message:
+        message += f"（{skipped} 张与现有图片相同，已跳过）"
     job["status"], job["message"] = status, message
     with catalog._database() as conn:
         _put(conn, job)
+
+
+def _same_file(left, right) -> bool:
+    left_path, right_path = Path(left), Path(right)
+    if not left_path.is_file() or not right_path.is_file() or left_path.stat().st_size != right_path.stat().st_size:
+        return False
+    def digest(path: Path) -> str:
+        hashed = hashlib.md5()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 16), b""):
+                hashed.update(chunk)
+        return hashed.hexdigest()
+    return digest(left_path) == digest(right_path)
+
+
+def _tag_replacement(item, tagger, job) -> str:
+    """Attach a re-uploaded 本厂产品 photo to the existing 款号. Returns insert when the target is gone."""
+    target_id = item["replacement_of"]
+    new_path = item["new_image_path"]
+    with catalog._database() as conn:
+        row = conn.execute("SELECT payload FROM records WHERE id=?", (target_id,)).fetchone()
+    if not row:
+        return "insert"
+    target = ImageRecord.model_validate_json(row[0])
+    # A second copy of a proposal already waiting for review adds nothing. A re-upload of the
+    # current image still goes to review, so the same file is never swapped in silently.
+    if target.pending_image_path and _same_file(new_path, target.pending_image_path):
+        Path(new_path).unlink(missing_ok=True)
+        item.update(state="done", error="", skipped=True, filtered=False, record=target.model_dump())
+        with catalog._database() as conn:
+            _put(conn, job)
+        return "done"
+    suggestion = tagger.tag(new_path, target.notes.text())
+    with catalog._database() as conn:
+        current_row = conn.execute("SELECT payload FROM records WHERE id=?", (target_id,)).fetchone()
+        if not current_row:
+            return "insert"
+        current = ImageRecord.model_validate_json(current_row[0])
+        if current.revision != target.revision:
+            raise CatalogConflict("这张图片已更新，请检查后重试")
+        if suggestion is not None:
+            apply_suggestion(current, suggestion, tagger.name)
+        elif current.review_status != "pending":
+            current.review_status = "pending"
+            current.proposed_tags = (current.proposed_tags or current.tags).model_copy(deep=True)
+            current.touch()
+        else:
+            current.touch()
+        previous_pending = current.pending_image_path
+        current.pending_image_path = str(Path(new_path).resolve())
+        current.style_code = current.style_code or target.style_code
+        current.revision = catalog._save(
+            conn, current, "image_replacement_proposed", note="新图片待确认替换，原图已保留",
+        )
+        item.update(state="done", error="", filtered=False, skipped=False, replacement=True, record=current.model_dump())
+        _put(conn, job)
+    if previous_pending and previous_pending != current.pending_image_path:
+        catalog.discard_unreferenced_image(previous_pending, current)
+    return "done"
 
 
 def _drop_non_garment(conn, record: ImageRecord, existing: bool):
@@ -161,6 +238,7 @@ def run_job(job_id):
         job["status"] = "extracting" if any(f["state"] == "pending" for f in job["files"]) else "tagging"
         with catalog._database() as conn:
             _put(conn, job)
+        batch_styles: dict[str, str] = {}
         for source in job["files"]:
             if source["state"] != "pending":
                 continue
@@ -171,12 +249,31 @@ def run_job(job_id):
                 folder = catalog.EXTRACTED_DIR / job_id / str(job["files"].index(source))
                 folder.mkdir(parents=True, exist_ok=True)
                 extracted = extract_from_file(Path(source["path"]), out_dir=folder)
+                display_name = source.get("display_name") or source["name"]
                 for record in extracted:
                     record.source.batch_id = job_id
                     record.source.source_path = source["path"]
                     record.source.uploaded_at = job["created_at"]
-                    job["items"].append({"record": record.model_dump(), "name": source["name"] + " / " + record.source.location,
-                                         "state": "pending", "error": ""})
+                    record.source_category = source.get("source_category") or UNCLASSIFIED_SOURCE
+                    if record.source.source_type == "image":
+                        record.source.source_file = Path(display_name).name
+                        record.source.location = display_name if "/" in display_name.replace("\\", "/") else "上传图片"
+                    item = {"record": record.model_dump(), "name": source["name"] + " / " + record.source.location,
+                            "state": "pending", "error": ""}
+                    if record.source_category == "本厂产品" and record.source.source_type == "image":
+                        record.style_code = image_style_code(record.source.source_file)
+                        record.notes.款号 = record.style_code
+                        item["record"] = record.model_dump()
+                        target_id = batch_styles.get(record.style_code)
+                        if target_id is None and record.style_code:
+                            with catalog._database() as conn:
+                                existing = find_own_factory(conn, record.style_code)
+                            target_id = existing.id if existing else None
+                        if target_id:
+                            item.update(replacement_of=target_id, new_image_path=record.image_path)
+                        elif record.style_code:
+                            batch_styles[record.style_code] = record.id
+                    job["items"].append(item)
                 source["state"], source["error"] = "done", ""
             except Exception as exc:
                 source["state"], source["error"] = "failed", friendly_error(exc)
@@ -195,6 +292,11 @@ def run_job(job_id):
             with catalog._database() as conn:
                 _put(conn, job)
             try:
+                if item.get("replacement_of"):
+                    outcome = _tag_replacement(item, tagger, job)
+                    if outcome != "insert":
+                        continue
+                    item.pop("replacement_of", None)
                 record = ImageRecord.model_validate(item["record"])
                 with catalog._database() as conn:
                     current = conn.execute("SELECT revision FROM records WHERE id=?", (record.id,)).fetchone()
@@ -220,12 +322,19 @@ def run_job(job_id):
         has_errors = bool(blocked) or any(i["state"] != "done" for i in [*job["items"], *job["files"]])
         successes = sum(i["state"] == "done" for i in job["items"])
         filtered = sum(i["state"] == "done" and i.get("filtered", False) for i in job["items"])
+        skipped = sum(bool(i.get("skipped")) for i in job["items"])
         state = ("partial" if successes else "failed") if has_errors else "completed"
+        kept = successes - filtered - skipped
         message = blocked or ("已保存成功结果，可重试剩余项目" if has_errors else
-                   "分类完成，图片已在主页展示，等待人工审核" if successes > filtered else
-                   "图片均不是服装款式图，已全部过滤" if successes else "未找到需要处理的图片，请检查资料内容")
+                   "分类完成，图片已在主页展示，等待人工审核" if kept else
+                   "图片均不是服装款式图，已全部过滤" if filtered else
+                   "未找到需要处理的图片，请检查资料内容" if not successes else
+                   "图片与已有款号相同，未重复导入")
         if filtered and not blocked:
             message += f"（已自动过滤 {filtered} 张非款式图）"
+        replacements = sum(bool(item.get("replacement")) for item in job["items"])
+        if replacements and not blocked:
+            message += f"（{replacements} 张为已有款号的替换图，待审核确认后才会替换原图）"
         _finish(job, state, message)
     except Exception as exc:
         job = get_job(job_id)

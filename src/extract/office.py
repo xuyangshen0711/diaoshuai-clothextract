@@ -18,8 +18,9 @@ from src.catalog import EXTRACTED_DIR, ensure_data_dirs
 from src.extract.pdf_notes import page_notes
 from src.schema import DesignNotes, ImageRecord, SourceMeta
 
-SUPPORTED_SUFFIXES = {".pptx", ".xlsx", ".xlsm", ".pdf"}
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+DOCUMENT_SUFFIXES = {".pptx", ".xlsx", ".xlsm", ".pdf"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+SUPPORTED_SUFFIXES = DOCUMENT_SUFFIXES | IMAGE_SUFFIXES
 # Skip tiny icons / logos commonly embedded in lookbooks.
 MIN_IMAGE_SIDE = 120
 MIN_IMAGE_PIXELS = 20_000
@@ -286,6 +287,45 @@ def extract_from_xlsx(path: Path, out_dir: Path) -> list[ImageRecord]:
     return records
 
 
+def extract_from_image(path: Path, out_dir: Path) -> list[ImageRecord]:
+    """One uploaded photo becomes one record. The caller sets 款号 from the filename."""
+    saved = _save_uploaded_image(path.read_bytes(), out_dir, _safe_stem(path.stem) or "image")
+    return [ImageRecord(
+        image_path=str(saved.resolve()),
+        source=SourceMeta(source_file=path.name, source_type="image", location="上传图片"),
+    )]
+
+
+def _save_uploaded_image(content: bytes, out_dir: Path, stem: str) -> Path:
+    try:
+        image = Image.open(io.BytesIO(content))
+        original_fmt = (image.format or "").upper()
+        image.load()
+    except Exception as exc:
+        raise ValueError("无法读取图片，请确认文件未损坏") from exc
+    orientation = 1
+    try:
+        from PIL import ImageOps
+
+        orientation = image.getexif().get(274, 1) or 1
+        image = ImageOps.exif_transpose(image) or image
+    except Exception:
+        pass
+    suffix = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "GIF": ".gif", "BMP": ".bmp"}.get(original_fmt, ".png")
+    if orientation not in (1, None):
+        suffix = ".png"
+    path = _unique_path(out_dir, stem, suffix, content)
+    if path.exists():
+        return path
+    if original_fmt in {"JPEG", "PNG", "WEBP", "GIF", "BMP"} and orientation in (1, None):
+        path.write_bytes(content)
+        return path
+    if image.mode not in ("RGB", "RGBA"):
+        image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
+    image.save(path, format="PNG")
+    return path
+
+
 def extract_from_file(path: Path | str, out_dir: Path | None = None) -> list[ImageRecord]:
     ensure_data_dirs()
     source = Path(path)
@@ -302,4 +342,6 @@ def extract_from_file(path: Path | str, out_dir: Path | None = None) -> list[Ima
         return extract_from_xlsx(source, target)
     if suffix == ".pdf":
         return extract_from_pdf(source, target)
-    raise ValueError(f"Unsupported file type: {suffix}. Use .pptx, .xlsx, or .pdf")
+    if suffix in IMAGE_SUFFIXES:
+        return extract_from_image(source, target)
+    raise ValueError(f"Unsupported file type: {suffix}. Use .pptx, .xlsx, .pdf, or an image file")

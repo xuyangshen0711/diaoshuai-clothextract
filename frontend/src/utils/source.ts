@@ -2,7 +2,7 @@ import type { CatalogItem } from '../api'
 
 export function sourceType(source: CatalogItem['source']): string {
   return ({ pdf: 'PDF', xlsx: 'Excel', xlsm: 'Excel', xls: 'Excel', pptx: 'PPT', ppt: 'PPT',
-    upload: '图片', sample: '演示' } as Record<string, string>)[source.source_type] || source.source_type
+    image: '图片', upload: '图片', sample: '演示' } as Record<string, string>)[source.source_type] || source.source_type
 }
 
 export function importTime(source: CatalogItem['source']): string {

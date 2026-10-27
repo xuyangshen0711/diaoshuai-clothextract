@@ -49,6 +49,12 @@ cd frontend && npm install && npm run dev
 
 详细流程、迁移和测试说明见 [人工审核与 SQLite 存储](docs/review-workflow.md)。本期审核人手动填写，尚未接入登录和角色权限。
 
+## 本厂产品
+
+导入时为每个文件选择资料大类：本厂产品、网图趋势、品牌资料包、市调拍照。也可以直接上传图片或整个文件夹。本厂产品图片的文件名（不含扩展名）就是大货款号基码，例如 `516083.jpg`。同一款号再次上传会进入审核，确认后才替换原图，旧图留在详情页。
+
+款式档案和销量表在导入页单独上传，按表头列名读取，重复导入会覆盖同一款号而不会把销量加两遍。有档案时，图库里的品类用一级品类，AI 标签仍保留作参考。说明和取舍见 [本厂产品](docs/own-factory.md)。
+
 ## 标签体系（需求草稿）
 
 唯一来源是 [`src/schema.py`](src/schema.py)：打标提示词、筛选项、搜索词表都从那里生成，改标签只改这一处。
@@ -73,7 +79,7 @@ cd frontend && npm install && npm run dev
 ├── docs/mvp-requirements.md
 ├── prompts/tagging_prompt.md
 ├── scripts/run_pipeline.py
-└── src/{extract,tag,index,search}
+└── src/{extract,tag,index,search,factory}
 ```
 
 ## 本期不做
