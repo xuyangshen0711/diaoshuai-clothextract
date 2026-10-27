@@ -1,43 +1,39 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted } from 'vue'
 import { activeJobCount, jobNotice, startJobPolling } from './composables/importJobs'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute } from 'vue-router'
 
 const route = useRoute()
-const router = useRouter()
-const onLibrary = computed(() => route.name === 'library')
+const textSearch = computed(() => route.name === 'search' && route.query.mode !== 'image')
+const imageSearch = computed(() => route.name === 'search' && route.query.mode === 'image')
 
 let stopPolling: (() => void) | undefined
 onMounted(() => { stopPolling = startJobPolling() })
 onUnmounted(() => stopPolling?.())
-
-function goHome() {
-  router.push({ name: 'library' })
-}
 </script>
 
 <template>
   <div class="app-shell">
     <header class="topbar">
-      <div class="brand">
-        <h1>服装图片库</h1>
-        <button v-if="!onLibrary" class="icon-btn home-button" type="button" @click="goHome">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
-            <path d="M3 10l9-7 9 7M5 9v12h5v-7h4v7h5V9" />
-          </svg>
-          返回主页
-        </button>
+      <div class="brand-lockup">
+        <RouterLink to="/" class="brand-name" exact-active-class="is-current" active-class="">
+          <span class="brand-zh">貂帅服装</span>
+          <span class="brand-en">DIAOSHUAI KNIT</span>
+        </RouterLink>
+        <span class="brand-rule" aria-hidden="true"></span>
+        <p class="brand-sub">
+          <span class="brand-sub-zh">女装针织 · 款式图库</span>
+          <span class="brand-sub-en">Women's Knitwear Style Library</span>
+        </p>
       </div>
-
-      <div class="header-actions">
-        <div class="util-links">
-          <RouterLink to="/search?mode=text">灵感找款</RouterLink>
-          <RouterLink to="/search?mode=image">以图搜</RouterLink>
-          <RouterLink to="/import">导入任务<span v-if="activeJobCount" class="nav-count">{{ activeJobCount }}</span></RouterLink>
-          <RouterLink to="/review">人工审核</RouterLink>
-          <RouterLink to="/categories">品类设置</RouterLink>
-        </div>
-      </div>
+      <nav class="util-links" aria-label="页面">
+        <RouterLink to="/" exact-active-class="is-current" active-class="">图库</RouterLink>
+        <RouterLink to="/search?mode=text" active-class="" exact-active-class="" :class="{ 'is-current': textSearch }">灵感找款</RouterLink>
+        <RouterLink to="/search?mode=image" active-class="" exact-active-class="" :class="{ 'is-current': imageSearch }">以图搜</RouterLink>
+        <RouterLink to="/import" exact-active-class="is-current" active-class="">导入<span v-if="activeJobCount" class="nav-count">{{ activeJobCount }}</span></RouterLink>
+        <RouterLink to="/review" exact-active-class="is-current" active-class="">审核</RouterLink>
+        <RouterLink to="/categories" exact-active-class="is-current" active-class="">品类设置</RouterLink>
+      </nav>
     </header>
 
     <RouterView />

@@ -109,6 +109,19 @@ python scripts/prepare_local_search.py --index
 
 风格、季节、版型、颜色、领型、袖型和细节元素仍在 [`src/schema.py`](src/schema.py)。品类表和同义词在 [`src/taxonomy.py`](src/taxonomy.py)。细节见 [固定品类与同义词](docs/taxonomy.md)。
 
+## 界面字体
+
+字体文件放在 [`frontend/public/fonts`](frontend/public/fonts)，由页面本地加载，不引用 Google 或其他外部 CDN（工厂网络可能访问不到）。四套字体都是 SIL Open Font License 1.1，许可全文在同目录：
+
+| 字体 | 用途 | 文件 | 许可 |
+|------|------|------|------|
+| 朱雀仿宋 Zhuque Fangsong（TrionesType/zhuque，璇玑造字） | 除品牌名以外的界面文字 | `ZhuqueFangsong-Regular.woff2` | `OFL-ZhuqueFangsong.txt` |
+| 思源宋体 Noto Serif SC | 页头品牌名「貂帅服装」，只保留这四个字 | `NotoSerifSC-SemiBold.woff2` | `OFL-NotoSerifSC.txt` |
+| 思源黑体 Noto Sans SC | 仿宋缺字时的回退 | `NotoSansSC-Regular.woff2` | `OFL-NotoSansSC.txt` |
+| Cormorant Garamond | 页头英文「DIAOSHUAI KNIT」和斜体副标题 | `CormorantGaramond-SemiBold.woff2`、`CormorantGaramond-SemiBoldItalic.woff2` | `OFL-CormorantGaramond.txt` |
+
+仿宋已转成 woff2，并按 GB2312 与界面用字做了子集；缺字回退到 Noto Sans SC。`font-display` 为 `swap`。这些字体的版权行没有声明 Reserved Font Name，因此保留原家族名。
+
 ```yaml
 风格: [极简, 复古, 甜美, 通勤, 工装, 法式, 休闲, 其他]
 季节: [春, 夏, 秋, 冬, 四季]
