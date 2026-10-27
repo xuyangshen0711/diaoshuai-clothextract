@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { jobs, isActive } from '../composables/importJobs'
 import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router'
+import { visibleDescription } from '../utils/source'
 import { NOTE_FIELDS, getFilters, getReviews, getReviewHistory, reviewRecord, type CatalogItem, type DesignNotes,
   type FashionTags, type FilterMeta, type ReviewEvent, type ReviewStatus } from '../api'
 
@@ -12,6 +13,8 @@ const actions: Record<string, string> = {
   record_created: '导入并生成初始分类', legacy_imported: '迁移历史数据',
   classification_proposed: '提交新的待审核分类', approve: '审核通过', reject: '驳回分类', resubmit: '重新提交审核',
   auto_rejected: 'AI 判断非款式图，自动移除',
+  image_replacement_proposed: '上传替换图，待确认', keep_image: '保留原图',
+  source_category_changed: '修改资料大类',
 }
 const fields = ['品类', '风格', '季节', '版型', '颜色主色调', '领型', '袖型'] as const
 const queryValue = (key: string) => typeof route.query[key] === 'string' ? route.query[key] as string : ''
@@ -131,7 +134,7 @@ watch(current, async item => {
     if (sequence === historySequence) history.value = data.items
   } catch (e) { if (sequence === historySequence) historyError.value = e instanceof Error ? e.message : String(e) }
 })
-async function decide(action: 'approve' | 'reject' | 'resubmit') {
+async function decide(action: 'approve' | 'reject' | 'resubmit' | 'keep_image') {
   const item = current.value
   if (!item || saving.value) return
   error.value = ''; message.value = ''
@@ -146,8 +149,9 @@ async function decide(action: 'approve' | 'reject' | 'resubmit') {
       action === 'approve' ? JSON.parse(JSON.stringify(form)) : undefined,
       action === 'approve' ? { ...notesForm } : undefined)
     localStorage.setItem('clothextract-reviewer', reviewer.value.trim())
-    message.value = action === 'approve' ? '已通过，主页已标记为已审核' :
-      action === 'reject' ? '已驳回，图片已从主页移除' : '已重新提交，请在待审核中确认分类'
+    message.value = action === 'approve' ? (item.has_pending_image ? '已通过，新图片已替换原图，旧图保留在历史中' : '已通过，主页已标记为已审核') :
+      action === 'reject' ? '已驳回，图片已从主页移除' :
+      action === 'keep_image' ? '已保留原图，待确认的新图片已放弃' : '已重新提交，请在待审核中确认分类'
     baseline.value = ''; saving.value = false
     await load(nextId)
   } catch (e) { error.value = e instanceof Error ? e.message : String(e) }
@@ -207,8 +211,11 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
           :class="{ selected: selectedId === item.id }" :aria-pressed="selectedId === item.id"
           :disabled="saving" @click="selectItem(item.id)">
           <img :src="item.thumbnail_url || item.image_url" alt="" loading="lazy" />
-          <span><strong>{{ (item.proposed_tags || item.tags).品类 }}</strong>
-            <small>{{ item.source.source_file }}</small><small>{{ item.source.location }}</small></span>
+          <span><strong>{{ item.library_category || (item.proposed_tags || item.tags).品类 }}</strong>
+            <small v-if="item.style_code">款号 {{ item.style_code }}</small>
+            <small>{{ item.source_category }} · {{ item.source.source_file }}</small>
+            <small v-if="item.has_pending_image">待确认替换图</small>
+            <small v-else>{{ item.source.location }}</small></span>
         </button>
         <div class="toolbar review-pagination">
           <button class="btn" :disabled="page === 1 || saving" @click="changePage(-1)">上一页</button>
@@ -223,10 +230,22 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
         <p class="meta review-shortcuts">← / → 切图 · A 通过 · S 暂时跳过（在输入框外使用）</p>
         <div class="review-detail" :key="current.id">
         <div class="review-image-panel">
-          <a :href="current.image_url" target="_blank" rel="noopener" aria-label="打开完整原图">
-            <img class="review-original" :src="current.image_url" :alt="current.tags.一句话描述 || '待审核服装原图'" />
-          </a>
-          <p class="review-source">{{ current.source.source_file }}<br />{{ current.source.location }} · 点击图片查看原图</p>
+          <div class="replacement-pair" :class="{ comparing: current.has_pending_image }">
+            <figure>
+              <a :href="current.image_url" target="_blank" rel="noopener" :aria-label="current.has_pending_image ? '打开当前原图' : '打开完整原图'">
+                <img class="review-original" :src="current.image_url" :alt="current.tags.一句话描述 || '待审核服装原图'" />
+              </a>
+              <figcaption>{{ current.has_pending_image ? '当前原图' : '原图' }}</figcaption>
+            </figure>
+            <figure v-if="current.has_pending_image && current.pending_image_url">
+              <a :href="current.pending_image_url" target="_blank" rel="noopener" aria-label="打开待确认的新图片">
+                <img class="review-original" :src="current.pending_image_url" alt="待确认的新图片" />
+              </a>
+              <figcaption>待确认的新图片</figcaption>
+            </figure>
+          </div>
+          <p class="review-source">{{ current.source_category }}<span v-if="current.style_code"> · 款号 {{ current.style_code }}</span><br />{{ current.source.source_file }}<br />{{ current.source.location }} · 点击图片查看原图</p>
+          <p v-if="current.has_pending_image" class="meta">通过后新图片会替换原图，旧图留在详情页历史里。选择「保留原图」则放弃这次替换，恢复替换前的审核状态。</p>
           <p v-if="current.reviewed_at" class="meta">
             上次审核：{{ current.reviewer }}<br />{{ date(current.reviewed_at) }}
           </p>
@@ -254,8 +273,9 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
             </div>
             <div class="review-description">
               <label for="review-description">一句话描述</label>
-              <p class="meta">AI：{{ current.ai_tags?.一句话描述 || '未提供' }}</p>
-              <textarea id="review-description" v-model="form.一句话描述" rows="2" />
+              <p class="meta">AI：{{ visibleDescription(current.ai_tags?.一句话描述, current.review_status) || '未提供' }}</p>
+              <textarea v-if="editable" id="review-description" v-model="form.一句话描述" rows="2" />
+              <p v-else id="review-description">{{ visibleDescription(form.一句话描述, current.review_status) || '未提供' }}</p>
             </div>
             <div class="review-notes">
               <strong>设计说明（资料原文，可修改）</strong>
@@ -279,7 +299,8 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
             <div v-if="editable" class="field"><label for="review-note">审核意见 / 驳回原因（驳回必填）</label>
               <textarea id="review-note" v-model="note" rows="2" maxlength="2000" :disabled="saving" placeholder="例如：图片不是服装款式图" /></div>
             <div v-if="editable" class="toolbar">
-              <button class="btn primary" type="submit" :disabled="saving">{{ saving ? '提交中…' : edited ? '修改后通过' : '直接通过' }}</button>
+              <button class="btn primary" type="submit" :disabled="saving">{{ saving ? '提交中…' : current.has_pending_image ? '通过并替换图片' : edited ? '修改后通过' : '直接通过' }}</button>
+              <button v-if="current.has_pending_image" class="btn" type="button" :disabled="saving" @click="decide('keep_image')">保留原图</button>
               <button class="btn" type="button" :disabled="saving" @click="move(1, true)">暂时跳过</button>
               <button class="btn review-reject" type="button" :disabled="saving" @click="decide('reject')">驳回</button>
             </div>

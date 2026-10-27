@@ -139,3 +139,25 @@ def tag_records(records: list[ImageRecord], backend: str | None = None, overwrit
 def has_openai_key() -> bool:
     load_dotenv(ROOT / ".env")
     return bool(os.getenv("OPENAI_API_KEY"))
+
+
+def openai_key_is_placeholder() -> bool:
+    """True when .env still has the sample value. Does not change whether a key is present."""
+    load_dotenv(ROOT / ".env")
+    key = (os.getenv("OPENAI_API_KEY") or "").strip().strip('"').strip("'")
+    if not key:
+        return False
+    example = ""
+    sample = ROOT / ".env.example"
+    if sample.is_file():
+        for line in sample.read_text(encoding="utf-8").splitlines():
+            if line.startswith("OPENAI_API_KEY="):
+                example = line.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+    if key == example or "..." in key:
+        return True
+    folded = key.lower()
+    if folded in {"sk-xxx", "sk-xxxx", "your-api-key", "changeme", "replace-me", "placeholder"}:
+        return True
+    body = key[3:] if key.lower().startswith("sk-") else key
+    return len(key) < 16 or set(body) <= set(".xX*_-")

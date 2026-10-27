@@ -44,6 +44,22 @@ CATEGORY_GROUPS = {
     "外套": {"外套"},
 }
 
+# 资料大类 sits above 品类 / 风格 / 季节. Only 本厂产品 has archive and sales behavior.
+SOURCE_CATEGORIES = ("本厂产品", "网图趋势", "品牌资料包", "市调拍照")
+UNCLASSIFIED_SOURCE = "未分类"
+SOURCE_CATEGORY_VALUES = (*SOURCE_CATEGORIES, UNCLASSIFIED_SOURCE)
+
+
+def coerce_source_category(value: str | None, *, required: bool = False) -> str:
+    text = (value or "").strip()
+    if not text:
+        if required:
+            raise ValueError("请选择资料大类")
+        return UNCLASSIFIED_SOURCE
+    if text not in SOURCE_CATEGORY_VALUES:
+        raise ValueError("资料大类只能是本厂产品、网图趋势、品牌资料包、市调拍照或未分类")
+    return text
+
 
 def taxonomy_yaml() -> str:
     """Render the vocabulary for prompts, so prompts never drift from this file."""
@@ -101,7 +117,7 @@ class DesignNotes(BaseModel):
 
 class SourceMeta(BaseModel):
     source_file: str
-    source_type: str  # pptx | xlsx | pdf | upload | sample
+    source_type: str  # pptx | xlsx | pdf | image | upload | sample
     batch_id: str | None = None
     source_path: str | None = None
     pdf_image_index: int | None = None
@@ -119,6 +135,11 @@ class ImageRecord(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex[:12])
     image_path: str
     source: SourceMeta
+    # Migrated rows stay 未分类 until someone assigns a 大类. Own-factory photos keep one image per 款号.
+    source_category: str = UNCLASSIFIED_SOURCE
+    style_code: str = ""
+    pending_image_path: str | None = None
+    image_history: list[dict] = Field(default_factory=list)
     tags: FashionTags = Field(default_factory=FashionTags)
     notes: DesignNotes = Field(default_factory=DesignNotes)
     tags_source: str = "untagged"  # mock | openai | manual | untagged
@@ -150,6 +171,8 @@ class ImageRecord(BaseModel):
 
     def search_text(self) -> str:
         detail = " ".join(self.tags.细节元素)
+        from src.factory.context import search_blob
+
         return " ".join(
             [
                 self.tags.一句话描述,
@@ -164,5 +187,8 @@ class ImageRecord(BaseModel):
                 self.notes.text(),
                 self.source.source_file,
                 self.source.location,
+                self.source_category,
+                self.style_code,
+                search_blob(self.style_code),
             ]
         ).strip()

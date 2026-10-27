@@ -16,6 +16,7 @@
 | 审核记录与持久化 | ✅ | SQLite；AI 建议、人工结果、审核人、时间、意见与历史快照 |
 | 优先复用开源、不自训模型 | ✅ | python-pptx / openpyxl / pymupdf / CLIP / FAISS / OpenAI |
 | 项目目录结构 | ✅ | 与文档第 5 节一致，额外含 `api/`、`frontend/` |
+| 资料大类与本厂产品（款号、档案、销量） | ✅ | `src/factory/`、导入页、图库筛选、款式详情；见 `docs/own-factory.md` |
 
 ## 本期明确不做
 

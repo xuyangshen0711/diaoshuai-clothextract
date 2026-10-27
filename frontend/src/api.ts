@@ -48,6 +48,64 @@ export type CatalogItem = {
     extracted_at: string
   }
   source_url?: string | null
+  source_category: string
+  style_code: string
+  library_category: string
+  sales_quantity: number
+  sales_amount: number
+  color_families?: string[]
+  variant_count?: number
+  has_pending_image: boolean
+  pending_image_url: string | null
+  variants?: StyleVariant[]
+  sales?: SalesSummary | null
+  image_history?: { url: string; archived_at?: string | null; note?: string }[]
+}
+
+export type StyleVariant = {
+  variant_code: string
+  customer: string
+  season: string
+  needle: string
+  series: string
+  category: string
+  material: string
+  colors: { name: string; family: string }[]
+  sizes: { label: string; number: string; letter: string }[]
+  quantity: number
+  amount: number
+}
+
+export type SalesSummary = {
+  total_quantity: number
+  total_amount: number
+  by_color: { name: string; family?: string; quantity: number; amount: number }[]
+  by_size: { name: string; quantity: number; amount: number }[]
+  by_customer: { variant_code: string; customer: string; season: string; quantity: number; amount: number }[]
+}
+
+export type LibraryMeta = {
+  source_categories: string[]
+  unclassified: string
+  factory: Record<string, string[]>
+  style_codes?: string[]
+}
+
+export type TableReport = {
+  imported: number
+  updated: number
+  skipped_rows: number
+  warnings?: string[]
+  style_codes: string[]
+  variant_count?: number
+  archive_without_image: string[]
+  image_without_archive: string[]
+  source_file: string
+  row_count?: number
+  parsed_quantity?: number
+  parsed_amount?: number
+  stored_quantity?: number
+  stored_amount?: number
 }
 
 export type FilterMeta = Record<string, string[]>
@@ -71,6 +129,7 @@ export function getHealth() {
   return request<{
     ok: boolean
     openai_ready: boolean
+    openai_placeholder?: boolean
     catalog_count: number
     tagger?: string
     embedding_backend?: string
@@ -81,6 +140,10 @@ export function getFilters() {
   return request<FilterMeta>('/api/meta/filters')
 }
 
+export function getLibraryMeta() {
+  return request<LibraryMeta>('/api/meta/library')
+}
+
 export function getCatalog(params: Record<string, string | boolean>) {
   const qs = new URLSearchParams()
   Object.entries(params).forEach(([k, v]) => {
@@ -89,7 +152,7 @@ export function getCatalog(params: Record<string, string | boolean>) {
   })
   if (!('exclude_samples' in params)) qs.set('exclude_samples', 'true')
   const suffix = qs.toString() ? `?${qs}` : ''
-  return request<{ count: number; items: CatalogItem[] }>(`/api/catalog${suffix}`)
+  return request<{ count: number; items: CatalogItem[]; color_counts?: Record<string, number> }>(`/api/catalog${suffix}`)
 }
 
 export type SearchInfo = { engine: string; local_only: boolean; include_pending: boolean; concepts: string[] }
@@ -136,12 +199,36 @@ export type ImportJob = {
   current_file: string
   message: string
   errors: { name: string; message: string }[]
+  skipped?: number
 }
 
-export async function importFiles(files: File[], backend: string) {
+export async function importFiles(files: { file: File; relativePath: string; category: string }[], backend: string) {
   const body = new FormData()
-  files.forEach(f => body.append('files', f))
+  files.forEach(item => {
+    body.append('files', item.file, item.relativePath || item.file.name)
+    body.append('source_categories', item.category)
+  })
   return request<ImportJob>(`/api/import/jobs?backend=${encodeURIComponent(backend)}`, { method: 'POST', body })
+}
+
+export async function importStyleArchive(file: File) {
+  const body = new FormData()
+  body.append('file', file)
+  return request<TableReport>('/api/import/style-archive', { method: 'POST', body })
+}
+
+export async function importSalesSheet(file: File) {
+  const body = new FormData()
+  body.append('file', file)
+  return request<TableReport>('/api/import/sales', { method: 'POST', body })
+}
+
+export function assignSourceCategory(ids: string[], sourceCategory: string) {
+  return request<{ count: number; items: CatalogItem[] }>('/api/records/source-category', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids, source_category: sourceCategory }),
+  })
 }
 
 export function retag(backend: string, overwrite: boolean) {
@@ -193,7 +280,7 @@ export function getReviewHistory(id: string) {
   return request<{ items: ReviewEvent[] }>(`/api/records/${id}/history`)
 }
 
-export function reviewRecord(item: CatalogItem, action: 'approve' | 'reject' | 'resubmit',
+export function reviewRecord(item: CatalogItem, action: 'approve' | 'reject' | 'resubmit' | 'keep_image',
   reviewer: string, note: string, tags?: FashionTags, notes?: DesignNotes) {
   return request<CatalogItem>(`/api/records/${item.id}/review`, {
     method: 'POST',
