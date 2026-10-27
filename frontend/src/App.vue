@@ -35,6 +35,7 @@ function goHome() {
           <RouterLink to="/search?mode=image">以图搜</RouterLink>
           <RouterLink to="/import">导入任务<span v-if="activeJobCount" class="nav-count">{{ activeJobCount }}</span></RouterLink>
           <RouterLink to="/review">人工审核</RouterLink>
+          <RouterLink to="/categories">品类设置</RouterLink>
         </div>
       </div>
     </header>

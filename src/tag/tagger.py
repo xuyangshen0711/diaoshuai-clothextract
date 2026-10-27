@@ -92,7 +92,7 @@ class MockTagger:
             袖型=sleeve,
             细节元素=details,
             一句话描述=description,
-        )
+        ).normalized()
 
 
 def get_tagger(backend: str | None = None):
@@ -111,14 +111,23 @@ def get_tagger(backend: str | None = None):
 
 
 def apply_suggestion(record: ImageRecord, suggestion: FashionTags, backend_name: str) -> None:
-    record.ai_tags = suggestion.model_copy(deep=True)
+    phrase = getattr(suggestion, "_category_phrase", "")
+    normalized = suggestion.normalized()
+    phrase = phrase or getattr(normalized, "_category_phrase", "")
+    record.ai_tags = normalized.model_copy(deep=True)
     record.ai_tags_source = backend_name
-    record.proposed_tags = suggestion.model_copy(deep=True)
+    record.proposed_tags = normalized.model_copy(deep=True)
     record.review_status = "pending"
     # Keep the last human classification even when explicitly re-tagging all.
     if record.reviewed_at is None and not record.manually_edited:
-        record.tags = suggestion.model_copy(deep=True)
+        record.tags = normalized.model_copy(deep=True)
         record.tags_source = backend_name
+    if phrase:
+        record.category_raw = phrase
+    if normalized.袖长:
+        record.sleeve_length = normalized.袖长
+    if normalized.面料:
+        record.fabric = normalized.面料
     record.touch()
 
 

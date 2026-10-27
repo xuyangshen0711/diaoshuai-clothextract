@@ -19,7 +19,7 @@ def test_prompt_lists_every_vocabulary_value_from_schema():
 def test_model_output_is_coerced_into_vocabulary():
     tags = _coerce_tags({"品类": "T恤", "风格": "朋克", "领型": " V领 ", "季节": None,
                          "细节元素": "口袋, 亮片", "一句话描述": "  白色T恤  "})
-    assert (tags.品类, tags.风格, tags.领型, tags.季节) == ("衬衫", "其他", "V领", "其他")
+    assert (tags.品类, tags.风格, tags.领型, tags.季节) == ("上衣>T恤", "其他", "V领", "其他")
     assert tags.细节元素 == ["口袋"] and tags.一句话描述 == "白色T恤"
 
 

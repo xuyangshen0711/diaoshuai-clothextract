@@ -13,10 +13,6 @@ from src.factory.excel_io import as_number
 from src.factory.sizes import size_sort_key
 from src.schema import CATEGORY_GROUPS, ImageRecord
 
-_UPPER = ("套衫", "开衫", "背心", "衬衫", "马甲", "毛衣", "卫衣", "吊带", "袖")
-_LOWER = ("裤", "裙")
-_OUTER = ("外套", "大衣", "风衣", "羽绒服")
-
 
 @dataclass
 class VariantView:
@@ -106,33 +102,38 @@ def prime_search(index: FactoryIndex):
     return set_search_blobs(blobs)
 
 
-def archive_in_group(category: str, group: str) -> bool:
-    if group == "下装":
-        return any(token in category for token in _LOWER)
-    if group == "外套":
-        return any(token in category for token in _OUTER)
-    if group == "上衣":
-        if any(token in category for token in _LOWER):
-            return False
-        return any(token in category for token in _UPPER) or category in CATEGORY_GROUPS["上衣"]
-    return False
+def effective_placement(record: ImageRecord, index: FactoryIndex):
+    """Fixed-table placement. A 本厂产品 archive category wins over the AI label."""
+    from src.taxonomy import Placement, resolve
+
+    if record.source_category == "本厂产品" and record.style_code:
+        raws = index.categories(record.style_code)
+        if raws:
+            return resolve(raws[0], factory=True)
+    shown = record.display_tags
+    placement = resolve(shown.品类)
+    sleeve = placement.sleeve or shown.袖长 or record.sleeve_length
+    fabric = placement.fabric or shown.面料 or record.fabric
+    raw = record.category_raw or (shown.品类 if shown.品类 != placement.label else "")
+    if (sleeve, fabric, raw) == (placement.sleeve, placement.fabric, placement.raw):
+        return placement
+    return Placement(placement.level1, placement.level2, sleeve, fabric, raw, placement.unmapped)
 
 
 def in_group(record: ImageRecord, group: str | None, index: FactoryIndex) -> bool:
     if not group or group not in CATEGORY_GROUPS:
         return True
-    categories = index.categories(record.style_code) if record.source_category == "本厂产品" else []
-    if categories:
-        return any(archive_in_group(name, group) or name in CATEGORY_GROUPS[group] for name in categories)
-    return record.display_tags.品类 in CATEGORY_GROUPS[group]
+    return effective_placement(record, index).level1 in CATEGORY_GROUPS[group]
 
 
 def display_categories(record: ImageRecord, index: FactoryIndex) -> list[str]:
-    if record.source_category == "本厂产品":
-        categories = index.categories(record.style_code)
-        if categories:
-            return categories
-    return [record.display_tags.品类]
+    placement = effective_placement(record, index)
+    labels = [placement.label]
+    if placement.level1 and placement.level1 not in labels:
+        labels.append(placement.level1)
+    if placement.level2 and placement.level2 not in labels:
+        labels.append(placement.level2)
+    return labels
 
 
 def matches_factory(record: ImageRecord, index: FactoryIndex, *, color_family=None, size=None,
@@ -217,14 +218,20 @@ def imported_at(record: ImageRecord) -> str:
 
 
 def card_fields(record: ImageRecord, index: FactoryIndex) -> dict:
-    categories = display_categories(record, index)
+    placement = effective_placement(record, index)
     quantity, amount = (0, 0.0)
     if record.source_category == "本厂产品" and record.style_code:
         quantity, amount = index.sales_totals(record.style_code)
+    archive_category = placement.raw if record.source_category == "本厂产品" else ""
     return {
         "source_category": record.source_category,
         "style_code": record.style_code,
-        "library_category": categories[0] if categories else record.display_tags.品类,
+        "library_category": placement.label,
+        "category_level1": placement.level1,
+        "category_level2": placement.level2,
+        "sleeve_length": placement.sleeve,
+        "fabric": placement.fabric,
+        "archive_category": archive_category,
         "sales_quantity": quantity,
         "sales_amount": as_number(amount),
         "has_pending_image": bool(record.pending_image_path),

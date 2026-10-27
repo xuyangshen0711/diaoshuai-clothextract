@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { assignSourceCategory, getCatalog, getFilters, getLibraryMeta, type CatalogItem, type FilterMeta, type LibraryMeta } from '../api'
+import { assignSourceCategory, getCatalog, getFilters, getLibraryMeta, getTaxonomy, type CatalogItem, type FilterMeta, type LibraryMeta, type Taxonomy } from '../api'
 import { swatchColor, swatchLight } from '../utils/source'
 
 const route = useRoute()
@@ -13,6 +13,7 @@ const loading = ref(false)
 const error = ref('')
 const meta = ref<FilterMeta>({})
 const libraryMeta = ref<LibraryMeta>({ source_categories: ['本厂产品', '网图趋势', '品牌资料包', '市调拍照'], unclassified: '未分类', factory: {} })
+const taxonomy = ref<Taxonomy>({ unsorted: '待归类', sleeves: [], fabrics: [], tree: [], labels: [], synonyms: [] })
 const bulkCategory = ref('本厂产品')
 const bulkMessage = ref('')
 const queryDraft = ref('')
@@ -22,6 +23,9 @@ const FACTORY_COLORS = ['红', '橙', '黄', '绿', '蓝', '紫', '粉', '棕咖
 const queryText = (key: string) => typeof route.query[key] === 'string' ? route.query[key] as string : '全部'
 const filters = computed(() => ({
   category: queryText('category'),
+  subcategory: queryText('subcategory'),
+  sleeve_length: queryText('sleeve_length'),
+  fabric: queryText('fabric'),
   color: queryText('color'),
   style: queryText('style'),
   season: queryText('season'),
@@ -32,7 +36,9 @@ const filters = computed(() => ({
   color_family: queryText('color_family'),
 }))
 function setFilter(key: string, value: string) {
-  router.replace({ query: { ...route.query, [key]: value === '全部' ? undefined : value } })
+  const next = { ...route.query, [key]: value === '全部' ? undefined : value }
+  if (key === 'category') delete next.subcategory
+  router.replace({ query: next })
 }
 const q = computed(() => (typeof route.query.q === 'string' ? route.query.q : ''))
 const reviewStatus = computed(() => ['pending', 'approved'].includes(String(route.query.review_status)) ? String(route.query.review_status) : '')
@@ -41,9 +47,11 @@ const sort = computed(() => route.query.sort === 'sales' || route.query.sort ===
 const ownFactory = computed(() => sourceCategory.value === '本厂产品')
 const statusOptions = [{ value: '', label: '全部' }, { value: 'pending', label: '未审核' }, { value: 'approved', label: '已审核' }]
 const sourceTabs = computed(() => ['全部', ...libraryMeta.value.source_categories, libraryMeta.value.unclassified])
-const categoryOptions = computed(() => ownFactory.value
-  ? ['全部', ...(libraryMeta.value.factory['品类'] || [])]
-  : ['全部', ...(meta.value['品类'] || [])])
+const level1Options = computed(() => ['全部', ...taxonomy.value.tree.map(item => item.level1), taxonomy.value.unsorted || '待归类'])
+const subcategoryOptions = computed(() => {
+  const node = taxonomy.value.tree.find(item => item.level1 === filters.value.category)
+  return node?.children.length ? ['全部', ...node.children] : []
+})
 const seasonKey = computed(() => ownFactory.value ? 'archive_season' : 'season')
 const seasonValue = computed(() => ownFactory.value ? filters.value.archive_season : filters.value.season)
 const seasonOptions = computed(() => ['全部', ...(ownFactory.value ? libraryMeta.value.factory['季节'] || [] : meta.value['季节'] || [])])
@@ -65,6 +73,9 @@ const extraFilters = computed(() => [
 const selectedChips = computed(() => {
   const chips: { key: string; label: string }[] = []
   if (filters.value.category !== '全部') chips.push({ key: 'category', label: filters.value.category })
+  if (filters.value.subcategory !== '全部') chips.push({ key: 'subcategory', label: filters.value.subcategory })
+  if (ownFactory.value && filters.value.sleeve_length !== '全部') chips.push({ key: 'sleeve_length', label: filters.value.sleeve_length })
+  if (ownFactory.value && filters.value.fabric !== '全部') chips.push({ key: 'fabric', label: filters.value.fabric })
   if (seasonValue.value !== '全部') chips.push({ key: seasonKey.value, label: seasonValue.value })
   if (activeColor.value !== '全部') chips.push({ key: colorKey.value, label: activeColor.value })
   if (!ownFactory.value) {
@@ -76,7 +87,7 @@ const selectedChips = computed(() => {
   return chips
 })
 
-const facetQueryKeys = ['category', 'color', 'style', 'season', 'fit', 'neckline', 'sleeve', 'archive_season', 'color_family', 'size', 'series', 'needle', 'customer', 'group']
+const facetQueryKeys = ['category', 'subcategory', 'sleeve_length', 'fabric', 'color', 'style', 'season', 'fit', 'neckline', 'sleeve', 'archive_season', 'color_family', 'size', 'series', 'needle', 'customer', 'group']
 function setSource(value: string) {
   const next = { ...route.query }
   for (const key of facetQueryKeys) delete next[key]
@@ -111,6 +122,9 @@ async function load() {
     const data = await getCatalog({
       q: q.value,
       category: filters.value.category,
+      subcategory: filters.value.subcategory,
+      sleeve_length: ownFactory.value ? filters.value.sleeve_length : '',
+      fabric: ownFactory.value ? filters.value.fabric : '',
       color: ownFactory.value ? '' : filters.value.color,
       style: ownFactory.value ? '' : filters.value.style,
       season: ownFactory.value ? '' : filters.value.season,
@@ -151,6 +165,7 @@ onMounted(async () => {
   try {
     meta.value = await getFilters()
     libraryMeta.value = await getLibraryMeta()
+    taxonomy.value = await getTaxonomy()
   } catch (reason) { error.value = reason instanceof Error ? reason.message : String(reason) }
   await load()
 })
@@ -185,7 +200,20 @@ watch(() => route.query, load, { deep: true })
       <div class="filter-row">
         <span class="filter-row-label">品类</span>
         <div class="filter-scroll" role="group" aria-label="品类">
-          <button v-for="opt in categoryOptions" :key="`c-${opt}`" type="button" class="chip" :aria-pressed="filters.category === opt" @click="setFilter('category', opt)">{{ opt }}</button>
+          <button v-for="opt in level1Options" :key="`c-${opt}`" type="button" class="chip" :aria-pressed="filters.category === opt" @click="setFilter('category', opt)">{{ opt }}</button>
+        </div>
+      </div>
+      <div v-if="subcategoryOptions.length" class="filter-row">
+        <span class="filter-row-label">二级</span>
+        <div class="filter-scroll" role="group" aria-label="二级品类">
+          <button v-for="opt in subcategoryOptions" :key="`sub-${opt}`" type="button" class="chip" :aria-pressed="filters.subcategory === opt" @click="setFilter('subcategory', opt)">{{ opt }}</button>
+        </div>
+      </div>
+      <div v-if="ownFactory" class="filter-row">
+        <span class="filter-row-label">袖长</span>
+        <div class="filter-scroll" role="group" aria-label="袖长">
+          <button type="button" class="chip" :aria-pressed="filters.sleeve_length === '全部'" @click="setFilter('sleeve_length', '全部')">全部</button>
+          <button v-for="opt in taxonomy.sleeves" :key="`sleeve-${opt}`" type="button" class="chip" :aria-pressed="filters.sleeve_length === opt" @click="setFilter('sleeve_length', opt)">{{ opt }}</button>
         </div>
       </div>
       <div class="filter-row">
@@ -203,9 +231,16 @@ watch(() => route.query, load, { deep: true })
           <span v-if="!swatches.length" class="meta">暂无颜色</span>
         </div>
       </div>
-      <details v-if="!ownFactory" class="more-filters">
+      <details class="more-filters">
         <summary>更多筛选</summary>
-        <div v-for="[key, label, options] in extraFilters" :key="key" class="filter-row">
+        <div v-if="ownFactory" class="filter-row">
+          <span class="filter-row-label">面料</span>
+          <div class="filter-scroll" role="group" aria-label="面料">
+            <button type="button" class="chip" :aria-pressed="filters.fabric === '全部'" @click="setFilter('fabric', '全部')">全部</button>
+            <button v-for="opt in taxonomy.fabrics" :key="`fabric-${opt}`" type="button" class="chip" :aria-pressed="filters.fabric === opt" @click="setFilter('fabric', opt)">{{ opt }}</button>
+          </div>
+        </div>
+        <div v-for="[key, label, options] in extraFilters" v-show="!ownFactory" :key="key" class="filter-row">
           <span class="filter-row-label">{{ label }}</span>
           <div class="filter-scroll" role="group" :aria-label="label">
             <button type="button" class="chip" :aria-pressed="filters[key] === '全部'" @click="setFilter(key, '全部')">全部</button>

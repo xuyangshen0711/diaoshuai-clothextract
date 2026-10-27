@@ -70,12 +70,12 @@ def test_modify_then_approve_preserves_ai_and_audit(store):
     final_tags = record.tags.model_copy(update={"品类": "外套"})
     result = approve(record, final_tags)
     assert result.review_status == "approved" and result.tags.品类 == "外套"
-    assert result.ai_tags.品类 == "毛衣" and result.proposed_tags is None
+    assert result.ai_tags.品类 == "上衣>套衫" and result.proposed_tags is None
     assert result.manually_edited and result.reviewer == "设计师甲" and result.reviewed_at
     persisted = catalog.load_catalog()[0]
     assert persisted == result
     history = catalog.review_history(record.id)
-    assert history[0]["before"]["ai_tags"]["品类"] == "毛衣"
+    assert history[0]["before"]["ai_tags"]["品类"] == "上衣>套衫"
     assert history[0]["after"]["tags"]["品类"] == "外套"
     assert history[0]["actor"] == "设计师甲"
 
@@ -87,11 +87,11 @@ def test_retag_keeps_human_result_and_requires_new_approval(store, monkeypatch):
     assert tag_records([approved], backend="mock")[0].review_status == "approved"
     tag_records([approved], backend="mock", overwrite=True)
     assert approved.review_status == "pending"
-    assert approved.tags.品类 == "外套" and approved.proposed_tags.品类 == "毛衣"
+    assert approved.tags.品类 == "外套" and approved.proposed_tags.品类 == "上衣>套衫"
     catalog.save_catalog([approved])
     assert not catalog.approved_records(catalog.load_catalog())
     final = approve(approved)
-    assert final.tags.品类 == "毛衣" and final.tags_source == "mock"
+    assert final.tags.品类 == "上衣>套衫" and final.tags_source == "mock"
     assert len([e for e in catalog.review_history(record.id) if e["action"] == "approve"]) == 2
 
 
@@ -241,8 +241,8 @@ def test_library_uses_pending_proposal_for_display_and_every_filter_without_chan
     assert catalog.get_by_id(catalog.load_catalog(), record.id).model_dump() == before
     assert len(catalog.review_history(record.id)) == history_count
     approved = approve(record, record.tags.model_copy(update={"品类": "衬衫"}))
-    result = client.get("/api/catalog?review_status=approved&category=衬衫").json()["items"][0]
-    assert result["display_tags"]["品类"] == "衬衫"
+    result = client.get("/api/catalog?review_status=approved&category=上衣>衬衫").json()["items"][0]
+    assert result["display_tags"]["品类"] == "上衣>衬衫"
     assert result["source"] == item["source"]
     pending = catalog.review_record(approved.id, action="resubmit", reviewer="甲", expected_revision=approved.revision)
     catalog.review_record(pending.id, action="reject", reviewer="甲", note="图片重复",

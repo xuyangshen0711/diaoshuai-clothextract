@@ -3,8 +3,8 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from
 import { jobs, isActive } from '../composables/importJobs'
 import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router'
 import { visibleDescription } from '../utils/source'
-import { NOTE_FIELDS, getFilters, getReviews, getReviewHistory, reviewRecord, type CatalogItem, type DesignNotes,
-  type FashionTags, type FilterMeta, type ReviewEvent, type ReviewStatus } from '../api'
+import { NOTE_FIELDS, assignRecordCategory, getFilters, getReviews, getReviewHistory, getTaxonomy, reviewRecord,
+  type CatalogItem, type DesignNotes, type FashionTags, type FilterMeta, type ReviewEvent, type ReviewStatus, type Taxonomy } from '../api'
 
 const route = useRoute()
 const router = useRouter()
@@ -15,6 +15,7 @@ const actions: Record<string, string> = {
   auto_rejected: 'AI 判断非款式图，自动移除',
   image_replacement_proposed: '上传替换图，待确认', keep_image: '保留原图',
   source_category_changed: '修改资料大类',
+  category_assigned: '改归固定品类',
 }
 const fields = ['品类', '风格', '季节', '版型', '颜色主色调', '领型', '袖型'] as const
 const queryValue = (key: string) => typeof route.query[key] === 'string' ? route.query[key] as string : ''
@@ -26,6 +27,17 @@ const category = computed(() => queryValue('category'))
 const facets = ref<{ batches: { id: string; label: string }[]; files: string[] }>({ batches: [], files: [] })
 const counts = reactive<Record<ReviewStatus, number>>({ pending: 0, approved: 0, rejected: 0 })
 const meta = ref<FilterMeta>({})
+const taxonomy = ref<Taxonomy>({ unsorted: '待归类', sleeves: [], fabrics: [], tree: [], labels: [], synonyms: [] })
+const assignLevel1 = ref('')
+const assignLevel2 = ref('')
+const assignError = ref('')
+const assignChildren = computed(() => taxonomy.value.tree.find(item => item.level1 === assignLevel1.value)?.children || [])
+const needsCategory = computed(() => {
+  const item = current.value
+  if (!item) return false
+  const label = item.library_category || (item.proposed_tags || item.tags).品类
+  return label === (taxonomy.value.unsorted || '待归类')
+})
 const items = ref<CatalogItem[]>([])
 const total = ref(0)
 const selectedId = ref('')
@@ -125,6 +137,9 @@ watch(current, async item => {
   const sequence = ++historySequence
   baseline.value = ''; history.value = []; historyError.value = ''; note.value = ''
   if (!item) return
+  assignLevel1.value = ''
+  assignLevel2.value = ''
+  assignError.value = ''
   Object.assign(form, JSON.parse(JSON.stringify(item.proposed_tags || item.tags)))
   for (const key of NOTE_FIELDS) notesForm[key] = item.notes?.[key] || ''
   for (const key of fields) if (!meta.value[key]?.includes(form[key])) form[key] = ''
@@ -134,6 +149,26 @@ watch(current, async item => {
     if (sequence === historySequence) history.value = data.items
   } catch (e) { if (sequence === historySequence) historyError.value = e instanceof Error ? e.message : String(e) }
 })
+async function assignCurrent() {
+  const item = current.value
+  if (!item || saving.value) return
+  const children = assignChildren.value
+  if (!assignLevel1.value || (children.length && !assignLevel2.value)) {
+    assignError.value = '请选到具体品类'
+    return
+  }
+  assignError.value = ''
+  error.value = ''
+  saving.value = true
+  try {
+    await assignRecordCategory(item, assignLevel1.value, children.length ? assignLevel2.value : '')
+    message.value = '已归入固定品类，原始叫法已记入同义词'
+    baseline.value = ''
+    saving.value = false
+    await load(item.id)
+  } catch (e) { assignError.value = e instanceof Error ? e.message : String(e) }
+  finally { saving.value = false }
+}
 async function decide(action: 'approve' | 'reject' | 'resubmit' | 'keep_image') {
   const item = current.value
   if (!item || saving.value) return
@@ -167,7 +202,7 @@ function onKey(event: KeyboardEvent) {
 }
 onMounted(async () => {
   window.addEventListener('keydown', onKey); window.addEventListener('beforeunload', beforeUnload)
-  try { meta.value = await getFilters(); await load(); ready = true }
+  try { meta.value = await getFilters(); taxonomy.value = await getTaxonomy(); await load(); ready = true }
   catch (e) { error.value = e instanceof Error ? e.message : String(e) }
 })
 onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeEventListener('beforeunload', beforeUnload) })
@@ -245,6 +280,23 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
             </figure>
           </div>
           <p class="review-source">{{ current.source_category }}<span v-if="current.style_code"> · 款号 {{ current.style_code }}</span><br />{{ current.source.source_file }}<br />{{ current.source.location }} · 点击图片查看原图</p>
+          <div v-if="needsCategory" class="unsorted-assign">
+            <p class="meta">这条还在待归类<template v-if="current.category_raw">，原始叫法「{{ current.category_raw }}」</template>。从固定品类里选一个，下次相同叫法会自动归入。</p>
+            <div class="field"><label for="assign-level1">一级品类</label>
+              <select id="assign-level1" v-model="assignLevel1" :disabled="saving">
+                <option value="">请选择</option>
+                <option v-for="node in taxonomy.tree" :key="node.level1" :value="node.level1">{{ node.level1 }}</option>
+              </select>
+            </div>
+            <div v-if="assignChildren.length" class="field"><label for="assign-level2">二级品类</label>
+              <select id="assign-level2" v-model="assignLevel2" :disabled="saving">
+                <option value="">请选择</option>
+                <option v-for="name in assignChildren" :key="name" :value="name">{{ name }}</option>
+              </select>
+            </div>
+            <button class="btn primary" type="button" :disabled="saving" @click="assignCurrent">归入此品类</button>
+            <p v-if="assignError" class="error">{{ assignError }}</p>
+          </div>
           <p v-if="current.has_pending_image" class="meta">通过后新图片会替换原图，旧图留在详情页历史里。选择「保留原图」则放弃这次替换，恢复替换前的审核状态。</p>
           <p v-if="current.reviewed_at" class="meta">
             上次审核：{{ current.reviewer }}<br />{{ date(current.reviewed_at) }}

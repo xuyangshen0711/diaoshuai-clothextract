@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
 from src.catalog import (  # noqa: E402
     RAW_DIR,
     CatalogConflict,
+    assign_garment_category,
     assign_source_category,
     ensure_data_dirs,
     get_by_id,
@@ -41,6 +42,7 @@ from src.factory.library import (  # noqa: E402
     color_tally,
     detail_fields,
     display_categories,
+    effective_placement,
     imported_at,
     in_group,
     load_index,
@@ -145,12 +147,32 @@ def _narrow(records: list[ImageRecord], *, filters: dict, group: str | None, q: 
         records = [record for record in records if record.source_category == source_category]
     by_id = {record.id: record for record in records}
     category = filters.get("category")
+    subcategory = filters.get("subcategory")
+    sleeve_length = filters.get("sleeve_length")
+    fabric = filters.get("fabric")
     projected = [record.model_copy(update={"tags": record.display_tags}) for record in records]
     if group in CATEGORY_GROUPS:
         projected = [record for record in projected if in_group(by_id[record.id], group, index)]
-    projected = filter_records(projected, **{key: value for key, value in filters.items() if key != "category"})
-    if category and category != "全部":
-        projected = [record for record in projected if category in display_categories(by_id[record.id], index)]
+    skipped = {"category", "subcategory", "sleeve_length", "fabric"}
+    projected = filter_records(projected, **{key: value for key, value in filters.items() if key not in skipped})
+    if any(value and value != "全部" for value in (category, subcategory, sleeve_length, fabric)):
+        kept = []
+        for record in projected:
+            placement = effective_placement(by_id[record.id], index)
+            if category and category != "全部":
+                if ">" in category:
+                    if placement.label != category:
+                        continue
+                elif category not in display_categories(by_id[record.id], index) and placement.level1 != category:
+                    continue
+            if subcategory and subcategory != "全部" and placement.level2 != subcategory:
+                continue
+            if sleeve_length and sleeve_length != "全部" and placement.sleeve != sleeve_length:
+                continue
+            if fabric and fabric != "全部" and placement.fabric != fabric:
+                continue
+            kept.append(record)
+        projected = kept
     chosen = [by_id[record.id] for record in projected
               if matches_factory(by_id[record.id], index, **factory_filters)]
     if q and q.strip():
@@ -163,6 +185,9 @@ def _narrow(records: list[ImageRecord], *, filters: dict, group: str | None, q: 
 
 def tag_filters(
     category: str | None = None,
+    subcategory: str | None = None,
+    sleeve_length: str | None = None,
+    fabric: str | None = None,
     style: str | None = None,
     season: str | None = None,
     fit: str | None = None,
@@ -170,8 +195,8 @@ def tag_filters(
     neckline: str | None = None,
     sleeve: str | None = None,
 ) -> dict[str, str | None]:
-    return dict(category=category, style=style, season=season, fit=fit,
-                color=color, neckline=neckline, sleeve=sleeve)
+    return dict(category=category, subcategory=subcategory, sleeve_length=sleeve_length, fabric=fabric,
+                style=style, season=season, fit=fit, color=color, neckline=neckline, sleeve=sleeve)
 
 
 class TagJobRequest(BaseModel):
@@ -213,7 +238,11 @@ def health() -> dict[str, Any]:
 
 @app.get("/api/meta/filters")
 def meta_filters() -> dict[str, list[str]]:
-    return {**FILTER_FIELDS, "细节元素": DETAILS}
+    from src.taxonomy import FABRICS, SLEEVE_LENGTHS, active
+
+    with catalog_store._database():
+        labels = active().labels()
+    return {**FILTER_FIELDS, "品类": labels, "细节元素": DETAILS, "袖长": list(SLEEVE_LENGTHS), "面料": list(FABRICS)}
 
 
 @app.get("/api/meta/library")
@@ -476,7 +505,9 @@ def review_queue(
     if source_file:
         records = [r for r in records if r.source.source_file == source_file]
     if category:
-        records = [r for r in records if (r.proposed_tags or r.tags).品类 == category]
+        index = load_index()
+        records = [r for r in records if effective_placement(r, index).label == category
+                   or effective_placement(r, index).level1 == category]
     counts = {state: sum(r.review_status == state for r in records)
               for state in ("pending", "approved", "rejected")}
     selected = [r for r in records if r.review_status == status]
@@ -609,6 +640,96 @@ def record_detail(record_id: str):
         return payload
     finally:
         reset_search_blobs(token)
+
+
+class TaxonomyEdit(BaseModel):
+    level1: str = ""
+    level2: str = ""
+    new_level1: str = ""
+    new_level2: str = ""
+    phrase: str = ""
+    sleeve_length: str = ""
+    fabric: str = ""
+
+
+class CategoryAssignBody(BaseModel):
+    level1: str
+    level2: str = ""
+    sleeve_length: str = ""
+    fabric: str = ""
+    expected_revision: int = Field(ge=1)
+
+
+def _taxonomy_edit(action) -> dict[str, Any]:
+    from src.taxonomy import TaxonomyError, snapshot
+
+    try:
+        with catalog_store._database() as conn:
+            action(conn)
+            return snapshot(conn)
+    except TaxonomyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/taxonomy")
+def taxonomy_view() -> dict[str, Any]:
+    from src.taxonomy import snapshot
+
+    with catalog_store._database() as conn:
+        return snapshot(conn)
+
+
+@app.post("/api/taxonomy/categories")
+def taxonomy_add(body: TaxonomyEdit) -> dict[str, Any]:
+    from src.taxonomy import add_category
+
+    return _taxonomy_edit(lambda conn: add_category(conn, body.level1, body.level2))
+
+
+@app.post("/api/taxonomy/categories/rename")
+def taxonomy_rename(body: TaxonomyEdit) -> dict[str, Any]:
+    from src.taxonomy import rename_category
+
+    return _taxonomy_edit(lambda conn: rename_category(conn, body.level1, body.level2, body.new_level1, body.new_level2))
+
+
+@app.post("/api/taxonomy/categories/delete")
+def taxonomy_delete(body: TaxonomyEdit) -> dict[str, Any]:
+    from src.taxonomy import delete_category
+
+    return _taxonomy_edit(lambda conn: delete_category(conn, body.level1, body.level2))
+
+
+@app.post("/api/taxonomy/synonyms")
+def taxonomy_save_synonym(body: TaxonomyEdit) -> dict[str, Any]:
+    from src.taxonomy import save_synonym
+
+    return _taxonomy_edit(lambda conn: save_synonym(
+        conn, body.phrase, body.level1, body.level2, body.sleeve_length, body.fabric, learned=True,
+    ))
+
+
+@app.post("/api/taxonomy/synonyms/delete")
+def taxonomy_delete_synonym(body: TaxonomyEdit) -> dict[str, Any]:
+    from src.taxonomy import delete_synonym
+
+    return _taxonomy_edit(lambda conn: delete_synonym(conn, body.phrase))
+
+
+@app.post("/api/records/{record_id}/category")
+def assign_record_category(record_id: str, body: CategoryAssignBody) -> dict[str, Any]:
+    try:
+        record = assign_garment_category(
+            record_id, level1=body.level1, level2=body.level2, sleeve_length=body.sleeve_length,
+            fabric=body.fabric, expected_revision=body.expected_revision,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="记录不存在") from exc
+    except CatalogConflict:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _serialize(record)
 
 
 @app.get("/api/records/{record_id}/source")

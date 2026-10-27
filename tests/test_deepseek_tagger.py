@@ -80,7 +80,7 @@ def test_thinking_defaults_on_and_json_object_stays_in_the_user_message(tmp_path
 
     tagger, seen = _tagger(handler, monkeypatch)
     tags = tagger.tag(image, "版型特点：宽松")
-    assert tags is not None and tags.品类 == "毛衣" and tags.细节元素 == ["开襟"]
+    assert tags is not None and tags.品类 == "上衣>套衫" and tags.细节元素 == ["开襟"]
     body = seen[0]
     assert body["model"] == "deepseek-flash"
     assert body["response_format"] == {"type": "json_object"}
@@ -105,7 +105,7 @@ def test_thinking_can_be_disabled(tmp_path, monkeypatch):
         return _completion(json.dumps(SAMPLE, ensure_ascii=False))
 
     tagger, seen = _tagger(handler, monkeypatch, thinking=False)
-    assert tagger.tag(image).品类 == "毛衣"
+    assert tagger.tag(image).品类 == "上衣>套衫"
     assert seen[0]["thinking"] == {"type": "disabled"}
     assert seen[0]["temperature"] == 0.1
     assert seen[0]["max_tokens"] == 1024
@@ -127,7 +127,7 @@ def test_fenced_json_is_parsed_and_unknown_labels_are_coerced(tmp_path, monkeypa
     tagger, _seen = _tagger(handler, monkeypatch)
     tags = tagger.tag(image)
     assert tags is not None
-    assert tags.品类 == "其他"
+    assert tags.品类 == "待归类"
     assert tags.细节元素 == ["开襟"]
     assert tags.一句话描述 == "一件毛衣"
 
@@ -204,7 +204,7 @@ def test_rate_limit_backs_off_then_succeeds(tmp_path, monkeypatch):
         return _completion(json.dumps(SAMPLE, ensure_ascii=False))
 
     tagger, seen = _tagger(handler, monkeypatch)
-    assert tagger.tag(image).品类 == "毛衣"
+    assert tagger.tag(image).品类 == "上衣>套衫"
     assert len(seen) == 3
     assert sleeps == [1.5, 1.5]
 
@@ -269,7 +269,7 @@ def test_reasoning_content_is_ignored(tmp_path, monkeypatch):
 
     tagger, _seen = _tagger(handler, monkeypatch)
     tags = tagger.tag(image)
-    assert tags is not None and tags.品类 == "毛衣"
+    assert tags is not None and tags.品类 == "上衣>套衫"
     assert "思维链" not in tags.一句话描述
 
 
@@ -363,4 +363,4 @@ def test_invalid_json_does_not_stop_the_rest_of_the_job(store, monkeypatch):
     assert public["succeeded"] == 1 and public["failed"] == 1
     assert any("不是合法 JSON" in item["message"] for item in public["errors"])
     saved = catalog.load_catalog()
-    assert len(saved) == 1 and saved[0].tags.品类 == "毛衣" and saved[0].tags_source == "deepseek"
+    assert len(saved) == 1 and saved[0].tags.品类 == "上衣>套衫" and saved[0].tags_source == "deepseek"

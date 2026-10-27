@@ -210,7 +210,11 @@ def test_image_upload_folder_case_replacement_and_filters(store, monkeypatch):
     assert detail["sales"]["total_quantity"] == 3411
     assert detail["sales"]["total_amount"] == 509145
     assert {row["customer"] for row in detail["variants"]} == {"本厂自有版本", "若宇", "张学庚", "卡雷莱", "声雨竹"}
-    assert detail["library_category"] == "长袖套衫"
+    assert detail["library_category"] == "上衣>套衫"
+    assert detail["sleeve_length"] == "长袖"
+    assert detail["fabric"] == "针织"
+    assert detail["archive_category"] == "长袖套衫"
+    assert {row["category"] for row in detail["variants"]} == {"长袖套衫"}
     assert all("KG" not in row["variant_code"] for row in detail["variants"])
     assert detail["has_pending_image"] and detail["pending_image_url"]
     assert client.get(detail["pending_image_url"]).status_code == 200
@@ -223,7 +227,7 @@ def test_image_upload_folder_case_replacement_and_filters(store, monkeypatch):
         ({"source_category": "本厂产品", "color_family": "紫"}, True),
         ({"source_category": "本厂产品", "size": "M"}, True),
         ({"source_category": "本厂产品", "customer": "若宇"}, True),
-        ({"source_category": "本厂产品", "category": "长袖套衫"}, True),
+        ({"source_category": "本厂产品", "category": "上衣", "subcategory": "套衫", "sleeve_length": "长袖"}, True),
         ({"group": "上衣", "source_category": "本厂产品"}, True),
         ({"group": "下装", "source_category": "本厂产品"}, False),
         ({"source_category": "网图趋势"}, False),
