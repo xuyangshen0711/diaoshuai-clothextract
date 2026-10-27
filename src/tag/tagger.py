@@ -1,4 +1,4 @@
-"""Image tagging backends: mock heuristics and OpenAI GPT-4o-mini."""
+"""Image tagging backends: mock heuristics, OpenAI GPT-4o-mini, and DeepSeek Flash."""
 
 from __future__ import annotations
 
@@ -103,6 +103,10 @@ def get_tagger(backend: str | None = None):
         from src.tag.openai_tagger import OpenAITagger
 
         return OpenAITagger()
+    if choice in {"deepseek", "deepseek-flash"}:
+        from src.tag.deepseek_tagger import DeepSeekTagger
+
+        return DeepSeekTagger()
     raise ValueError(f"Unknown tagger backend: {choice}")
 
 
@@ -141,23 +145,55 @@ def has_openai_key() -> bool:
     return bool(os.getenv("OPENAI_API_KEY"))
 
 
-def openai_key_is_placeholder() -> bool:
+def has_deepseek_key() -> bool:
+    load_dotenv(ROOT / ".env")
+    return bool(os.getenv("DEEPSEEK_API_KEY"))
+
+
+def _key_is_placeholder(env_name: str) -> bool:
     """True when .env still has the sample value. Does not change whether a key is present."""
     load_dotenv(ROOT / ".env")
-    key = (os.getenv("OPENAI_API_KEY") or "").strip().strip('"').strip("'")
+    key = (os.getenv(env_name) or "").strip().strip('"').strip("'")
     if not key:
         return False
     example = ""
     sample = ROOT / ".env.example"
     if sample.is_file():
+        prefix = env_name + "="
         for line in sample.read_text(encoding="utf-8").splitlines():
-            if line.startswith("OPENAI_API_KEY="):
+            if line.startswith(prefix):
                 example = line.split("=", 1)[1].strip().strip('"').strip("'")
                 break
     if key == example or "..." in key:
         return True
-    folded = key.lower()
-    if folded in {"sk-xxx", "sk-xxxx", "your-api-key", "changeme", "replace-me", "placeholder"}:
+    if key.lower() in {"sk-xxx", "sk-xxxx", "your-api-key", "changeme", "replace-me", "placeholder"}:
         return True
     body = key[3:] if key.lower().startswith("sk-") else key
     return len(key) < 16 or set(body) <= set(".xX*_-")
+
+
+def openai_key_is_placeholder() -> bool:
+    return _key_is_placeholder("OPENAI_API_KEY")
+
+
+def deepseek_key_is_placeholder() -> bool:
+    return _key_is_placeholder("DEEPSEEK_API_KEY")
+
+
+def provider_ready(kind: str) -> bool:
+    if kind == "openai":
+        return has_openai_key() and not openai_key_is_placeholder()
+    if kind == "deepseek":
+        return has_deepseek_key() and not deepseek_key_is_placeholder()
+    return False
+
+
+def default_tagger_backend() -> str:
+    """One configured provider wins; both configured prefers DeepSeek; otherwise mock."""
+    deepseek = provider_ready("deepseek")
+    openai = provider_ready("openai")
+    if deepseek:
+        return "deepseek"
+    if openai:
+        return "openai"
+    return "mock"

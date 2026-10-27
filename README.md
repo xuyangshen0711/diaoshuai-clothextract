@@ -9,7 +9,7 @@
 | 模块 | 实现 |
 |------|------|
 | 抽图 | `python-pptx` + `openpyxl` + `pymupdf` |
-| 打标 | GPT-4o-mini + 受约束 JSON（等价于文档中的多模态 API 路径） |
+| 打标 | GPT-4o-mini 或 DeepSeek Flash + JSON Output |
 | 检索 | CLIP（多语言文本塔）+ FAISS |
 | 存储 | 本地图片 + SQLite（含审核状态与操作历史） |
 | 界面 | Vue 3 + FastAPI |
@@ -22,7 +22,7 @@
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # 填入真实的 OPENAI_API_KEY；没有密钥就保持示例值，页面会改用模拟分类
+cp .env.example .env   # 填入真实的 OPENAI_API_KEY 或 DEEPSEEK_API_KEY；示例值不算已配置，页面会改用模拟分类
 ```
 
 `data/raw` 里还没有资料时，不必跑 `run_pipeline`，直接启动网页，在「导入」里上传即可：
@@ -38,7 +38,22 @@ cd frontend && npm install && npm run dev
 python scripts/run_pipeline.py --input data/raw --backend openai
 ```
 
-没有密钥时把 `--backend openai` 改成 `--backend mock`，或在导入页选择「模拟分类（测试）」。
+没有密钥时把 `--backend openai` 改成 `--backend mock`，或在导入页选择「模拟分类（测试）」。`--backend` 留空时：只配置了 OpenAI 或 DeepSeek 其中一家就用那一家；两家都配置好时用 DeepSeek；都没有（或仍是示例密钥）时用模拟分类。
+
+DeepSeek 密钥在 <https://platform.deepseek.com> 创建，写入 `.env`：
+
+```bash
+DEEPSEEK_API_KEY=你的密钥
+DEEPSEEK_MODEL=deepseek-flash
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_THINKING=true
+```
+
+`DEEPSEEK_THINKING` 不写或写成 `true` 时开启思考（官方默认，请求里是 `thinking.type=enabled`）。设成 `false` 则发送 `thinking.type=disabled`。两种都配合 `response_format` 的 `json_object`。开启思考时接口还会返回 `reasoning_content`，打标只解析 `content` 里的 JSON，思维链不参与校验。返回内容仍会去掉 markdown 代码块，并按 `src/schema.py` 的标签表校验。某一张图解析失败只标记这张失败，不会卡住整批。图片只放在用户消息里，支持 JPEG、PNG、GIF、WebP，单张不超过 32 MiB。单次请求读超时 180 秒。密钥无效、余额不足、限流和超时会显示中文说明；限流会退避重试。命令行：
+
+```bash
+python scripts/run_pipeline.py --input data/raw --backend deepseek
+```
 
 启用 CLIP 语义检索前，在本机准备权重并建索引：
 

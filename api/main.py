@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import tempfile
@@ -61,7 +62,14 @@ from src.schema import (  # noqa: E402
 )
 from src.search.query import filter_records, search_by_image, search_by_text  # noqa: E402
 from src.search.inspiration import parse_inspiration  # noqa: E402
-from src.tag.tagger import has_openai_key, openai_key_is_placeholder  # noqa: E402
+from src.tag.tagger import (  # noqa: E402
+    default_tagger_backend,
+    deepseek_key_is_placeholder,
+    has_deepseek_key,
+    has_openai_key,
+    openai_key_is_placeholder,
+    provider_ready,
+)
 from src.images import image_metadata, image_version, thumbnail_path  # noqa: E402
 
 ensure_data_dirs()
@@ -167,7 +175,7 @@ def tag_filters(
 
 
 class TagJobRequest(BaseModel):
-    backend: Literal["openai", "mock"] = "openai"
+    backend: Literal["openai", "mock", "deepseek"] = "openai"
     overwrite: bool = False
     source_type: str | None = None
 
@@ -180,12 +188,23 @@ def health() -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         backend_name = "unavailable"
     placeholder = openai_key_is_placeholder()
-    ready = has_openai_key() and not placeholder
+    ready = provider_ready("openai")
+    deepseek_placeholder = deepseek_key_is_placeholder()
+    deepseek_ready = provider_ready("deepseek")
+    if deepseek_ready:
+        shown = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
+    elif ready:
+        shown = "gpt-4o-mini"
+    else:
+        shown = "mock"
     return {
         "ok": True,
         "openai_ready": ready,
         "openai_placeholder": placeholder,
-        "tagger": "gpt-4o-mini" if ready else "mock",
+        "deepseek_ready": deepseek_ready,
+        "deepseek_placeholder": deepseek_placeholder,
+        "default_backend": default_tagger_backend(),
+        "tagger": shown,
         "embedding_backend": backend_name,
         "catalog_count": len(load_catalog()),
         "pending_count": sum(r.review_status == "pending" for r in load_catalog()),
@@ -332,11 +351,13 @@ def _safe_relative(filename: str) -> str:
 @app.post("/api/import/jobs", status_code=202)
 def start_import_job(
     files: list[UploadFile] = File(...),
-    backend: Literal["openai", "mock"] = "openai",
+    backend: Literal["openai", "mock", "deepseek"] = "openai",
     source_categories: list[str] | None = Form(default=None),
 ):
     if backend == "openai" and not has_openai_key():
         raise HTTPException(status_code=400, detail="请先在本地配置 OPENAI_API_KEY")
+    if backend == "deepseek" and not has_deepseek_key():
+        raise HTTPException(status_code=400, detail="请先在本地配置 DEEPSEEK_API_KEY")
     if not files:
         raise HTTPException(status_code=422, detail="请选择文件")
     names = [_safe_relative(upload.filename or "upload.bin") for upload in files]
@@ -406,6 +427,8 @@ def import_sales_sheet(file: UploadFile = File(...)):
 def start_tag_job(req: TagJobRequest):
     if req.backend == "openai" and not has_openai_key():
         raise HTTPException(status_code=400, detail="请先在本地配置 OPENAI_API_KEY")
+    if req.backend == "deepseek" and not has_deepseek_key():
+        raise HTTPException(status_code=400, detail="请先在本地配置 DEEPSEEK_API_KEY")
     job = import_jobs.create_retag(req.backend, req.overwrite, req.source_type)
     import_jobs.submit_job(job["id"])
     return import_jobs.public_job(job)

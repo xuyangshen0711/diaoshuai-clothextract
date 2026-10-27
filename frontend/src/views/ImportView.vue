@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { getCatalog, getHealth, getLibraryMeta, importFiles, importSalesSheet, importStyleArchive, rebuildIndex, retag, retryJob, type ImportJob, type TableReport } from '../api'
 import { fileSizeLabel } from '../utils/source'
 import { jobs, jobsError, isActive, refreshJobs, rememberJob } from '../composables/importJobs'
@@ -9,9 +9,27 @@ const ACCEPT = /\.(pdf|pptx|xlsx|xlsm|png|jpe?g|webp|gif|bmp|tiff?)$/i
 type Queued = { key: string; file: File; relativePath: string; category: string }
 const queued = ref<Queued[]>([])
 const batchCategory = ref('')
-const backend = ref('openai')
+const backend = ref('mock')
 const openaiReady = ref(false)
-const keyPlaceholder = ref(false)
+const deepseekReady = ref(false)
+const openaiPlaceholder = ref(false)
+const deepseekPlaceholder = ref(false)
+function providerLine(name: string, ready: boolean, placeholder: boolean) {
+  if (ready) return `${name} 已配置`
+  if (placeholder) return `${name} 密钥是示例值`
+  return `${name} 未配置`
+}
+const classifierStatus = computed(() => {
+  const openai = providerLine('OpenAI', openaiReady.value, openaiPlaceholder.value)
+  const deepseek = providerLine('DeepSeek', deepseekReady.value, deepseekPlaceholder.value)
+  const fallback = !openaiReady.value && !deepseekReady.value ? '，当前可使用模拟分类' : ''
+  return `${openai}，${deepseek}${fallback}`
+})
+function backendLabel(name: string) {
+  if (name === 'mock') return '模拟分类'
+  if (name === 'deepseek') return 'DeepSeek'
+  return 'AI 分类'
+}
 const imageCodes = ref<Set<string>>(new Set())
 const knownCodes = ref<Set<string>>(new Set())
 const error = ref('')
@@ -222,8 +240,10 @@ onMounted(async () => {
   try {
     const health = await getHealth()
     openaiReady.value = health.openai_ready
-    keyPlaceholder.value = Boolean(health.openai_placeholder)
-    if (!health.openai_ready) backend.value = 'mock'
+    deepseekReady.value = Boolean(health.deepseek_ready)
+    openaiPlaceholder.value = Boolean(health.openai_placeholder)
+    deepseekPlaceholder.value = Boolean(health.deepseek_placeholder)
+    backend.value = health.default_backend || 'mock'
     await refreshJobs()
     await refreshKnownCodes()
   } catch { error.value = '无法连接服务，请稍后刷新重试' }
@@ -234,7 +254,7 @@ watch(() => jobs.value.map(job => `${job.id}:${job.status}`).join(','), () => { 
 <template>
   <main class="import-page">
     <div class="page-head"><div><h2>导入与处理任务</h2><p class="meta">分类完成后先在主页展示并标记未审核，再由人工确认。每个文件单独选择资料大类，抽出来的图片会继承该文件的大类。</p></div>
-      <span class="meta">{{ keyPlaceholder ? '密钥是示例值，请填真实密钥，或者用模拟分类' : openaiReady ? 'AI 分类已配置' : '当前可使用模拟分类' }}</span></div>
+      <span id="classifier-status" class="meta classifier-status">{{ classifierStatus }}</span></div>
     <section class="import-upload" aria-label="上传资料">
       <div class="dropzone" :class="{ dragging }" @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false" @drop.prevent="onDrop">
         <strong>拖入 PDF / PPT / Excel，或图片、整个文件夹</strong>
@@ -264,7 +284,7 @@ watch(() => jobs.value.map(job => `${job.id}:${job.status}`).join(','), () => { 
         <button class="btn" :disabled="uploading" :aria-label="`移除 ${item.relativePath}`" @click="queued.splice(index, 1)">移除</button>
       </li></ul>
       <div class="toolbar import-submit"><div class="field"><label for="tag-backend">分类方式</label>
-        <select id="tag-backend" v-model="backend" :disabled="uploading"><option value="openai" :disabled="!openaiReady">GPT-4o-mini</option><option value="mock">模拟分类（测试）</option></select></div>
+        <select id="tag-backend" v-model="backend" :disabled="uploading"><option value="deepseek">DeepSeek</option><option value="openai" :disabled="!openaiReady">GPT-4o-mini</option><option value="mock">模拟分类（测试）</option></select></div>
         <button class="btn primary" :disabled="uploading" @click="runImport">{{ uploading ? '正在提交…' : '上传并开始分类' }}</button>
       </div>
     </section>
@@ -302,7 +322,7 @@ watch(() => jobs.value.map(job => `${job.id}:${job.status}`).join(','), () => { 
       <p v-if="!jobs.length && !jobsError" class="empty">暂无任务记录。上方上传资料后，可在这里查看抽图和打标进度。更新前的资料保留在图库和审核队列中。</p>
       <article v-for="job in jobs" :id="`job-${job.id}`" :key="job.id" class="import-task" :class="{ 'task-active': isActive(job) }">
         <div class="task-heading"><strong>{{ job.name }}</strong><span class="task-state" :class="job.status">{{ labels[job.status] }}</span></div>
-        <p class="meta">{{ time(job.created_at) }} · {{ job.backend === 'mock' ? '模拟分类' : 'AI 分类' }} · 已用 {{ duration(job.elapsed_seconds) }}<span v-if="job.eta_seconds !== null && job.eta_seconds > 0"> · 预计剩余约 {{ duration(job.eta_seconds) }}</span></p>
+        <p class="meta">{{ time(job.created_at) }} · {{ backendLabel(job.backend) }} · 已用 {{ duration(job.elapsed_seconds) }}<span v-if="job.eta_seconds !== null && job.eta_seconds > 0"> · 预计剩余约 {{ duration(job.eta_seconds) }}</span></p>
         <template v-if="job.status === 'queued'"><p class="meta">前序任务完成后自动开始，无需重复提交。</p></template>
         <template v-else-if="job.status === 'extracting'"><progress :value="job.files_processed" :max="job.files_total || 1" aria-label="文件抽图进度" /><p class="meta">抽图 {{ job.files_processed }} / {{ job.files_total }} 份资料 · {{ job.current_file }}</p></template>
         <template v-else-if="job.total"><progress :value="job.processed" :max="job.total || 1" :aria-label="`${job.name}分类进度`" /><p class="meta">已处理 {{ job.processed }} / {{ job.total }} 张，成功 {{ job.succeeded }} 张，<template v-if="job.filtered">过滤非款式图 {{ job.filtered }} 张，</template><template v-if="job.skipped">跳过相同图片 {{ job.skipped }} 张，</template>失败 {{ job.failed }} 张<span v-if="job.status === 'tagging'"> · {{ job.current_file }}</span></p></template>

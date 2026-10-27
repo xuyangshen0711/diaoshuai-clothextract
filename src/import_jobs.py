@@ -146,13 +146,18 @@ def friendly_error(exc):
     if isinstance(exc, CatalogConflict):
         text = str(exc)
         return text if text.startswith("款号") else "这张图片已被其他操作修改，请刷新检查后重试"
+    user_message = getattr(exc, "user_message", None)
+    if isinstance(user_message, str) and user_message:
+        return user_message
     code, status = getattr(exc, "code", None), getattr(exc, "status_code", None)
     if code == "insufficient_quota":
         return "AI 账户余额或额度不足，请检查计费设置后重试"
     if status == 401:
         return "API 密钥无效，请更新本地配置后重试"
+    if status == 402:
+        return "账户余额不足，请充值后重试"
     if status == 429:
-        return "AI 请求达到限额，请稍后重试"
+        return "请求被限流，请稍后重试"
     if status == 403:
         return "当前账号或网络无权访问模型，请检查权限"
     if "Timeout" in type(exc).__name__:
@@ -332,7 +337,7 @@ def run_job(job_id):
                 item["state"], item["error"] = "failed", friendly_error(exc)
                 with catalog._database() as conn:
                     _put(conn, job)
-                if getattr(exc, "status_code", None) in {401, 403, 429}:
+                if getattr(exc, "status_code", None) in {401, 402, 403, 429}:
                     blocked = item["error"]
                     break
         has_errors = bool(blocked) or any(i["state"] != "done" for i in [*job["items"], *job["files"]])

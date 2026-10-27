@@ -130,6 +130,9 @@ export function getHealth() {
     ok: boolean
     openai_ready: boolean
     openai_placeholder?: boolean
+    deepseek_ready?: boolean
+    deepseek_placeholder?: boolean
+    default_backend?: string
     catalog_count: number
     tagger?: string
     embedding_backend?: string
