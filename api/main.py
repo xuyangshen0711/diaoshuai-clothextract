@@ -37,8 +37,10 @@ from src.factory.archive import import_archive  # noqa: E402
 from src.factory.context import reset_search_blobs  # noqa: E402
 from src.factory.library import (  # noqa: E402
     card_fields,
+    color_tally,
     detail_fields,
     display_categories,
+    imported_at,
     in_group,
     load_index,
     matches_factory,
@@ -108,6 +110,13 @@ def _serialize(record: ImageRecord, score: float | None = None, index=None) -> d
     if score is not None:
         payload["score"] = score
     return payload
+
+
+def _without_color(filters: dict, factory_filters: dict, source_category: str | None):
+    """Drop only the active color dimension so swatch counts stay visible for the other colors."""
+    if source_category == "本厂产品":
+        return filters, {**factory_filters, "color_family": None}
+    return {**filters, "color": None}, factory_filters
 
 
 def _factory_filters(
@@ -218,6 +227,10 @@ def catalog(
             records = [r for r in records if r.source.source_type != "sample"]
         if review_status:
             records = [r for r in records if r.review_status == review_status]
+        basis_filters, basis_factory = _without_color(filters, factory_filters, source_category)
+        basis = _narrow(records, filters=basis_filters, group=group, q=q, source_category=source_category,
+                        factory_filters=basis_factory, index=index)
+        counts = color_tally(basis, index, source_category)
         records = _narrow(records, filters=filters, group=group, q=q, source_category=source_category,
                           factory_filters=factory_filters, index=index)
         if sort == "sales":
@@ -225,7 +238,15 @@ def catalog(
                 -(index.sales_totals(record.style_code)[0] if record.source_category == "本厂产品" else 0),
                 record.style_code, record.id,
             ))
-        return {"count": len(records), "items": [_serialize(record, index=index) for record in records]}
+        elif sort == "amount":
+            records.sort(key=lambda record: (
+                -(index.sales_totals(record.style_code)[1] if record.source_category == "本厂产品" else 0),
+                record.style_code, record.id,
+            ))
+        elif sort == "imported":
+            records.sort(key=lambda record: (imported_at(record), record.id), reverse=True)
+        return {"count": len(records), "items": [_serialize(record, index=index) for record in records],
+                "color_counts": counts}
     finally:
         reset_search_blobs(token)
 

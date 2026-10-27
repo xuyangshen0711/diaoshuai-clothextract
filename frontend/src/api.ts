@@ -53,6 +53,8 @@ export type CatalogItem = {
   library_category: string
   sales_quantity: number
   sales_amount: number
+  color_families?: string[]
+  variant_count?: number
   has_pending_image: boolean
   pending_image_url: string | null
   variants?: StyleVariant[]
@@ -150,7 +152,7 @@ export function getCatalog(params: Record<string, string | boolean>) {
   })
   if (!('exclude_samples' in params)) qs.set('exclude_samples', 'true')
   const suffix = qs.toString() ? `?${qs}` : ''
-  return request<{ count: number; items: CatalogItem[] }>(`/api/catalog${suffix}`)
+  return request<{ count: number; items: CatalogItem[]; color_counts?: Record<string, number> }>(`/api/catalog${suffix}`)
 }
 
 export type SearchInfo = { engine: string; local_only: boolean; include_pending: boolean; concepts: string[] }

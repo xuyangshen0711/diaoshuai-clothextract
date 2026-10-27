@@ -171,6 +171,51 @@ def matches_factory(record: ImageRecord, index: FactoryIndex, *, color_family=No
     return True
 
 
+def style_color_families(record: ImageRecord, index: FactoryIndex) -> list[str]:
+    """色系 on a 本厂产品 card. Any customer variant that has the family counts."""
+    if record.source_category != "本厂产品" or not record.style_code:
+        return []
+    found: set[str] = set()
+    for row in index.variants.get(record.style_code) or []:
+        found.update(color["family"] for color in row.colors if color.get("family"))
+    for row in index.sales.get(record.style_code) or []:
+        found.add(classify_color(row.color))
+    return [name for name in COLOR_FAMILIES if name in found]
+
+
+def card_color_families(record: ImageRecord, index: FactoryIndex) -> list[str]:
+    families = style_color_families(record, index)
+    if families or record.source_category == "本厂产品":
+        return families
+    name = record.display_tags.颜色主色调
+    return [name] if name else []
+
+
+def variant_count(record: ImageRecord, index: FactoryIndex) -> int:
+    if record.source_category != "本厂产品" or not record.style_code:
+        return 0
+    codes = {row.variant_code for row in index.variants.get(record.style_code) or []}
+    codes.update(row.variant_code for row in index.sales.get(record.style_code) or [])
+    return len(codes)
+
+
+def color_tally(records: list[ImageRecord], index: FactoryIndex, source_category: str | None) -> dict[str, int]:
+    """How many styles match each swatch before the color filter itself is applied."""
+    counts: dict[str, int] = {}
+    for record in records:
+        if source_category == "本厂产品":
+            names = style_color_families(record, index)
+        else:
+            names = [record.display_tags.颜色主色调] if record.display_tags.颜色主色调 else []
+        for name in names:
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def imported_at(record: ImageRecord) -> str:
+    return record.source.uploaded_at or record.source.extracted_at or record.created_at or ""
+
+
 def card_fields(record: ImageRecord, index: FactoryIndex) -> dict:
     categories = display_categories(record, index)
     quantity, amount = (0, 0.0)
@@ -183,6 +228,8 @@ def card_fields(record: ImageRecord, index: FactoryIndex) -> dict:
         "sales_quantity": quantity,
         "sales_amount": as_number(amount),
         "has_pending_image": bool(record.pending_image_path),
+        "color_families": card_color_families(record, index),
+        "variant_count": variant_count(record, index),
     }
 
 

@@ -378,6 +378,33 @@ def test_wrong_table_and_image_slot_only_change_the_wording(store, monkeypatch):
     assert client.get("/api/catalog").json()["count"] == 0
 
 
+def test_library_search_finds_customer_and_color_names(store, monkeypatch):
+    client = _client(monkeypatch)
+    _upload(client, "516083.jpg", _jpeg("navy"), "本厂产品")
+    _upload(client, "later.jpg", _jpeg("red"), "网图趋势")
+    archive = client.post("/api/import/style-archive", files={"file": ("a.xlsx", (FIXTURES / "style_archive_516083.xlsx").read_bytes())})
+    assert archive.status_code == 200, archive.text
+    sales = client.post("/api/import/sales", files={"file": ("s.xlsx", (FIXTURES / "sales_516083.xlsx").read_bytes())})
+    assert sales.status_code == 200, sales.text
+
+    by_customer = client.get("/api/catalog", params={"q": "若宇", "source_category": "本厂产品"}).json()
+    assert by_customer["count"] == 1
+    assert by_customer["items"][0]["style_code"] == "516083"
+    assert by_customer["items"][0]["variant_count"] == 5
+    assert "灰" in by_customer["items"][0]["color_families"]
+    by_color = client.get("/api/catalog", params={"q": "驼灰", "source_category": "本厂产品"}).json()
+    assert [item["style_code"] for item in by_color["items"]] == ["516083"]
+
+    listed = client.get("/api/catalog", params={"sort": "imported"}).json()
+    assert listed["items"][0]["source_category"] == "网图趋势"
+    plain = client.get("/api/catalog").json()
+    assert [item["source_category"] for item in plain["items"]] == ["本厂产品", "网图趋势"]
+    amounts = client.get("/api/catalog", params={"sort": "amount", "source_category": "本厂产品"}).json()
+    assert amounts["items"][0]["sales_amount"] == 509145
+    assert amounts["color_counts"]["灰"] == 1
+    assert amounts["color_counts"]["紫"] == 1
+
+
 def test_review_reject_still_removes_factory_image_from_library(store, monkeypatch):
     client = _client(monkeypatch)
     _upload(client, "516083.jpg", _jpeg("navy"), "本厂产品")
