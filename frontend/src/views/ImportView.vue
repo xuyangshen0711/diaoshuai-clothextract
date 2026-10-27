@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
-import { getHealth, importFiles, importSalesSheet, importStyleArchive, rebuildIndex, retag, retryJob, type ImportJob, type TableReport } from '../api'
+import { onMounted, ref, watch } from 'vue'
+import { getCatalog, getHealth, getLibraryMeta, importFiles, importSalesSheet, importStyleArchive, rebuildIndex, retag, retryJob, type ImportJob, type TableReport } from '../api'
+import { fileSizeLabel } from '../utils/source'
 import { jobs, jobsError, isActive, refreshJobs, rememberJob } from '../composables/importJobs'
 
 const SOURCE_CATEGORIES = ['本厂产品', '网图趋势', '品牌资料包', '市调拍照']
@@ -10,6 +11,9 @@ const queued = ref<Queued[]>([])
 const batchCategory = ref('')
 const backend = ref('openai')
 const openaiReady = ref(false)
+const keyPlaceholder = ref(false)
+const imageCodes = ref<Set<string>>(new Set())
+const knownCodes = ref<Set<string>>(new Set())
 const error = ref('')
 const status = ref('')
 const uploading = ref(false)
@@ -34,6 +38,7 @@ function relativePathOf(file: File) {
 }
 function addFiles(files: File[]) {
   error.value = ''
+  status.value = ''
   const skipped = files.filter(file => !ACCEPT.test(file.name) || file.name.startsWith('.') || relativePathOf(file).includes('__MACOSX'))
   const allowed = files.filter(file => !skipped.includes(file))
   if (skipped.length) error.value = `已跳过 ${skipped.length} 个不支持的文件，请使用 PDF、PPT、Excel 或图片。`
@@ -46,7 +51,63 @@ function addFiles(files: File[]) {
   }
 }
 function onFiles(event: Event) { addFiles(Array.from((event.target as HTMLInputElement).files || [])) }
-function onFolder(event: Event) { addFiles(Array.from((event.target as HTMLInputElement).files || [])) }
+function onFolder(event: Event) {
+  const input = event.target as HTMLInputElement
+  const files = Array.from(input.files || [])
+  input.value = ''
+  status.value = ''
+  if (!files.length) {
+    error.value = '这个文件夹是空的，没有可导入的文件。'
+    return
+  }
+  const before = queued.value.length
+  addFiles(files)
+  if (queued.value.length === before) {
+    error.value = '这个文件夹里没有可导入的图片、PDF、PPT 或 Excel。'
+  }
+}
+function suffixHint(name: string): string {
+  const fileName = name.split(/[/\\]/).pop() || name
+  const stem = fileName.replace(/\.[^.]+$/, '').replace(/[\s\u3000]/g, '')
+  const base = stem.replace(/[\u4e00-\u9fff]+$/, '')
+  if (!base || base === stem || !/^[A-Za-z]*\d[A-Za-z0-9]*$/.test(base) || base.length < 4) return ''
+  const code = base.toUpperCase()
+  if (!knownCodes.value.has(code)) return ''
+  return `文件名疑似带客户后缀，应命名为 ${code}.jpg`
+}
+function jobSuffixHints(name: string): string[] {
+  const hints = new Set<string>()
+  for (const part of name.split('、')) {
+    const hint = suffixHint(part.trim())
+    if (hint) hints.add(hint)
+  }
+  return [...hints]
+}
+function salesWithoutLibrary(report: TableReport | null): string[] {
+  if (!report?.style_codes.length) return []
+  if (report.archive_without_image.length || report.image_without_archive.length) return []
+  return report.style_codes.filter(code => !imageCodes.value.has(code))
+}
+function salesGapLabel(report: TableReport, codes: string[]): string {
+  const quantity = (report.stored_quantity ?? 0).toLocaleString('zh-CN')
+  if (codes.length === 1) return `${codes[0]}（${quantity} 件）`
+  return `${codes.join('、')}（合计 ${quantity} 件）`
+}
+async function refreshKnownCodes() {
+  try {
+    const [meta, catalog] = await Promise.all([
+      getLibraryMeta(),
+      getCatalog({ source_category: '本厂产品' }),
+    ])
+    const images = new Set(catalog.items.map(item => item.style_code).filter(Boolean))
+    const codes = new Set<string>([...(meta.style_codes || []), ...images])
+    for (const report of [archiveReport.value, salesReport.value]) {
+      report?.style_codes.forEach(code => codes.add(code))
+    }
+    imageCodes.value = images
+    knownCodes.value = codes
+  } catch { /* 提醒仍可使用本次导入结果里的款号 */ }
+}
 function readEntry(entry: FileSystemEntry): Promise<File[]> {
   return new Promise(resolve => {
     if (entry.isFile) {
@@ -78,13 +139,25 @@ async function onDrop(event: DragEvent) {
   if (uploading.value) return
   const items = Array.from(event.dataTransfer?.items || [])
   const entries = items.map(item => item.webkitGetAsEntry?.()).filter((entry): entry is FileSystemEntry => Boolean(entry))
+  status.value = ''
   if (entries.length) {
     const files: File[] = []
     for (const entry of entries) files.push(...await readEntry(entry))
+    if (!files.length) {
+      error.value = '这个文件夹是空的，没有可导入的文件。'
+      return
+    }
+    const before = queued.value.length
     addFiles(files)
+    if (queued.value.length === before) error.value = '这个文件夹里没有可导入的图片、PDF、PPT 或 Excel。'
     return
   }
-  addFiles(Array.from(event.dataTransfer?.files || []))
+  const dropped = Array.from(event.dataTransfer?.files || [])
+  if (!dropped.length) {
+    error.value = '没有可导入的文件。'
+    return
+  }
+  addFiles(dropped)
 }
 function applyBatchCategory() {
   if (!batchCategory.value) { error.value = '请先选择要套用的资料大类'; return }
@@ -118,6 +191,7 @@ async function uploadTable(kind: 'archive' | 'sales', event: Event) {
     const report = kind === 'archive' ? await importStyleArchive(file) : await importSalesSheet(file)
     if (kind === 'archive') archiveReport.value = report
     else salesReport.value = report
+    await refreshKnownCodes()
   } catch (reason) { tableError.value = reason instanceof Error ? reason.message : String(reason) }
   finally { tableBusy.value = '' }
 }
@@ -148,20 +222,23 @@ onMounted(async () => {
   try {
     const health = await getHealth()
     openaiReady.value = health.openai_ready
+    keyPlaceholder.value = Boolean(health.openai_placeholder)
     if (!health.openai_ready) backend.value = 'mock'
     await refreshJobs()
+    await refreshKnownCodes()
   } catch { error.value = '无法连接服务，请稍后刷新重试' }
 })
+watch(() => jobs.value.map(job => `${job.id}:${job.status}`).join(','), () => { refreshKnownCodes() })
 </script>
 
 <template>
   <main class="import-page">
     <div class="page-head"><div><h2>导入与处理任务</h2><p class="meta">分类完成后先在主页展示并标记未审核，再由人工确认。每个文件单独选择资料大类，抽出来的图片会继承该文件的大类。</p></div>
-      <span class="meta">{{ openaiReady ? 'AI 分类已配置' : '当前可使用模拟分类' }}</span></div>
+      <span class="meta">{{ keyPlaceholder ? '密钥是示例值，请填真实密钥，或者用模拟分类' : openaiReady ? 'AI 分类已配置' : '当前可使用模拟分类' }}</span></div>
     <section class="import-upload" aria-label="上传资料">
       <div class="dropzone" :class="{ dragging }" @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false" @drop.prevent="onDrop">
         <strong>拖入 PDF / PPT / Excel，或图片、整个文件夹</strong>
-        <p class="meta">支持子文件夹。本厂产品的图片请直接用款号命名，例如 516083.jpg，一个款号只保留一张图。</p>
+        <p class="meta">支持子文件夹。本厂产品的图片请直接用款号命名，例如 516083.jpg，一个款号只保留一张图。文件名里的空格会去掉。</p>
         <div class="toolbar import-pickers">
           <label for="import-files" class="btn">选择文件</label>
           <label for="import-folder" class="btn">选择文件夹</label>
@@ -179,7 +256,7 @@ onMounted(async () => {
         <button class="btn" type="button" :disabled="uploading || !queued.length" @click="applyBatchCategory">应用到全部文件</button>
       </div>
       <ul v-if="queued.length" class="import-file-list"><li v-for="(item, index) in queued" :key="item.key">
-        <span>{{ item.relativePath }} <small>{{ (item.file.size / 1024 / 1024).toFixed(1) }} MB</small></span>
+        <span>{{ item.relativePath }} <small>{{ fileSizeLabel(item.file.size) }}</small><small v-if="suffixHint(item.relativePath)" class="suffix-hint">{{ suffixHint(item.relativePath) }}</small></span>
         <select :aria-label="`${item.relativePath} 的资料大类`" v-model="item.category" :disabled="uploading">
           <option value="">选择大类</option>
           <option v-for="category in SOURCE_CATEGORIES" :key="category" :value="category">{{ category }}</option>
@@ -214,6 +291,7 @@ onMounted(async () => {
         <p>本次款号合计 {{ salesReport.stored_quantity?.toLocaleString('zh-CN') }} 件 / {{ salesReport.stored_amount?.toLocaleString('zh-CN') }} 元。</p>
         <p>有档案、还没有图片的款号：{{ preview(salesReport.archive_without_image) }}</p>
         <p>已有本厂图片、还没有档案的款号：{{ preview(salesReport.image_without_archive) }}</p>
+        <p v-if="salesWithoutLibrary(salesReport).length">有销量、还没有图片或档案的款号：{{ salesGapLabel(salesReport, salesWithoutLibrary(salesReport)) }}。补上图片后就会在图库显示。</p>
       </div>
     </section>
     <p v-if="status" class="review-notice" role="status">{{ status }}</p>
@@ -228,8 +306,9 @@ onMounted(async () => {
         <template v-if="job.status === 'queued'"><p class="meta">前序任务完成后自动开始，无需重复提交。</p></template>
         <template v-else-if="job.status === 'extracting'"><progress :value="job.files_processed" :max="job.files_total || 1" aria-label="文件抽图进度" /><p class="meta">抽图 {{ job.files_processed }} / {{ job.files_total }} 份资料 · {{ job.current_file }}</p></template>
         <template v-else-if="job.total"><progress :value="job.processed" :max="job.total || 1" :aria-label="`${job.name}分类进度`" /><p class="meta">已处理 {{ job.processed }} / {{ job.total }} 张，成功 {{ job.succeeded }} 张，<template v-if="job.filtered">过滤非款式图 {{ job.filtered }} 张，</template><template v-if="job.skipped">跳过相同图片 {{ job.skipped }} 张，</template>失败 {{ job.failed }} 张<span v-if="job.status === 'tagging'"> · {{ job.current_file }}</span></p></template>
-        <p v-if="!job.total && !isActive(job)" class="meta">未生成可分类的图片。</p>
+        <p v-if="!job.total && !isActive(job) && !job.message.includes('请用下方对应入口')" class="meta">未生成可分类的图片。</p>
         <p v-if="!isActive(job)" class="task-message" role="status">{{ job.message }}</p>
+        <p v-for="hint in jobSuffixHints(job.name)" :key="hint" class="meta">{{ hint }}</p>
         <div class="toolbar"><RouterLink v-if="job.succeeded" class="btn" :to="{ path: '/review', query: job.kind === 'import' ? { batch: job.id } : {} }">审核本批图片</RouterLink>
           <button v-if="['partial', 'failed', 'interrupted'].includes(job.status)" class="btn" :disabled="retrying === job.id" @click="retry(job)">{{ retrying === job.id ? '提交中…' : '继续处理未完成项' }}</button></div>
         <details v-if="job.errors.length"><summary>查看 {{ job.errors.length }} 项异常</summary><ul class="task-errors"><li v-for="(item, index) in job.errors" :key="index"><strong>{{ item.name }}</strong><span>{{ item.message }}</span></li></ul></details>

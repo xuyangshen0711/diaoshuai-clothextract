@@ -9,6 +9,17 @@ export function importTime(source: CatalogItem['source']): string {
   return source.uploaded_at || source.extracted_at
 }
 
+export function visibleDescription(text: string | null | undefined, status: string): string {
+  const value = text || ''
+  if (status !== 'approved') return value
+  return value.replaceAll('（待人工确认）', '').replaceAll('(待人工确认)', '').trim()
+}
+
+export function fileSizeLabel(bytes: number): string {
+  if (bytes < 1024 * 102.4) return `${Math.round(bytes / 1024)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
 export function formatTime(value: string): string {
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? '时间未记录' : new Intl.DateTimeFormat('zh-CN', {

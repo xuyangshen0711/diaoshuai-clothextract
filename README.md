@@ -16,22 +16,40 @@
 
 ## 快速开始
 
-需要 Python 3.10 及以上。
+需要 Python 3.10 及以上。Linux 上如果 `python3 -m venv` 提示没有 ensurepip，先安装 `python3-venv`。
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # 填入 OPENAI_API_KEY
+cp .env.example .env   # 填入真实的 OPENAI_API_KEY；没有密钥就保持示例值，页面会改用模拟分类
+```
 
-python scripts/run_pipeline.py --input data/raw --backend openai
+`data/raw` 里还没有资料时，不必跑 `run_pipeline`，直接启动网页，在「导入」里上传即可：
 
+```bash
 uvicorn api.main:app --host 0.0.0.0 --port 8520
 cd frontend && npm install && npm run dev
 ```
 
+已有一批 PDF / PPT / Excel 时，可以先批量处理再打开网页：
+
+```bash
+python scripts/run_pipeline.py --input data/raw --backend openai
+```
+
+没有密钥时把 `--backend openai` 改成 `--backend mock`，或在导入页选择「模拟分类（测试）」。
+
+启用 CLIP 语义检索前，在本机准备权重并建索引：
+
+```bash
+python scripts/prepare_local_search.py --index
+```
+
 - 前端：<http://127.0.0.1:8518>
 - API：<http://127.0.0.1:8520/docs>
+
+第一板块建议按这个顺序操作：先上传图片文件夹，再导入款式档案，最后导入销量。三个步骤的顺序可以颠倒，款号会自动对上。图片文件名用基础款号（`516083.jpg`），空格会去掉；不要把客户名写在文件名后面。
 
 ## 自动处理
 
@@ -53,7 +71,7 @@ cd frontend && npm install && npm run dev
 
 导入时为每个文件选择资料大类：本厂产品、网图趋势、品牌资料包、市调拍照。也可以直接上传图片或整个文件夹。本厂产品图片的文件名（不含扩展名）就是大货款号基码，例如 `516083.jpg`。同一款号再次上传会进入审核，确认后才替换原图，旧图留在详情页。
 
-款式档案和销量表在导入页单独上传，按表头列名读取，重复导入会覆盖同一款号而不会把销量加两遍。有档案时，图库里的品类用一级品类，AI 标签仍保留作参考。说明和取舍见 [本厂产品](docs/own-factory.md)。
+款式档案和销量表在导入页单独上传，按表头列名读取，重复导入会覆盖同一款号而不会把销量加两遍。有档案时，图库里的品类用一级品类，AI 标签仍保留作参考。先传图片、再传档案、最后传销量即可；顺序换一下也会按款号接上。说明和取舍见 [本厂产品](docs/own-factory.md)。
 
 ## 标签体系（需求草稿）
 

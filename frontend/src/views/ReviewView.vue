@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { jobs, isActive } from '../composables/importJobs'
 import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router'
+import { visibleDescription } from '../utils/source'
 import { NOTE_FIELDS, getFilters, getReviews, getReviewHistory, reviewRecord, type CatalogItem, type DesignNotes,
   type FashionTags, type FilterMeta, type ReviewEvent, type ReviewStatus } from '../api'
 
@@ -272,8 +273,9 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
             </div>
             <div class="review-description">
               <label for="review-description">一句话描述</label>
-              <p class="meta">AI：{{ current.ai_tags?.一句话描述 || '未提供' }}</p>
-              <textarea id="review-description" v-model="form.一句话描述" rows="2" />
+              <p class="meta">AI：{{ visibleDescription(current.ai_tags?.一句话描述, current.review_status) || '未提供' }}</p>
+              <textarea v-if="editable" id="review-description" v-model="form.一句话描述" rows="2" />
+              <p v-else id="review-description">{{ visibleDescription(form.一句话描述, current.review_status) || '未提供' }}</p>
             </div>
             <div class="review-notes">
               <strong>设计说明（资料原文，可修改）</strong>

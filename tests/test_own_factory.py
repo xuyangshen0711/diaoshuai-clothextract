@@ -342,6 +342,42 @@ def test_legacy_rows_gain_unclassified_without_revision_bump(store):
     assert again.review_status == "pending"
 
 
+def test_placeholder_key_is_flagged_without_removing_a_real_key(store, monkeypatch):
+    from src.tag.tagger import has_openai_key, openai_key_is_placeholder
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-...")
+    assert openai_key_is_placeholder()
+    assert has_openai_key()
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-real-key-value-0123456789")
+    assert not openai_key_is_placeholder()
+    client = TestClient(api.app)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-...")
+    health = client.get("/api/health").json()
+    assert health["openai_placeholder"] is True
+    assert health["openai_ready"] is False
+
+
+def test_wrong_table_and_image_slot_only_change_the_wording(store, monkeypatch):
+    client = _client(monkeypatch)
+    sales = (FIXTURES / "sales_516083.xlsx").read_bytes()
+    archive = (FIXTURES / "style_archive_516083.xlsx").read_bytes()
+    swapped = client.post("/api/import/style-archive", files={"file": ("sales.xlsx", sales)})
+    assert swapped.status_code == 422
+    assert "可能传错了表" in swapped.json()["detail"] and "销量表" in swapped.json()["detail"]
+    swapped = client.post("/api/import/sales", files={"file": ("archive.xlsx", archive)})
+    assert swapped.status_code == 422
+    assert "可能传错了表" in swapped.json()["detail"] and "款式档案" in swapped.json()["detail"]
+    job = client.post("/api/import/jobs?backend=mock", files=[
+        ("files", ("sales_516083.xlsx", sales, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")),
+        ("source_categories", (None, "本厂产品")),
+    ])
+    assert job.status_code == 202, job.text
+    finished = client.get(f"/api/import/jobs/{job.json()['id']}").json()
+    assert "这像是销量表，请用下方对应入口" in finished["message"]
+    assert finished["succeeded"] == 0
+    assert client.get("/api/catalog").json()["count"] == 0
+
+
 def test_review_reject_still_removes_factory_image_from_library(store, monkeypatch):
     client = _client(monkeypatch)
     _upload(client, "516083.jpg", _jpeg("navy"), "本厂产品")

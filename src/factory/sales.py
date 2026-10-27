@@ -10,7 +10,10 @@ from pathlib import Path
 
 from src import catalog
 from src.factory.codes import parse_style_code
-from src.factory.excel_io import as_number, cell_at, column_index, find_header, load_sheet_rows, parse_number, plain_text
+from src.factory.excel_io import (
+    as_number, cell_at, column_index, find_header, load_sheet_rows, parse_number, plain_text,
+    sheet_headers, table_kind_from_headers,
+)
 from src.factory.tables import gap_report, now
 
 SALES_COLUMNS = ("款号", "颜色", "尺码", "订单数量", "订单金额")
@@ -18,6 +21,8 @@ SALES_COLUMNS = ("款号", "颜色", "尺码", "订单数量", "订单金额")
 
 def parse_sales_rows(path: Path) -> tuple[list[dict], int]:
     rows = load_sheet_rows(path)
+    if table_kind_from_headers(sheet_headers(rows)) == "archive":
+        raise ValueError("可能传错了表，这像是款式档案，请用款式档案入口。")
     header_index, headers = find_header(rows, "款号")
     missing = [name for name in SALES_COLUMNS if name not in headers]
     if missing:

@@ -4,7 +4,7 @@ import { useRoute } from 'vue-router'
 import { assignSourceCategory, getLibraryMeta, getRecord, type CatalogItem, type LibraryMeta } from '../api'
 import DesignNotesList from '../components/DesignNotesList.vue'
 import RecordHistory from '../components/RecordHistory.vue'
-import { formatTime, importTime, sourceType } from '../utils/source'
+import { formatTime, importTime, sourceType, visibleDescription } from '../utils/source'
 const route = useRoute()
 const item = ref<CatalogItem | null>(null)
 const loading = ref(false)
@@ -71,7 +71,7 @@ async function changeCategory(event: Event) {
       </section>
       <section class="record-information" aria-label="款式信息">
         <div class="record-title"><h2>{{ item.library_category || tags.品类 }}<small v-if="item.style_code" class="record-style-no">款号 {{ item.style_code }}</small></h2><span class="task-state" :class="item.review_status">{{ labels[item.review_status] }}</span></div>
-        <p class="record-description">{{ tags.一句话描述 || '暂无款式描述' }}</p>
+        <p class="record-description">{{ visibleDescription(tags.一句话描述, item.review_status) || '暂无款式描述' }}</p>
         <p v-if="item.review_status === 'pending'" class="meta">当前分类已在主页展示，尚待人工审核确认。搜索时可选择是否包含未审核图片。</p>
         <p v-else-if="item.review_status === 'rejected'" class="meta">此图片已驳回，不在主页或搜索结果中展示。</p>
         <dl class="record-source">
@@ -137,7 +137,7 @@ async function changeCategory(event: Event) {
         </section>
 
         <div class="record-tag-table"><table><caption>分类标签对照</caption><thead><tr><th scope="col">标签</th><th scope="col">AI 建议{{ item.ai_tags_source === 'mock' ? '（模拟）' : '' }}</th><th scope="col">{{ item.review_status === 'approved' ? '最终分类' : '待审核分类' }}</th></tr></thead><tbody>
-          <tr v-for="(value, key) in tags" :key="key" :class="{ changed: item.ai_tags && display(item.ai_tags[key]) !== display(value) }"><th scope="row">{{ key }}</th><td>{{ display(item.ai_tags?.[key]) }}</td><td>{{ display(value) }}</td></tr>
+          <tr v-for="(value, key) in tags" :key="key" :class="{ changed: item.ai_tags && display(item.ai_tags[key]) !== display(value) }"><th scope="row">{{ key }}</th><td>{{ key === '一句话描述' ? (visibleDescription(display(item.ai_tags?.[key]), item.review_status) || '未提供') : display(item.ai_tags?.[key]) }}</td><td>{{ key === '一句话描述' ? (visibleDescription(display(value), item.review_status) || '未提供') : display(value) }}</td></tr>
         </tbody></table></div>
         <DesignNotesList :notes="item.notes" />
         <RecordHistory :id="item.id" />

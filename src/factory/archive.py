@@ -7,7 +7,9 @@ from pathlib import Path
 from src import catalog
 from src.factory.codes import parse_style_code
 from src.factory.colors import split_colors
-from src.factory.excel_io import cell_at, column_index, find_header, load_sheet_rows, plain_text
+from src.factory.excel_io import (
+    cell_at, column_index, find_header, load_sheet_rows, plain_text, sheet_headers, table_kind_from_headers,
+)
 from src.factory.sizes import split_sizes
 from src.factory.tables import gap_report, now
 
@@ -17,6 +19,8 @@ IMPORTANT = ("季节", "大货款号", "颜色", "尺码", "原料名称")
 
 def parse_archive_rows(path: Path) -> tuple[list[dict], int, list[str]]:
     rows = load_sheet_rows(path)
+    if table_kind_from_headers(sheet_headers(rows)) == "sales":
+        raise ValueError("可能传错了表，这像是销量表，请用下方的销量入口。")
     header_index, headers = find_header(rows, "大货款号")
     indexes = {name: column_index(headers, name) for name in KEEP_COLUMNS}
     warnings = [f"未找到「{name}」列，该字段将留空" for name in IMPORTANT if name != "大货款号" and indexes[name] is None]

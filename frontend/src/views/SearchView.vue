@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { getLibraryMeta, getRecord, getSimilarRecords, searchImage, searchText, type LibraryMeta, type SearchInfo } from '../api'
+import { getHealth, getLibraryMeta, getRecord, getSimilarRecords, searchImage, searchText, type LibraryMeta, type SearchInfo } from '../api'
 import { searchMode as mode, searchQuery as query, searchFile as file, searchItems as items,
   searchIncludePending as includePending, searchPerformed as searched, referenceId, referenceUrl,
   referenceTitle } from '../composables/searchState'
@@ -10,10 +10,20 @@ const router = useRouter()
 const loading = ref(false)
 const error = ref('')
 const info = ref<SearchInfo | null>(null)
+const embeddingBackend = ref('')
 const libraryMeta = ref<LibraryMeta>({ source_categories: ['本厂产品', '网图趋势', '品牌资料包', '市调拍照'], unclassified: '未分类', factory: {} })
 const examples = ['秋日法式，奶油色，松弛感', '极简通勤的羊毛外套', '周末休闲，不要红色']
 const sourceTabs = () => ['全部', ...libraryMeta.value.source_categories, libraryMeta.value.unclassified]
-onMounted(async () => { try { libraryMeta.value = await getLibraryMeta() } catch { /* 筛选仍可用全部 */ } })
+onMounted(async () => {
+  try { libraryMeta.value = await getLibraryMeta() } catch { /* 筛选仍可用全部 */ }
+  try { embeddingBackend.value = (await getHealth()).embedding_backend || '' } catch { /* 引擎名称留到检索返回 */ }
+})
+function engineLabel() {
+  const engine = info.value?.engine || (mode.value === 'image' ? embeddingBackend.value : '')
+  if (engine === 'clip-multilingual') return '本地语义检索'
+  if (engine) return '本地词汇匹配'
+  return '图片、标签与已有说明综合检索'
+}
 let sequence = 0
 onUnmounted(() => { sequence += 1 })
 
@@ -109,7 +119,7 @@ watch(() => route.fullPath, async () => {
       <button v-for="item in sourceTabs()" :key="item" type="button" :aria-pressed="sourceCategory() === item" @click="setSource(item)">{{ item }}</button>
     </div>
     <div class="inspiration-options"><label><input v-model="includePending" type="checkbox" @change="submitSearch" />包含未审核图片</label>
-      <p class="meta">{{ info?.engine === 'clip-multilingual' ? '本地语义检索' : info ? '本地词汇匹配' : '图片、标签与已有说明综合检索' }} · 不调用付费接口</p></div>
+      <p class="meta">{{ engineLabel() }} · 不调用付费接口</p></div>
     <div v-if="info?.concepts.length" class="inspiration-concepts" role="group" aria-label="识别到的灵感条件"><span>已识别</span><span v-for="concept in info.concepts" :key="concept" class="inspiration-concept">{{ concept }}</span></div>
     <div v-if="referenceUrl && mode === 'image'" class="search-reference"><img :src="referenceUrl" alt="本次检索参考图" width="90" height="120" /><div><strong>参考款式</strong><p class="meta">{{ referenceTitle }}</p><RouterLink v-if="referenceId" class="review-text-link" :to="{ name: 'record', params: { id: referenceId } }">查看参考款详情</RouterLink></div></div>
     <p v-if="error" class="error" role="alert">{{ error }}</p>

@@ -13,6 +13,7 @@ from src import catalog
 from src.catalog import CatalogConflict
 from src.extract.office import extract_from_file
 from src.factory.codes import image_style_code
+from src.factory.excel_io import workbook_table_kind
 from src.factory.tables import find_own_factory
 from src.schema import UNCLASSIFIED_SOURCE, ImageRecord
 from src.tag.tagger import apply_suggestion, get_tagger, needs_tagging
@@ -124,6 +125,21 @@ def create_retag(backend: str, overwrite: bool, source_type: str | None = None, 
         _table(conn)
         _put(conn, job)
     return job
+
+
+def _table_upload_hint(job) -> str:
+    """Wording only: a spreadsheet with no extracted pictures was sent to the image importer."""
+    labels = []
+    for source in job.get("files", []):
+        kind = workbook_table_kind(Path(source.get("path") or ""))
+        if kind == "archive":
+            labels.append("款式档案")
+        elif kind == "sales":
+            labels.append("销量表")
+    if not labels:
+        return ""
+    unique = list(dict.fromkeys(labels))
+    return "这像是" + "、".join(unique) + "，请用下方对应入口"
 
 
 def friendly_error(exc):
@@ -335,6 +351,9 @@ def run_job(job_id):
         replacements = sum(bool(item.get("replacement")) for item in job["items"])
         if replacements and not blocked:
             message += f"（{replacements} 张为已有款号的替换图，待审核确认后才会替换原图）"
+        hint = _table_upload_hint(job)
+        if hint and not blocked:
+            message = hint if not successes else f"{message}。{hint}"
         _finish(job, state, message)
     except Exception as exc:
         job = get_job(job_id)

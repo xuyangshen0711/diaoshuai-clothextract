@@ -59,7 +59,7 @@ from src.schema import (  # noqa: E402
 )
 from src.search.query import filter_records, search_by_image, search_by_text  # noqa: E402
 from src.search.inspiration import parse_inspiration  # noqa: E402
-from src.tag.tagger import has_openai_key  # noqa: E402
+from src.tag.tagger import has_openai_key, openai_key_is_placeholder  # noqa: E402
 from src.images import image_metadata, image_version, thumbnail_path  # noqa: E402
 
 ensure_data_dirs()
@@ -170,10 +170,13 @@ def health() -> dict[str, Any]:
         backend_name = get_embedding_backend().name
     except Exception:  # noqa: BLE001
         backend_name = "unavailable"
+    placeholder = openai_key_is_placeholder()
+    ready = has_openai_key() and not placeholder
     return {
         "ok": True,
-        "openai_ready": has_openai_key(),
-        "tagger": "gpt-4o-mini" if has_openai_key() else "mock",
+        "openai_ready": ready,
+        "openai_placeholder": placeholder,
+        "tagger": "gpt-4o-mini" if ready else "mock",
         "embedding_backend": backend_name,
         "catalog_count": len(load_catalog()),
         "pending_count": sum(r.review_status == "pending" for r in load_catalog()),
@@ -192,6 +195,7 @@ def library_meta() -> dict[str, Any]:
         "source_categories": list(SOURCE_CATEGORIES),
         "unclassified": UNCLASSIFIED_SOURCE,
         "factory": index.facets,
+        "style_codes": sorted(set(index.variants) | set(index.sales)),
     }
 
 

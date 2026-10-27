@@ -55,6 +55,37 @@ def column_index(headers: list[str], name: str) -> int | None:
     return headers.index(name) if name in headers else None
 
 
+def sheet_headers(rows: list[tuple], limit: int = 8) -> set[str]:
+    names: set[str] = set()
+    for row in rows[:limit]:
+        for cell in row:
+            text = header_text(cell)
+            if text:
+                names.add(text)
+    return names
+
+
+def table_kind_from_headers(names: set[str]) -> str:
+    """'archive', 'sales', or '' — used only to choose an error or hint sentence."""
+    sales = "款号" in names and "订单数量" in names
+    archive = "大货款号" in names
+    if sales and not archive:
+        return "sales"
+    if archive and not sales:
+        return "archive"
+    if sales and archive:
+        return "sales" if "订单金额" in names and "原料名称" not in names else "archive"
+    return ""
+
+
+def workbook_table_kind(path: Path) -> str:
+    try:
+        rows = load_sheet_rows(path)
+    except (OSError, ValueError):
+        return ""
+    return table_kind_from_headers(sheet_headers(rows))
+
+
 def cell_at(row: tuple, index: int | None):
     if index is None or index >= len(row):
         return None

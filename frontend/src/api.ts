@@ -86,6 +86,7 @@ export type LibraryMeta = {
   source_categories: string[]
   unclassified: string
   factory: Record<string, string[]>
+  style_codes?: string[]
 }
 
 export type TableReport = {
@@ -126,6 +127,7 @@ export function getHealth() {
   return request<{
     ok: boolean
     openai_ready: boolean
+    openai_placeholder?: boolean
     catalog_count: number
     tagger?: string
     embedding_backend?: string
