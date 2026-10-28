@@ -161,7 +161,7 @@ async function changeCategory(event: Event) {
             </div>
           </section>
         </div>
-        <p v-if="ownFactory && item.library_category && item.library_category !== tags.品类" class="meta">图库品类使用档案一级品类「{{ item.library_category }}」。下方 AI 标签仅作参考。</p>
+        <p v-if="ownFactory && item.library_category" class="meta">品类按固定品类表显示为「{{ item.library_category }}」<template v-if="item.sleeve_length">，袖长 {{ item.sleeve_length }}</template><template v-if="item.fabric">，面料 {{ item.fabric }}</template>。<template v-if="item.archive_category">档案一级品类「{{ item.archive_category }}」仍保留。</template>下方 AI 标签仅作参考。</p>
 
         <details class="detail-fold">
           <summary>来源与操作</summary>

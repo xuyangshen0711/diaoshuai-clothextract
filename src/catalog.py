@@ -72,7 +72,9 @@ def _database():
             CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY);
         """)
         from src.factory.tables import ensure_factory, migrate_source_categories
+        from src.taxonomy import ensure_taxonomy, migrate_record_labels
         ensure_factory(conn)
+        ensure_taxonomy(conn)
         conn.execute("BEGIN IMMEDIATE")
         if not conn.execute("SELECT 1 FROM migrations WHERE name='legacy_json'").fetchone():
             if CATALOG_PATH.exists():
@@ -93,6 +95,7 @@ def _database():
                     _event(conn, record, "legacy_imported", note="历史 JSON 导入，等待人工审核")
             conn.execute("INSERT INTO migrations VALUES ('legacy_json')")
         migrate_source_categories(conn)
+        migrate_record_labels(conn)
         yield conn
         conn.commit()
     except Exception:
@@ -216,13 +219,29 @@ def review_record(record_id: str, *, action: str, reviewer: str, expected_revisi
             if record.review_status != "pending":
                 raise CatalogConflict("记录已完成审核，请勿重复提交")
             if action == "approve":
+                from src.taxonomy import UNSORTED, learn_phrase, resolve
+
                 final = tags or record.proposed_tags or record.tags
                 final.validate_vocabulary()
-                record.tags = final.model_copy(deep=True)
+                previous = record.proposed_tags or record.tags
+                previous_label = resolve(previous.品类).label
+                raw_phrase = record.category_raw or previous.品类
+                stored = final.normalized()
+                phrase = getattr(final, "_category_phrase", "") or getattr(stored, "_category_phrase", "")
+                record.tags = stored.model_copy(deep=True)
+                if phrase and phrase != stored.品类:
+                    record.category_raw = phrase
+                if stored.袖长:
+                    record.sleeve_length = stored.袖长
+                if stored.面料:
+                    record.fabric = stored.面料
+                if previous_label == UNSORTED and stored.品类 != UNSORTED and raw_phrase and raw_phrase != stored.品类:
+                    level1, _, level2 = stored.品类.partition(">")
+                    learn_phrase(conn, raw_phrase, level1, level2, stored.袖长, stored.面料)
                 if notes is not None:
                     record.notes = notes.model_copy(deep=True)
                 record.proposed_tags = None
-                record.manually_edited = record.ai_tags is None or final != record.ai_tags
+                record.manually_edited = record.ai_tags is None or stored != record.ai_tags
                 record.tags_source = "manual" if record.manually_edited else (record.ai_tags_source or "openai")
                 record.review_status = "approved"
                 if record.pending_image_path:
@@ -237,6 +256,64 @@ def review_record(record_id: str, *, action: str, reviewer: str, expected_revisi
     record.revision = revision
     if dropped_image:
         discard_unreferenced_image(dropped_image, record)
+    return record
+
+
+def assign_garment_category(record_id: str, *, level1: str, level2: str = "", sleeve_length: str = "",
+                            fabric: str = "", expected_revision: int) -> ImageRecord:
+    """Move one record onto the fixed table. Does not approve or reject it."""
+    from src.taxonomy import (
+        FABRICS,
+        SLEEVE_LENGTHS,
+        UNSORTED,
+        TaxonomyError,
+        _require_node,
+        label_of,
+        learn_phrase,
+        read_taxonomy,
+        resolve,
+    )
+
+    level2 = level2 or ""
+    sleeve_length = (sleeve_length or "").strip()
+    fabric = (fabric or "").strip()
+    if sleeve_length and sleeve_length not in SLEEVE_LENGTHS:
+        raise ValueError("袖长只能是无袖、短袖、中袖或长袖")
+    if fabric and fabric not in FABRICS:
+        raise ValueError("面料只能是针织或梭织")
+    with _database() as conn:
+        row = conn.execute("SELECT payload FROM records WHERE id=?", (record_id,)).fetchone()
+        if not row:
+            raise KeyError(record_id)
+        record = ImageRecord.model_validate_json(row[0])
+        if record.revision != expected_revision:
+            raise CatalogConflict("分类或审核结果已更新，请刷新后再操作")
+        try:
+            _require_node(read_taxonomy(conn), level1, level2)
+        except TaxonomyError as exc:
+            raise ValueError(str(exc)) from exc
+        label = label_of(level1, level2)
+        shown = record.proposed_tags or record.tags
+        raw_phrase = record.category_raw or shown.品类
+        was_unsorted = resolve(shown.品类).label == UNSORTED or resolve(raw_phrase).label == UNSORTED
+        for name in ("tags", "proposed_tags"):
+            block = getattr(record, name)
+            if block is None:
+                continue
+            setattr(record, name, block.model_copy(update={
+                "品类": label,
+                "袖长": sleeve_length or block.袖长,
+                "面料": fabric or block.面料,
+            }))
+        if sleeve_length:
+            record.sleeve_length = sleeve_length
+        if fabric:
+            record.fabric = fabric
+        if was_unsorted and raw_phrase and raw_phrase != label:
+            learn_phrase(conn, raw_phrase, level1, level2, sleeve_length, fabric)
+        record.touch()
+        revision = _save(conn, record, "category_assigned", note=label)
+    record.revision = revision
     return record
 
 

@@ -1,0 +1,80 @@
+/* Quiet-luxury tokens and locally hosted fonts. No external CDN. */
+
+@font-face {
+  font-family: "Zhuque Fangsong";
+  src: url("/fonts/ZhuqueFangsong-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Noto Sans SC";
+  src: url("/fonts/NotoSansSC-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Noto Serif SC";
+  src: url("/fonts/NotoSerifSC-SemiBold.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Cormorant Garamond";
+  src: url("/fonts/CormorantGaramond-SemiBold.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Cormorant Garamond";
+  src: url("/fonts/CormorantGaramond-SemiBoldItalic.woff2") format("woff2");
+  font-weight: 600;
+  font-style: italic;
+  font-display: swap;
+}
+
+:root {
+  --page: #F6F2EA;
+  --header: #FBF8F3;
+  --ink: #2B2926;
+  --text: #24221F;
+  --gold: #A88B5E;
+  --line: #E3DACB;
+  --line-strong: #E6DED1;
+  --panel: #FFFDF9;
+  --muted: #5E574D;
+  --muted-2: #9B9184;
+  --nav: #6E665B;
+  --rule: #D9CEBD;
+  --divider: #EFE8DC;
+  --link: #A0672E;
+  --approved: #4B6B53;
+  --badge-bg: rgba(251, 248, 243, .94);
+  --segment: #ECE5D9;
+  --placeholder: #EFE9DF;
+  --search: #FBF8F3;
+  --radius-panel: 4px;
+  --radius-card: 3px;
+  --radius-control: 2px;
+  --font: "Zhuque Fangsong", "Noto Sans SC", sans-serif;
+  --serif: "Noto Serif SC", "Noto Sans SC", serif;
+  --latin: "Cormorant Garamond", "Times New Roman", serif;
+  --content-pad: 26px 48px;
+  font-family: var(--font);
+  color: var(--text);
+  background: var(--page);
+  font-size: 15px;
+  line-height: 1.6;
+  letter-spacing: .06em;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -webkit-text-stroke: .15px currentColor;
+}

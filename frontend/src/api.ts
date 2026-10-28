@@ -8,6 +8,8 @@ export type FashionTags = {
   袖型: string
   细节元素: string[]
   一句话描述: string
+  袖长?: string
+  面料?: string
 }
 
 // Free text printed next to the picture in the source document; order = display order.
@@ -51,6 +53,12 @@ export type CatalogItem = {
   source_category: string
   style_code: string
   library_category: string
+  category_level1?: string
+  category_level2?: string
+  sleeve_length?: string
+  fabric?: string
+  archive_category?: string
+  category_raw?: string
   sales_quantity: number
   sales_amount: number
   color_families?: string[]
@@ -130,14 +138,82 @@ export function getHealth() {
     ok: boolean
     openai_ready: boolean
     openai_placeholder?: boolean
+    deepseek_ready?: boolean
+    deepseek_placeholder?: boolean
+    default_backend?: string
     catalog_count: number
     tagger?: string
     embedding_backend?: string
   }>('/api/health')
 }
 
+export type TaxonomyNode = { level1: string; children: string[] }
+export type TaxonomySynonym = {
+  phrase: string
+  level1: string
+  level2: string
+  label: string
+  sleeve_length: string
+  fabric: string
+  learned: boolean
+}
+export type Taxonomy = {
+  unsorted: string
+  sleeves: string[]
+  fabrics: string[]
+  tree: TaxonomyNode[]
+  labels: string[]
+  synonyms: TaxonomySynonym[]
+}
+
 export function getFilters() {
   return request<FilterMeta>('/api/meta/filters')
+}
+
+export function getTaxonomy() {
+  return request<Taxonomy>('/api/taxonomy')
+}
+
+export function addTaxonomyCategory(level1: string, level2 = '') {
+  return request<Taxonomy>('/api/taxonomy/categories', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ level1, level2 }),
+  })
+}
+
+export function renameTaxonomyCategory(level1: string, level2: string, newLevel1: string, newLevel2: string) {
+  return request<Taxonomy>('/api/taxonomy/categories/rename', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ level1, level2, new_level1: newLevel1, new_level2: newLevel2 }),
+  })
+}
+
+export function deleteTaxonomyCategory(level1: string, level2 = '') {
+  return request<Taxonomy>('/api/taxonomy/categories/delete', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ level1, level2 }),
+  })
+}
+
+export function saveTaxonomySynonym(phrase: string, level1: string, level2 = '', sleeveLength = '', fabric = '') {
+  return request<Taxonomy>('/api/taxonomy/synonyms', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phrase, level1, level2, sleeve_length: sleeveLength, fabric }),
+  })
+}
+
+export function deleteTaxonomySynonym(phrase: string) {
+  return request<Taxonomy>('/api/taxonomy/synonyms/delete', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phrase }),
+  })
+}
+
+export function assignRecordCategory(item: CatalogItem, level1: string, level2 = '') {
+  return request<CatalogItem>(`/api/records/${item.id}/category`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ level1, level2, expected_revision: item.revision }),
+  })
 }
 
 export function getLibraryMeta() {

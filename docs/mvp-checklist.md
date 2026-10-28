@@ -5,9 +5,9 @@
 | 需求项 | 状态 | 实现位置 |
 |--------|------|----------|
 | PPT / Excel 批量抽图 + 来源（文件名、页码/Sheet） | ✅ | `src/extract/office.py`（另支持 PDF） |
-| 自动打标（品类/风格/季节/版型/颜色/细节） | ✅ | `src/tag/openai_tagger.py`（GPT-4o-mini） |
+| 自动打标（品类/风格/季节/版型/颜色/细节） | ✅ | `src/tag/openai_tagger.py`（GPT-4o-mini）、`src/tag/deepseek_tagger.py`（deepseek-flash，思考默认开启） |
 | 严格 JSON 标签输出 | ✅ | `prompts/tagging_prompt.md` |
-| 标签体系按第 4 节草稿 | ✅ | `src/schema.py` |
+| 标签体系按第 4 节草稿 | ✅ | 风格等到领型、袖型、细节仍在 `src/schema.py`；品类改为固定两级表，见 `src/taxonomy.py` 与 `docs/taxonomy.md` |
 | 文字语义搜索 | ✅ | CLIP text→image + 标签加权 |
 | 以图搜图 | ✅ | CLIP + FAISS |
 | 基础筛选 | ✅ | Vue 图库 / 搜索页 |

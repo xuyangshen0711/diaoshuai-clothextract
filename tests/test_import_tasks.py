@@ -159,7 +159,7 @@ def test_retag_job_preserves_human_tags_and_requires_new_review(store):
     job = tasks.create_retag('mock', True)
     tasks.run_job(job['id'])
     record = catalog.load_catalog()[0]
-    assert record.tags.品类 == '外套' and record.proposed_tags.品类 == '毛衣'
+    assert record.tags.品类 == '外套' and record.proposed_tags.品类 == '上衣>套衫'
     assert record.review_status == 'pending' and record.revision > approved.revision
 
 

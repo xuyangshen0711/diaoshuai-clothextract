@@ -58,6 +58,8 @@ def _coerce_tags(data: dict) -> FashionTags | None:
         details = []
     return FashionTags(
         **{key: str(data.get(key) or "其他") for key in FILTER_FIELDS},
+        袖长=str(data.get("袖长") or ""),
+        面料=str(data.get("面料") or ""),
         细节元素=[str(d).strip() for d in details],
         一句话描述=str(data.get("一句话描述") or ""),
     ).normalized()

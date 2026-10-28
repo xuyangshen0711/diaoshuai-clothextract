@@ -8,8 +8,10 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-# Section 4 draft taxonomy from the MVP requirements doc.
-CATEGORY = ["毛衣", "外套", "连衣裙", "衬衫", "裤装", "半裙", "套装", "其他"]
+from src.taxonomy import FABRICS, SLEEVE_LENGTHS, default_labels
+
+# Fixed two-level labels. Synonyms and edits live in src/taxonomy.py.
+CATEGORY = default_labels()
 STYLE = ["极简", "复古", "甜美", "通勤", "工装", "法式", "休闲", "其他"]
 SEASON = ["春", "夏", "秋", "冬", "四季"]
 FIT = ["修身", "宽松", "直筒", "廓形", "其他"]
@@ -17,14 +19,6 @@ COLOR = ["黑色", "白色", "灰色", "米色", "蓝色", "红色", "其他"]
 NECKLINE = ["圆领", "V领", "高领", "翻领", "无领", "其他"]
 SLEEVE = ["长袖", "短袖", "无袖", "泡泡袖", "其他"]
 DETAILS = ["开襟", "拉链", "口袋", "刺绣", "印花", "拼接", "其他"]
-
-# Legacy values from earlier trials → map back to the MD draft.
-CATEGORY_ALIASES = {
-    "T恤": "衬衫",
-    "马甲": "外套",
-    "针织开衫": "毛衣",
-    "羽绒服": "外套",
-}
 
 FILTER_FIELDS = {
     "品类": CATEGORY,
@@ -37,10 +31,10 @@ FILTER_FIELDS = {
 }
 
 
-# Library page tabs → categories they include.
+# Library group tabs → level-1 labels they include. 连衣裙 is its own level, not 上衣.
 CATEGORY_GROUPS = {
-    "上衣": {"毛衣", "衬衫", "连衣裙", "套装"},
-    "下装": {"裤装", "半裙"},
+    "上衣": {"上衣"},
+    "下装": {"裤装", "半身裙"},
     "外套": {"外套"},
 }
 
@@ -62,9 +56,15 @@ def coerce_source_category(value: str | None, *, required: bool = False) -> str:
 
 
 def taxonomy_yaml() -> str:
-    """Render the vocabulary for prompts, so prompts never drift from this file."""
+    """Render the vocabulary for prompts. 品类 follows the saved table when one is loaded."""
+    from src.taxonomy import active
+
     fields = {**FILTER_FIELDS, "细节元素": DETAILS}
-    return "\n".join(f"{key}: [{', '.join(values)}]" for key, values in fields.items())
+    fields["品类"] = active().labels()
+    lines = [f"{key}: [{', '.join(values)}]" for key, values in fields.items()]
+    lines.append(f"袖长: [{', '.join(SLEEVE_LENGTHS)}]")
+    lines.append(f"面料: [{', '.join(FABRICS)}]")
+    return "\n".join(lines)
 
 
 class FashionTags(BaseModel):
@@ -77,22 +77,57 @@ class FashionTags(BaseModel):
     袖型: str = "其他"
     细节元素: list[str] = Field(default_factory=list)
     一句话描述: str = ""
+    袖长: str = ""
+    面料: str = ""
 
     def validate_vocabulary(self) -> None:
+        from src.taxonomy import resolve
+
+        if resolve(self.品类).unmapped:
+            raise ValueError("品类不在允许的标签范围内")
         for key, values in FILTER_FIELDS.items():
+            if key == "品类":
+                continue
             if getattr(self, key) not in values:
                 raise ValueError(f"{key}不在允许的标签范围内")
+        if self.袖长 and self.袖长 not in SLEEVE_LENGTHS:
+            raise ValueError("袖长不在允许的标签范围内")
+        if self.面料 and self.面料 not in FABRICS:
+            raise ValueError("面料不在允许的标签范围内")
         if any(value not in DETAILS for value in self.细节元素):
             raise ValueError("细节元素不在允许的标签范围内")
 
     def normalized(self) -> "FashionTags":
+        from src.taxonomy import resolve
+
         values = {key: getattr(self, key).strip() for key in FILTER_FIELDS}
-        values["品类"] = CATEGORY_ALIASES.get(values["品类"], values["品类"])
-        return FashionTags(
-            **{key: value if value in FILTER_FIELDS[key] else "其他" for key, value in values.items()},
+        original = values["品类"]
+        placement = resolve(original)
+        values["品类"] = placement.label
+        cleaned = {}
+        for key, value in values.items():
+            if key == "品类":
+                cleaned[key] = value
+            else:
+                cleaned[key] = value if value in FILTER_FIELDS[key] else "其他"
+        sleeve = (self.袖长 or "").strip()
+        if sleeve not in SLEEVE_LENGTHS:
+            sleeve = placement.sleeve if placement.sleeve in SLEEVE_LENGTHS else ""
+            if not sleeve and self.袖型 in SLEEVE_LENGTHS:
+                sleeve = self.袖型
+        fabric = (self.面料 or "").strip()
+        if fabric not in FABRICS:
+            fabric = placement.fabric if placement.fabric in FABRICS else ""
+        result = FashionTags(
+            **cleaned,
+            袖长=sleeve,
+            面料=fabric,
             细节元素=[d for d in self.细节元素 if d in DETAILS],
             一句话描述=self.一句话描述.strip(),
         )
+        if original and original != result.品类:
+            object.__setattr__(result, "_category_phrase", original)
+        return result
 
 
 class DesignNotes(BaseModel):
@@ -138,6 +173,10 @@ class ImageRecord(BaseModel):
     # Migrated rows stay 未分类 until someone assigns a 大类. Own-factory photos keep one image per 款号.
     source_category: str = UNCLASSIFIED_SOURCE
     style_code: str = ""
+    # Original wording before it was mapped onto the fixed category table.
+    category_raw: str = ""
+    sleeve_length: str = ""
+    fabric: str = ""
     pending_image_path: str | None = None
     image_history: list[dict] = Field(default_factory=list)
     tags: FashionTags = Field(default_factory=FashionTags)
@@ -189,6 +228,11 @@ class ImageRecord(BaseModel):
                 self.source.location,
                 self.source_category,
                 self.style_code,
+                self.category_raw,
+                self.sleeve_length,
+                self.fabric,
+                self.tags.袖长,
+                self.tags.面料,
                 search_blob(self.style_code),
             ]
         ).strip()
