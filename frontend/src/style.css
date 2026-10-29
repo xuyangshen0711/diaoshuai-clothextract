@@ -73,26 +73,24 @@ a {
 }
 
 .brand-zh {
-  font-family: var(--serif);
+  font-family: var(--font);
   font-weight: 600;
   font-size: 30px;
-  line-height: 1;
-  letter-spacing: .42em;
-  margin-right: -.42em;
+  line-height: 1.2;
+  letter-spacing: normal;
+  margin-right: 0;
   color: var(--ink);
-  -webkit-text-stroke: 0;
 }
 
 .brand-en {
-  margin-top: 7px;
-  font-family: var(--latin);
-  font-weight: 600;
+  margin-top: 4px;
+  font-family: var(--font);
+  font-weight: 400;
   font-style: normal;
-  font-size: 11.5px;
-  line-height: 1;
-  letter-spacing: .62em;
+  font-size: 13px;
+  line-height: 1.2;
+  letter-spacing: normal;
   color: var(--gold);
-  -webkit-text-stroke: 0;
 }
 
 .brand-rule {
@@ -111,20 +109,19 @@ a {
 
 .brand-sub-zh {
   font-size: 15px;
-  line-height: 1.2;
-  letter-spacing: .12em;
+  line-height: 1.4;
+  letter-spacing: normal;
   color: var(--muted);
 }
 
 .brand-sub-en {
-  font-family: var(--latin);
-  font-weight: 600;
-  font-style: italic;
+  font-family: var(--font);
+  font-weight: 400;
+  font-style: normal;
   font-size: 13px;
-  line-height: 1.2;
-  letter-spacing: .02em;
+  line-height: 1.4;
+  letter-spacing: normal;
   color: var(--muted-2);
-  -webkit-text-stroke: 0;
 }
 
 .home-button {
@@ -139,10 +136,10 @@ a {
 
 .brand h1 {
   margin: 0;
-  font-family: var(--serif);
+  font-family: var(--font);
   font-size: 30px;
   font-weight: 600;
-  letter-spacing: .42em;
+  letter-spacing: normal;
   color: var(--ink);
 }
 
@@ -247,7 +244,7 @@ a {
   position: relative;
   color: var(--nav);
   font-size: 16px;
-  letter-spacing: .14em;
+  letter-spacing: normal;
   padding: 8px 0 6px;
   border-radius: 0;
   background: none;
@@ -883,7 +880,7 @@ a {
 .quiet-more-body { position: absolute; right: 0; z-index: 5; width: min(320px, 80vw); margin-top: 8px; padding: 12px; background: #fff; border: 1px solid #e4e0d8; border-radius: 12px; box-shadow: 0 8px 24px rgba(0, 0, 0, .08); display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .quiet-more-body select { border: 1px solid #d8d5cf; background: #fff; border-radius: 8px; padding: 6px 8px; font: inherit; }
 .card-title-row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-.card-title-row strong { font-size: 15px; letter-spacing: .01em; }
+.card-title-row strong { font-size: 15px; letter-spacing: normal; }
 .card-title-row span { color: #8a847c; font-size: 12px; white-space: nowrap; }
 .card-dots { display: flex; gap: 5px; margin: 8px 0; }
 .card-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: 0 0 auto; }
@@ -898,7 +895,7 @@ a {
 .detail-caption dt { color: #8a847c; }
 .detail-caption dd { margin: 0; }
 .detail-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
-.detail-heading h2 { margin: 0; font-size: 32px; letter-spacing: .02em; }
+.detail-heading h2 { margin: 0; font-size: 32px; letter-spacing: normal; }
 .detail-pills { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
 .detail-pill { border: 1px solid #e4e0d8; border-radius: 999px; padding: 4px 10px; font-size: 13px; color: #4c4842; }
 .detail-pill.strong { background: #1a1a1a; border-color: #1a1a1a; color: #fff; }
@@ -907,7 +904,7 @@ a {
 .detail-facts dt { color: #8a847c; font-size: 12px; }
 .detail-facts dd { margin: 2px 0 0; font-size: 14px; overflow-wrap: anywhere; }
 .sales-banner { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; background: #f6f3ee; border-radius: 12px; padding: 14px 16px; margin: 8px 0 18px; }
-.sales-banner strong { font-size: 28px; font-weight: 650; letter-spacing: .01em; }
+.sales-banner strong { font-size: 28px; font-weight: 600; letter-spacing: normal; }
 .sales-dot { color: #b0aaa2; margin: 0 4px; }
 .detail-block { margin-top: 8px; }
 .detail-block-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
@@ -998,8 +995,8 @@ a {
 .card-title-row strong,
 .library-card-heading h3 {
   font-size: 18px;
-  font-weight: 400;
-  letter-spacing: .04em;
+  font-weight: 600;
+  letter-spacing: normal;
   color: var(--ink);
 }
 
@@ -1097,7 +1094,7 @@ a {
   flex: 0 0 3.5em;
   color: var(--muted-2);
   font-size: 14.5px;
-  letter-spacing: .2em;
+  letter-spacing: normal;
   white-space: nowrap;
 }
 
@@ -1262,5 +1259,5 @@ a {
   }
 
   .grid { gap: 16px; }
-  .filter-row-label { letter-spacing: .12em; }
+  .filter-row-label { letter-spacing: normal; }
 }

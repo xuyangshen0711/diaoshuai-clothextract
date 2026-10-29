@@ -1,42 +1,10 @@
-/* Quiet-luxury tokens and locally hosted fonts. No external CDN. */
-
-@font-face {
-  font-family: "Zhuque Fangsong";
-  src: url("/fonts/ZhuqueFangsong-Regular.woff2") format("woff2");
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-}
+/* Colors and a normal sans. The Chinese face is hosted locally so the factory network does not need a CDN. */
 
 @font-face {
   font-family: "Noto Sans SC";
   src: url("/fonts/NotoSansSC-Regular.woff2") format("woff2");
   font-weight: 400;
   font-style: normal;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "Noto Serif SC";
-  src: url("/fonts/NotoSerifSC-SemiBold.woff2") format("woff2");
-  font-weight: 600;
-  font-style: normal;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "Cormorant Garamond";
-  src: url("/fonts/CormorantGaramond-SemiBold.woff2") format("woff2");
-  font-weight: 600;
-  font-style: normal;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "Cormorant Garamond";
-  src: url("/fonts/CormorantGaramond-SemiBoldItalic.woff2") format("woff2");
-  font-weight: 600;
-  font-style: italic;
   font-display: swap;
 }
 
@@ -63,18 +31,18 @@
   --radius-panel: 4px;
   --radius-card: 3px;
   --radius-control: 2px;
-  --font: "Zhuque Fangsong", "Noto Sans SC", sans-serif;
-  --serif: "Noto Serif SC", "Noto Sans SC", serif;
-  --latin: "Cormorant Garamond", "Times New Roman", serif;
+  --font: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --serif: var(--font);
+  --latin: var(--font);
   --content-pad: 26px 48px;
   font-family: var(--font);
   color: var(--text);
   background: var(--page);
   font-size: 15px;
   line-height: 1.6;
-  letter-spacing: .06em;
-  font-synthesis: none;
+  letter-spacing: normal;
+  font-synthesis: weight style;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
-  -webkit-text-stroke: .15px currentColor;
+  -webkit-text-stroke: 0;
 }
