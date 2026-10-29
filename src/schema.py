@@ -18,7 +18,19 @@ FIT = ["修身", "宽松", "直筒", "廓形", "其他"]
 COLOR = ["黑色", "白色", "灰色", "米色", "蓝色", "红色", "其他"]
 NECKLINE = ["圆领", "V领", "高领", "翻领", "无领", "其他"]
 SLEEVE = ["长袖", "短袖", "无袖", "泡泡袖", "其他"]
-DETAILS = ["开襟", "拉链", "口袋", "刺绣", "印花", "拼接", "其他"]
+PATTERN = [
+    "纯色/无明显图案", "条纹", "格纹", "波点", "花卉", "动物纹", "几何图案",
+    "字母/图形", "迷彩", "抽象/泼墨", "混合图案", "其他图案", "未判断",
+]
+DETAIL_GROUPS = {
+    "结构与闭合": ["开襟", "纽扣", "拉链", "搭扣", "系带", "抽绳", "口袋", "拼接"],
+    "装饰工艺": ["刺绣", "贴花", "珠饰", "亮片", "蝴蝶结", "花饰", "流苏", "缎带", "铆钉", "荷叶边", "蕾丝"],
+    "针织纹理": ["罗纹", "绞花", "提花", "镂空针织"],
+}
+# 印花曾经作为细节元素保存。保留为兼容项，AI 新打标会使用独立的「图案」字段。
+LEGACY_DETAILS = ["印花", "其他"]
+DETAIL_OPTIONS = list(dict.fromkeys(sum(DETAIL_GROUPS.values(), [])))
+DETAILS = [*DETAIL_OPTIONS, *LEGACY_DETAILS]
 
 FILTER_FIELDS = {
     "品类": CATEGORY,
@@ -28,6 +40,7 @@ FILTER_FIELDS = {
     "颜色主色调": COLOR,
     "领型": NECKLINE,
     "袖型": SLEEVE,
+    "图案": PATTERN,
 }
 
 
@@ -59,9 +72,13 @@ def taxonomy_yaml() -> str:
     """Render the vocabulary for prompts. 品类 follows the saved table when one is loaded."""
     from src.taxonomy import active
 
-    fields = {**FILTER_FIELDS, "细节元素": DETAILS}
+    fields = {key: values for key, values in FILTER_FIELDS.items() if key != "图案"}
     fields["品类"] = active().labels()
     lines = [f"{key}: [{', '.join(values)}]" for key, values in fields.items()]
+    lines.append(f"图案: [{', '.join(PATTERN)}]")
+    lines.append("细节元素（分组仅用于组织选项，输出仍为一个列表）：")
+    for group, values in DETAIL_GROUPS.items():
+        lines.append(f"  {group}: [{', '.join(values)}]")
     lines.append(f"袖长: [{', '.join(SLEEVE_LENGTHS)}]")
     lines.append(f"面料: [{', '.join(FABRICS)}]")
     return "\n".join(lines)
@@ -75,6 +92,7 @@ class FashionTags(BaseModel):
     颜色主色调: str = "其他"
     领型: str = "其他"
     袖型: str = "其他"
+    图案: str = "未判断"
     细节元素: list[str] = Field(default_factory=list)
     一句话描述: str = ""
     袖长: str = ""
@@ -109,7 +127,7 @@ class FashionTags(BaseModel):
             if key == "品类":
                 cleaned[key] = value
             else:
-                cleaned[key] = value if value in FILTER_FIELDS[key] else "其他"
+                cleaned[key] = value if value in FILTER_FIELDS[key] else ("未判断" if key == "图案" else "其他")
         sleeve = (self.袖长 or "").strip()
         if sleeve not in SLEEVE_LENGTHS:
             sleeve = placement.sleeve if placement.sleeve in SLEEVE_LENGTHS else ""
@@ -118,11 +136,16 @@ class FashionTags(BaseModel):
         fabric = (self.面料 or "").strip()
         if fabric not in FABRICS:
             fabric = placement.fabric if placement.fabric in FABRICS else ""
+        detail_values = [d for d in self.细节元素 if d in DETAILS and d not in LEGACY_DETAILS]
+        pattern = cleaned["图案"]
+        if "印花" in self.细节元素 and pattern == "未判断":
+            pattern = "其他图案"
+        cleaned["图案"] = pattern
         result = FashionTags(
             **cleaned,
             袖长=sleeve,
             面料=fabric,
-            细节元素=[d for d in self.细节元素 if d in DETAILS],
+            细节元素=detail_values,
             一句话描述=self.一句话描述.strip(),
         )
         if original and original != result.品类:
@@ -222,6 +245,7 @@ class ImageRecord(BaseModel):
                 self.tags.颜色主色调,
                 self.tags.领型,
                 self.tags.袖型,
+                self.tags.图案,
                 detail,
                 self.notes.text(),
                 self.source.source_file,

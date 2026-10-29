@@ -57,7 +57,7 @@ def _coerce_tags(data: dict) -> FashionTags | None:
     if not isinstance(details, list):
         details = []
     return FashionTags(
-        **{key: str(data.get(key) or "其他") for key in FILTER_FIELDS},
+        **{key: str(data.get(key) or ("未判断" if key == "图案" else "其他")) for key in FILTER_FIELDS},
         袖长=str(data.get("袖长") or ""),
         面料=str(data.get("面料") or ""),
         细节元素=[str(d).strip() for d in details],
@@ -118,7 +118,7 @@ class OpenAITagger:
                             "type": "image_url",
                             "image_url": {
                                 "url": _image_data_url(path),
-                                "detail": "low",
+                                "detail": "high",
                             },
                         },
                     ],

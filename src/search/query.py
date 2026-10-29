@@ -29,6 +29,7 @@ FILTER_PARAMS = {
     "color": "颜色主色调",
     "neckline": "领型",
     "sleeve": "袖型",
+    "pattern": "图案",
 }
 
 

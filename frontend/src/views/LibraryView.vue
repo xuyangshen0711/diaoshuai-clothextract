@@ -11,9 +11,9 @@ const count = ref(0)
 const colorCounts = ref<Record<string, number>>({})
 const loading = ref(false)
 const error = ref('')
-const meta = ref<FilterMeta>({})
+const meta = ref<FilterMeta>({ fields: {}, detail_groups: {} })
 const libraryMeta = ref<LibraryMeta>({ source_categories: ['本厂产品', '网图趋势', '品牌资料包', '市调拍照'], unclassified: '未分类', factory: {} })
-const taxonomy = ref<Taxonomy>({ unsorted: '待归类', sleeves: [], fabrics: [], tree: [], labels: [], synonyms: [] })
+const taxonomy = ref<Taxonomy>({ unsorted: '待归类', sleeves: [], fabrics: [], tree: [], labels: [] })
 const bulkCategory = ref('本厂产品')
 const bulkMessage = ref('')
 const queryDraft = ref('')
@@ -32,6 +32,7 @@ const filters = computed(() => ({
   fit: queryText('fit'),
   neckline: queryText('neckline'),
   sleeve: queryText('sleeve'),
+  pattern: queryText('pattern'),
   archive_season: queryText('archive_season'),
   color_family: queryText('color_family'),
 }))
@@ -54,21 +55,22 @@ const subcategoryOptions = computed(() => {
 })
 const seasonKey = computed(() => ownFactory.value ? 'archive_season' : 'season')
 const seasonValue = computed(() => ownFactory.value ? filters.value.archive_season : filters.value.season)
-const seasonOptions = computed(() => ['全部', ...(ownFactory.value ? libraryMeta.value.factory['季节'] || [] : meta.value['季节'] || [])])
+const seasonOptions = computed(() => ['全部', ...(ownFactory.value ? libraryMeta.value.factory['季节'] || [] : meta.value.fields['季节'] || [])])
 const colorKey = computed(() => ownFactory.value ? 'color_family' : 'color')
 const activeColor = computed(() => ownFactory.value ? filters.value.color_family : filters.value.color)
 const swatches = computed(() => {
-  const order = ownFactory.value ? FACTORY_COLORS : (meta.value['颜色主色调'] || [])
+  const order = ownFactory.value ? FACTORY_COLORS : (meta.value.fields['颜色主色调'] || [])
   const names = order.filter(name => colorCounts.value[name])
   for (const name of Object.keys(colorCounts.value)) if (!names.includes(name)) names.push(name)
   if (activeColor.value !== '全部' && !names.includes(activeColor.value)) names.push(activeColor.value)
   return names.map(name => ({ name, count: colorCounts.value[name] || 0 }))
 })
 const extraFilters = computed(() => [
-  ['style', '风格', meta.value['风格'] || []],
-  ['fit', '版型', meta.value['版型'] || []],
-  ['neckline', '领型', meta.value['领型'] || []],
-  ['sleeve', '袖型', meta.value['袖型'] || []],
+  ['style', '风格', meta.value.fields['风格'] || []],
+  ['fit', '版型', meta.value.fields['版型'] || []],
+  ['neckline', '领型', meta.value.fields['领型'] || []],
+  ['sleeve', '袖型', meta.value.fields['袖型'] || []],
+  ['pattern', '图案', meta.value.fields['图案'] || []],
 ] as const)
 const selectedChips = computed(() => {
   const chips: { key: string; label: string }[] = []
@@ -78,8 +80,10 @@ const selectedChips = computed(() => {
   if (ownFactory.value && filters.value.fabric !== '全部') chips.push({ key: 'fabric', label: filters.value.fabric })
   if (seasonValue.value !== '全部') chips.push({ key: seasonKey.value, label: seasonValue.value })
   if (activeColor.value !== '全部') chips.push({ key: colorKey.value, label: activeColor.value })
+  if (filters.value.pattern !== '全部') chips.push({ key: 'pattern', label: filters.value.pattern })
   if (!ownFactory.value) {
     for (const [key, , options] of extraFilters.value) {
+      if (key === 'pattern') continue
       const value = filters.value[key]
       if (value !== '全部' && (options.includes(value) || value)) chips.push({ key, label: value })
     }
@@ -87,7 +91,7 @@ const selectedChips = computed(() => {
   return chips
 })
 
-const facetQueryKeys = ['category', 'subcategory', 'sleeve_length', 'fabric', 'color', 'style', 'season', 'fit', 'neckline', 'sleeve', 'archive_season', 'color_family', 'size', 'series', 'needle', 'customer', 'group']
+const facetQueryKeys = ['category', 'subcategory', 'sleeve_length', 'fabric', 'color', 'style', 'season', 'fit', 'neckline', 'sleeve', 'pattern', 'archive_season', 'color_family', 'size', 'series', 'needle', 'customer', 'group']
 function setSource(value: string) {
   const next = { ...route.query }
   for (const key of facetQueryKeys) delete next[key]
@@ -131,6 +135,7 @@ async function load() {
       fit: ownFactory.value ? '' : filters.value.fit,
       neckline: ownFactory.value ? '' : filters.value.neckline,
       sleeve: ownFactory.value ? '' : filters.value.sleeve,
+      pattern: filters.value.pattern,
       archive_season: ownFactory.value ? filters.value.archive_season : '',
       color_family: ownFactory.value ? filters.value.color_family : '',
       source_category: sourceCategory.value,
@@ -240,7 +245,7 @@ watch(() => route.query, load, { deep: true })
             <button v-for="opt in taxonomy.fabrics" :key="`fabric-${opt}`" type="button" class="chip" :aria-pressed="filters.fabric === opt" @click="setFilter('fabric', opt)">{{ opt }}</button>
           </div>
         </div>
-        <div v-for="[key, label, options] in extraFilters" v-show="!ownFactory" :key="key" class="filter-row">
+        <div v-for="[key, label, options] in extraFilters" v-show="!ownFactory || key === 'pattern'" :key="key" class="filter-row">
           <span class="filter-row-label">{{ label }}</span>
           <div class="filter-scroll" role="group" :aria-label="label">
             <button type="button" class="chip" :aria-pressed="filters[key] === '全部'" @click="setFilter(key, '全部')">全部</button>

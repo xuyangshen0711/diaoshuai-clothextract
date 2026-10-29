@@ -4,7 +4,6 @@ import SearchView from './views/SearchView.vue'
 import ImportView from './views/ImportView.vue'
 import ReviewView from './views/ReviewView.vue'
 import RecordView from './views/RecordView.vue'
-import CategoriesView from './views/CategoriesView.vue'
 
 export const router = createRouter({
   history: createWebHistory(),
@@ -14,7 +13,7 @@ export const router = createRouter({
     { path: '/import', name: 'import', component: ImportView },
     { path: '/records/:id', name: 'record', component: RecordView },
     { path: '/review', name: 'review', component: ReviewView },
-    { path: '/categories', name: 'categories', component: CategoriesView },
+    { path: '/categories', redirect: '/' },
     { path: '/edit', redirect: '/review' },
   ],
 })

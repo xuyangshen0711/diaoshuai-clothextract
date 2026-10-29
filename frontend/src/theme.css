@@ -63,18 +63,15 @@
   --radius-panel: 4px;
   --radius-card: 3px;
   --radius-control: 2px;
-  --font: "Zhuque Fangsong", "Noto Sans SC", sans-serif;
-  --serif: "Noto Serif SC", "Noto Sans SC", serif;
-  --latin: "Cormorant Garamond", "Times New Roman", serif;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+  --serif: var(--font);
+  --latin: var(--font);
   --content-pad: 26px 48px;
   font-family: var(--font);
   color: var(--text);
   background: var(--page);
   font-size: 15px;
   line-height: 1.6;
-  letter-spacing: .06em;
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -webkit-text-stroke: .15px currentColor;
+  letter-spacing: normal;
+  -webkit-text-stroke: 0;
 }

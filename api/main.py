@@ -52,7 +52,8 @@ from src.factory.library import (  # noqa: E402
 from src.factory.sales import import_sales  # noqa: E402
 from src.schema import (  # noqa: E402
     CATEGORY_GROUPS,
-    DETAILS,
+    DETAIL_GROUPS,
+    DETAIL_OPTIONS,
     FILTER_FIELDS,
     SOURCE_CATEGORIES,
     UNCLASSIFIED_SOURCE,
@@ -194,9 +195,11 @@ def tag_filters(
     color: str | None = None,
     neckline: str | None = None,
     sleeve: str | None = None,
+    pattern: str | None = None,
 ) -> dict[str, str | None]:
     return dict(category=category, subcategory=subcategory, sleeve_length=sleeve_length, fabric=fabric,
-                style=style, season=season, fit=fit, color=color, neckline=neckline, sleeve=sleeve)
+                style=style, season=season, fit=fit, color=color, neckline=neckline, sleeve=sleeve,
+                pattern=pattern)
 
 
 class TagJobRequest(BaseModel):
@@ -237,12 +240,14 @@ def health() -> dict[str, Any]:
 
 
 @app.get("/api/meta/filters")
-def meta_filters() -> dict[str, list[str]]:
+def meta_filters() -> dict[str, Any]:
     from src.taxonomy import FABRICS, SLEEVE_LENGTHS, active
 
     with catalog_store._database():
         labels = active().labels()
-    return {**FILTER_FIELDS, "品类": labels, "细节元素": DETAILS, "袖长": list(SLEEVE_LENGTHS), "面料": list(FABRICS)}
+    fields = {**FILTER_FIELDS, "品类": labels, "细节元素": DETAIL_OPTIONS,
+              "袖长": list(SLEEVE_LENGTHS), "面料": list(FABRICS)}
+    return {"fields": fields, "detail_groups": DETAIL_GROUPS}
 
 
 @app.get("/api/meta/library")
@@ -642,16 +647,6 @@ def record_detail(record_id: str):
         reset_search_blobs(token)
 
 
-class TaxonomyEdit(BaseModel):
-    level1: str = ""
-    level2: str = ""
-    new_level1: str = ""
-    new_level2: str = ""
-    phrase: str = ""
-    sleeve_length: str = ""
-    fabric: str = ""
-
-
 class CategoryAssignBody(BaseModel):
     level1: str
     level2: str = ""
@@ -660,60 +655,12 @@ class CategoryAssignBody(BaseModel):
     expected_revision: int = Field(ge=1)
 
 
-def _taxonomy_edit(action) -> dict[str, Any]:
-    from src.taxonomy import TaxonomyError, snapshot
-
-    try:
-        with catalog_store._database() as conn:
-            action(conn)
-            return snapshot(conn)
-    except TaxonomyError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-
 @app.get("/api/taxonomy")
 def taxonomy_view() -> dict[str, Any]:
     from src.taxonomy import snapshot
 
     with catalog_store._database() as conn:
         return snapshot(conn)
-
-
-@app.post("/api/taxonomy/categories")
-def taxonomy_add(body: TaxonomyEdit) -> dict[str, Any]:
-    from src.taxonomy import add_category
-
-    return _taxonomy_edit(lambda conn: add_category(conn, body.level1, body.level2))
-
-
-@app.post("/api/taxonomy/categories/rename")
-def taxonomy_rename(body: TaxonomyEdit) -> dict[str, Any]:
-    from src.taxonomy import rename_category
-
-    return _taxonomy_edit(lambda conn: rename_category(conn, body.level1, body.level2, body.new_level1, body.new_level2))
-
-
-@app.post("/api/taxonomy/categories/delete")
-def taxonomy_delete(body: TaxonomyEdit) -> dict[str, Any]:
-    from src.taxonomy import delete_category
-
-    return _taxonomy_edit(lambda conn: delete_category(conn, body.level1, body.level2))
-
-
-@app.post("/api/taxonomy/synonyms")
-def taxonomy_save_synonym(body: TaxonomyEdit) -> dict[str, Any]:
-    from src.taxonomy import save_synonym
-
-    return _taxonomy_edit(lambda conn: save_synonym(
-        conn, body.phrase, body.level1, body.level2, body.sleeve_length, body.fabric, learned=True,
-    ))
-
-
-@app.post("/api/taxonomy/synonyms/delete")
-def taxonomy_delete_synonym(body: TaxonomyEdit) -> dict[str, Any]:
-    from src.taxonomy import delete_synonym
-
-    return _taxonomy_edit(lambda conn: delete_synonym(conn, body.phrase))
 
 
 @app.post("/api/records/{record_id}/category")

@@ -652,6 +652,8 @@ a {
 .review-comparison-row.changed select { border-color: #6a7d95; background: #eff3f8; }
 .review-details-row { align-items: start; }
 .review-checks { display: flex; flex-wrap: wrap; gap: 7px 12px; font-size: 12px; }
+.review-detail-group { display: flex; flex-wrap: wrap; align-items: center; gap: 7px 12px; width: 100%; }
+.review-detail-group strong { width: 100%; color: #666; font-size: 12px; font-weight: 600; }
 .review-checks label { display: inline-flex; align-items: center; gap: 3px; }
 .review-checks input { margin: 0; accent-color: #2f2e2b; }
 .review-description { margin: 16px 0; font-size: 14px; }

@@ -17,7 +17,7 @@ const actions: Record<string, string> = {
   source_category_changed: '修改资料大类',
   category_assigned: '改归固定品类',
 }
-const fields = ['品类', '风格', '季节', '版型', '颜色主色调', '领型', '袖型'] as const
+const fields = ['品类', '风格', '季节', '版型', '颜色主色调', '领型', '袖型', '图案'] as const
 const queryValue = (key: string) => typeof route.query[key] === 'string' ? route.query[key] as string : ''
 const state = computed<ReviewStatus>(() => ['pending', 'approved', 'rejected'].includes(queryValue('status')) ? queryValue('status') as ReviewStatus : 'pending')
 const page = computed(() => Math.max(1, Number.parseInt(queryValue('page')) || 1))
@@ -26,8 +26,8 @@ const source = computed(() => queryValue('source'))
 const category = computed(() => queryValue('category'))
 const facets = ref<{ batches: { id: string; label: string }[]; files: string[] }>({ batches: [], files: [] })
 const counts = reactive<Record<ReviewStatus, number>>({ pending: 0, approved: 0, rejected: 0 })
-const meta = ref<FilterMeta>({})
-const taxonomy = ref<Taxonomy>({ unsorted: '待归类', sleeves: [], fabrics: [], tree: [], labels: [], synonyms: [] })
+const meta = ref<FilterMeta>({ fields: {}, detail_groups: {} })
+const taxonomy = ref<Taxonomy>({ unsorted: '待归类', sleeves: [], fabrics: [], tree: [], labels: [] })
 const assignLevel1 = ref('')
 const assignLevel2 = ref('')
 const assignError = ref('')
@@ -44,7 +44,7 @@ const selectedId = ref('')
 const current = computed(() => items.value.find(item => item.id === selectedId.value))
 const position = computed(() => (page.value - 1) * 30 + items.value.findIndex(item => item.id === selectedId.value) + 1)
 const form = reactive<FashionTags>({ 品类: '', 风格: '', 季节: '', 版型: '', 颜色主色调: '',
-  领型: '', 袖型: '', 细节元素: [], 一句话描述: '' })
+  领型: '', 袖型: '', 图案: '未判断', 细节元素: [], 一句话描述: '' })
 const reviewer = ref(localStorage.getItem('clothextract-reviewer') || '')
 const note = ref('')
 const history = ref<ReviewEvent[]>([])
@@ -142,7 +142,7 @@ watch(current, async item => {
   assignError.value = ''
   Object.assign(form, JSON.parse(JSON.stringify(item.proposed_tags || item.tags)))
   for (const key of NOTE_FIELDS) notesForm[key] = item.notes?.[key] || ''
-  for (const key of fields) if (!meta.value[key]?.includes(form[key])) form[key] = ''
+  for (const key of fields) if (!meta.value.fields[key]?.includes(form[key])) form[key] = ''
   baseline.value = signature()
   try {
     const data = await getReviewHistory(item.id)
@@ -227,7 +227,7 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
     <div class="review-filterbar">
       <div class="field"><label for="review-batch">导入批次</label><select id="review-batch" :value="batch" :disabled="saving" @change="setParams({ batch: ($event.target as HTMLSelectElement).value || undefined })"><option value="">全部批次</option><option v-for="item in facets.batches" :key="item.id" :value="item.id">{{ item.label }}</option></select></div>
       <div class="field"><label for="review-source">来源文件</label><select id="review-source" :value="source" :disabled="saving" @change="setParams({ source: ($event.target as HTMLSelectElement).value || undefined })"><option value="">全部文件</option><option v-for="item in facets.files" :key="item" :value="item">{{ item }}</option></select></div>
-      <div class="field"><label for="review-category">服装品类</label><select id="review-category" :value="category" :disabled="saving" @change="setParams({ category: ($event.target as HTMLSelectElement).value || undefined })"><option value="">全部品类</option><option v-for="item in meta['品类'] || []" :key="item" :value="item">{{ item }}</option></select></div>
+      <div class="field"><label for="review-category">服装品类</label><select id="review-category" :value="category" :disabled="saving" @change="setParams({ category: ($event.target as HTMLSelectElement).value || undefined })"><option value="">全部品类</option><option v-for="item in meta.fields['品类'] || []" :key="item" :value="item">{{ item }}</option></select></div>
       <button v-if="batch || source || category" class="btn" :disabled="saving" @click="setParams({ batch: undefined, source: undefined, category: undefined })">清除筛选</button>
     </div>
     <p v-if="message" class="review-notice" role="status">{{ message }}</p>
@@ -312,15 +312,18 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
               <span>{{ display(current.ai_tags?.[key]) }}</span>
               <select :id="`review-${key}`" v-model="form[key]">
                 <option disabled value="">请选择</option>
-                <option v-for="opt in meta[key] || []" :key="opt" :value="opt">{{ opt }}</option>
+                <option v-for="opt in meta.fields[key] || []" :key="opt" :value="opt">{{ opt }}</option>
               </select>
             </div>
             <div class="review-comparison-row review-details-row">
               <span id="detail-label">细节元素</span><span>{{ display(current.ai_tags?.细节元素) }}</span>
               <div class="review-checks" role="group" aria-labelledby="detail-label">
-                <label v-for="opt in meta['细节元素'] || []" :key="opt">
-                  <input v-model="form.细节元素" type="checkbox" :value="opt" />{{ opt }}
-                </label>
+                <div v-for="(options, group) in meta.detail_groups" :key="group" class="review-detail-group">
+                  <strong>{{ group }}</strong>
+                  <label v-for="opt in options" :key="opt">
+                    <input v-model="form.细节元素" type="checkbox" :value="opt" />{{ opt }}
+                  </label>
+                </div>
               </div>
             </div>
             <div class="review-description">

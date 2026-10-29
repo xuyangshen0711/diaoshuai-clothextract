@@ -32,7 +32,6 @@ onUnmounted(() => stopPolling?.())
         <RouterLink to="/search?mode=image" active-class="" exact-active-class="" :class="{ 'is-current': imageSearch }">以图搜</RouterLink>
         <RouterLink to="/import" exact-active-class="is-current" active-class="">导入<span v-if="activeJobCount" class="nav-count">{{ activeJobCount }}</span></RouterLink>
         <RouterLink to="/review" exact-active-class="is-current" active-class="">审核</RouterLink>
-        <RouterLink to="/categories" exact-active-class="is-current" active-class="">品类设置</RouterLink>
       </nav>
     </header>
 
