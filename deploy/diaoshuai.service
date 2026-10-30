@@ -1,0 +1,19 @@
+[Unit]
+Description=貂帅服装图片库 API
+After=network.target
+
+[Service]
+Type=simple
+User=diaoshuai
+Group=diaoshuai
+WorkingDirectory=/opt/diaoshuai
+EnvironmentFile=/opt/diaoshuai/.env
+ExecStart=/opt/diaoshuai/.venv/bin/uvicorn api.main:app --host 127.0.0.1 --port 8520 --workers 1
+Restart=on-failure
+RestartSec=3
+
+# 导入任务写在进程内存里，只能开一个 worker。不要改成多进程。
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

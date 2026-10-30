@@ -112,28 +112,19 @@ def test_migration_remaps_without_bumping_revision(store):
     assert catalog.load_catalog()[0].revision == revision
 
 
-def test_category_edits_are_refused_while_records_still_use_them(store):
+def test_category_table_stays_fixed_without_management_routes(store):
     client = TestClient(api.app)
     catalog.load_catalog()
-    blocked = client.post("/api/taxonomy/categories/delete", json={"level1": "待归类"})
-    assert blocked.status_code == 422 and "不能删除" in blocked.text
-    parent = client.post("/api/taxonomy/categories/delete", json={"level1": "上衣"})
-    assert parent.status_code == 422 and "二级" in parent.text
-    added = client.post("/api/taxonomy/categories", json={"level1": "试穿"})
-    assert added.status_code == 200, added.text
-    renamed = client.post("/api/taxonomy/categories/rename", json={
-        "level1": "试穿", "new_level1": "试穿样",
-    })
-    assert renamed.status_code == 200, renamed.text
-    assert any(node["level1"] == "试穿样" for node in renamed.json()["tree"])
-    removed = client.post("/api/taxonomy/categories/delete", json={"level1": "试穿样"})
-    assert removed.status_code == 200, removed.text
-    assert all(node["level1"] != "试穿样" for node in removed.json()["tree"])
+    for path in ("/api/taxonomy/categories", "/api/taxonomy/categories/rename", "/api/taxonomy/categories/delete"):
+        assert client.post(path, json={"level1": "待归类"}).status_code == 404
     record = make_record(store)
     catalog.save_catalog([record])
-    used = client.post("/api/taxonomy/categories/delete", json={"level1": "上衣", "level2": "套衫"})
-    assert used.status_code == 422 and "请先把这些资料改归" in used.text
-    assert catalog.load_catalog()[0].tags.品类 == "上衣>套衫"
+    assigned = client.post(f"/api/records/{record.id}/category", json={
+        "level1": "上衣", "level2": "卫衣", "expected_revision": record.revision,
+    })
+    assert assigned.status_code == 200, assigned.text
+    assert assigned.json()["library_category"] == "上衣>卫衣"
+    assert catalog.load_catalog()[0].tags.品类 == "上衣>卫衣"
 
 
 def test_factory_archive_category_overrides_an_ai_cardigan(store, monkeypatch):

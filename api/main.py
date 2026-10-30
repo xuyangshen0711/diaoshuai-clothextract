@@ -74,6 +74,8 @@ from src.tag.tagger import (  # noqa: E402
     provider_ready,
 )
 from src.images import image_metadata, image_version, thumbnail_path  # noqa: E402
+from src import storage  # noqa: E402
+from src.db import mysql_config  # noqa: E402
 
 ensure_data_dirs()
 
@@ -103,19 +105,29 @@ async def catalog_conflict_handler(_request, exc):
 
 def _serialize(record: ImageRecord, score: float | None = None, index=None) -> dict[str, Any]:
     payload = record.model_dump()
-    metadata = image_metadata(Path(record.image_path))
+    metadata = image_metadata(record.image_path)
     url = f"/api/records/{record.id}/image"
     version = metadata.pop("version")
     payload.update(metadata)
-    payload["image_url"] = f"{url}?v={version}"
-    payload["thumbnail_url"] = f"{url}?variant=thumbnail&v={version}"
+    original_cdn = storage.public_url(record.image_path)
+    payload["image_url"] = f"{original_cdn}?v={version}" if original_cdn else f"{url}?v={version}"
+    thumb_cdn = None
+    if original_cdn and storage.is_file(record.image_path):
+        try:
+            thumb_cdn = storage.upload_thumbnail(record.id, record.image_path, thumbnail_path(record.id, record.image_path))
+        except OSError:
+            thumb_cdn = None
+    payload["thumbnail_url"] = thumb_cdn or f"{url}?variant=thumbnail&v={version}"
     payload["download_url"] = f"{url}?download=true&v={version}"
     payload["display_tags"] = record.display_tags.model_dump()
     factory = index if index is not None else load_index()
     payload.update(card_fields(record, factory))
-    pending = Path(record.pending_image_path) if record.pending_image_path else None
-    if pending and pending.is_file():
-        payload["pending_image_url"] = f"{url}?variant=pending&v={image_version(pending)}"
+    if record.pending_image_path and storage.is_file(record.pending_image_path):
+        pending_cdn = storage.public_url(record.pending_image_path)
+        pending_version = image_version(record.pending_image_path)
+        payload["pending_image_url"] = (
+            f"{pending_cdn}?v={pending_version}" if pending_cdn else f"{url}?variant=pending&v={pending_version}"
+        )
     else:
         payload["pending_image_url"] = None
     if score is not None:
@@ -234,6 +246,8 @@ def health() -> dict[str, Any]:
         "default_backend": default_tagger_backend(),
         "tagger": shown,
         "embedding_backend": backend_name,
+        "database": "mysql" if mysql_config() else "sqlite",
+        "storage": "oss" if storage.using_oss() else "local",
         "catalog_count": len(load_catalog()),
         "pending_count": sum(r.review_status == "pending" for r in load_catalog()),
     }
@@ -573,23 +587,25 @@ def record_image(record_id: str, download: bool = False,
     if record is None:
         raise HTTPException(status_code=404, detail="图片不存在")
     if variant == "pending":
-        path = Path(record.pending_image_path) if record.pending_image_path else None
-        if path is None or not path.is_file():
+        pending = record.pending_image_path or ""
+        if not storage.is_file(pending):
             raise HTTPException(status_code=404, detail="没有待确认的新图片")
-        return FileResponse(path, headers={"Cache-Control": "no-cache"})
+        return FileResponse(storage.local_file(pending), headers={"Cache-Control": "no-cache"})
     if variant == "history":
         if index < 0 or index >= len(record.image_history):
             raise HTTPException(status_code=404, detail="历史图片不存在")
-        path = Path(record.image_history[index].get("image_path") or "")
-        if not path.is_file():
+        stored = record.image_history[index].get("image_path") or ""
+        if not storage.is_file(stored):
             raise HTTPException(status_code=404, detail="历史图片不存在")
-        return FileResponse(path, headers={"Cache-Control": "no-cache"})
-    if not Path(record.image_path).exists():
+        return FileResponse(storage.local_file(stored), headers={"Cache-Control": "no-cache"})
+    if not storage.is_file(record.image_path):
         raise HTTPException(status_code=404, detail="图片不存在")
-    original = Path(record.image_path)
-    path = thumbnail_path(record.id, original) if variant == "thumbnail" and not download else original
-    cache = "private, max-age=31536000, immutable" if v == image_version(original) else "no-cache"
-    return FileResponse(path, filename=original.name if download else None, headers={"Cache-Control": cache})
+    original = storage.local_file(record.image_path)
+    path = thumbnail_path(record.id, record.image_path) if variant == "thumbnail" and not download else original
+    cache = "private, max-age=31536000, immutable" if v == image_version(record.image_path) else "no-cache"
+    return FileResponse(
+        path, filename=storage.file_name(record.image_path) if download else None, headers={"Cache-Control": cache},
+    )
 
 
 def _source_path(record: ImageRecord) -> Path | None:
@@ -633,8 +649,8 @@ def record_detail(record_id: str):
         payload.update(detail_fields(record, index))
         history = []
         for position, item in enumerate(record.image_history):
-            path = Path(item.get("image_path") or "")
-            if not path.is_file():
+            stored = item.get("image_path") or ""
+            if not storage.is_file(stored):
                 continue
             history.append({
                 "url": f"/api/records/{record_id}/image?variant=history&index={position}",
@@ -692,7 +708,7 @@ def source_document(record_id: str):
 def similar_records(record_id: str, include_pending: bool = False):
     records = load_catalog()
     record = get_by_id(records, record_id)
-    if record is None or not Path(record.image_path).is_file():
+    if record is None or not storage.is_file(record.image_path):
         raise HTTPException(status_code=404, detail="款式图片不存在")
     hits = search_by_image(records, record.image_path, top_k=24,
                            filtered=[r for r in records if r.id != record_id and r.source.source_type != "sample"],

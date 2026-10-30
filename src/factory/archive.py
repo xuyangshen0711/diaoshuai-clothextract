@@ -11,6 +11,7 @@ from src.factory.excel_io import (
     cell_at, column_index, find_header, load_sheet_rows, plain_text, sheet_headers, table_kind_from_headers,
 )
 from src.factory.sizes import split_sizes
+from src.db import on_conflict_update
 from src.factory.tables import gap_report, now
 
 KEEP_COLUMNS = ("季节", "大货款号", "颜色", "尺码", "原料名称", "针型", "系列", "一级品类")
@@ -68,12 +69,10 @@ def import_archive(path: Path, source_name: str | None = None) -> dict:
                     variant_code, style_code, customer, season, needle, series, category, material,
                     colors_json, sizes_json, source_file, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(variant_code) DO UPDATE SET
-                    style_code=excluded.style_code, customer=excluded.customer, season=excluded.season,
-                    needle=excluded.needle, series=excluded.series, category=excluded.category,
-                    material=excluded.material, colors_json=excluded.colors_json, sizes_json=excluded.sizes_json,
-                    source_file=excluded.source_file, updated_at=excluded.updated_at
-                """,
+                """ + on_conflict_update("variant_code", [
+                    "style_code", "customer", "season", "needle", "series", "category", "material",
+                    "colors_json", "sizes_json", "source_file", "updated_at",
+                ]),
                 (
                     item["variant_code"], item["style_code"], item["customer"], item["season"], item["needle"],
                     item["series"], item["category"], item["material"],
