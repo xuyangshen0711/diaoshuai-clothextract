@@ -5,22 +5,25 @@ from fastapi.testclient import TestClient
 from test_review_workflow import store, make_record, approve
 from api import main as api
 from src import catalog
-from src.schema import FILTER_FIELDS, DETAILS
+from src.schema import DETAIL_GROUPS, FILTER_FIELDS
 from src.tag.openai_tagger import _coerce_tags, _load_system_prompt
 
 
 def test_prompt_lists_every_vocabulary_value_from_schema():
     prompt = _load_system_prompt()
     assert "{{" not in prompt
-    for key, values in {**FILTER_FIELDS, "细节元素": DETAILS}.items():
+    for key, values in FILTER_FIELDS.items():
         assert f"{key}: [{', '.join(values)}]" in prompt
+    assert "细节元素（分组仅用于组织选项，输出仍为一个列表）：" in prompt
+    for group, values in DETAIL_GROUPS.items():
+        assert f"{group}: [{', '.join(values)}]" in prompt
 
 
 def test_model_output_is_coerced_into_vocabulary():
     tags = _coerce_tags({"品类": "T恤", "风格": "朋克", "领型": " V领 ", "季节": None,
-                         "细节元素": "口袋, 亮片", "一句话描述": "  白色T恤  "})
+                         "细节元素": "口袋, 亮片, 不存在的工艺", "一句话描述": "  白色T恤  "})
     assert (tags.品类, tags.风格, tags.领型, tags.季节) == ("上衣>T恤", "其他", "V领", "其他")
-    assert tags.细节元素 == ["口袋"] and tags.一句话描述 == "白色T恤"
+    assert tags.细节元素 == ["口袋", "亮片"] and tags.一句话描述 == "白色T恤"
 
 
 def test_catalog_filters_on_neckline_and_sleeve(store):

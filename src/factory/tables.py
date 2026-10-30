@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
+from src.db import MYSQL_FACTORY_SCHEMA, exec_script, is_mysql, json_extract
 from src.schema import UNCLASSIFIED_SOURCE, ImageRecord
 
 FACTORY_SCHEMA = """
@@ -36,7 +37,7 @@ CREATE TABLE IF NOT EXISTS style_sales (
     amount REAL NOT NULL,
     style_code TEXT NOT NULL,
     customer TEXT NOT NULL,
-    year TEXT NOT NULL DEFAULT '',
+    `year` TEXT NOT NULL DEFAULT '',
     period TEXT NOT NULL DEFAULT '',
     source_file TEXT NOT NULL DEFAULT '',
     extra_json TEXT NOT NULL DEFAULT '{}',
@@ -48,7 +49,7 @@ CREATE INDEX IF NOT EXISTS style_sales_style ON style_sales(style_code);
 
 
 def ensure_factory(conn) -> None:
-    conn.executescript(FACTORY_SCHEMA)
+    exec_script(conn, MYSQL_FACTORY_SCHEMA if is_mysql(conn) else FACTORY_SCHEMA)
 
 
 def migrate_source_categories(conn) -> None:
@@ -100,8 +101,8 @@ def find_own_factory(conn, style_code: str) -> ImageRecord | None:
     if not style_code:
         return None
     row = conn.execute(
-        "SELECT payload FROM records WHERE json_extract(payload, '$.source_category') = '本厂产品' "
-        "AND json_extract(payload, '$.style_code') = ?",
+        f"SELECT payload FROM records WHERE {json_extract('payload', '$.source_category')} = '本厂产品' "
+        f"AND {json_extract('payload', '$.style_code')} = ?",
         (style_code,),
     ).fetchone()
     return ImageRecord.model_validate_json(row[0]) if row else None

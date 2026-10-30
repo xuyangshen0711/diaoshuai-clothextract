@@ -28,6 +28,7 @@ from PIL import Image
 
 from src.catalog import INDEX_DIR, approved_records, library_records, ensure_data_dirs
 from src.schema import ImageRecord
+from src import storage
 
 INDEX_FILE = "faiss.index"
 META_FILE = "meta.json"
@@ -106,7 +107,7 @@ class LocalLiteBackend:
     dim = LOCAL_DIM
 
     def encode_image(self, image_path: str | Path) -> np.ndarray:
-        return _local_image_vector(Path(image_path))
+        return _local_image_vector(storage.local_file(image_path))
 
     def encode_text(self, text: str) -> np.ndarray:
         return _local_text_vector(text)
@@ -127,7 +128,7 @@ class ClipBackend:
         self.dim = int(probe.shape[0])
 
     def encode_image(self, image_path: str | Path) -> np.ndarray:
-        with MODEL_LOCK, Image.open(image_path) as source:
+        with MODEL_LOCK, Image.open(storage.local_file(image_path)) as source:
             image = source.convert("RGB")
             vec = self.image_model.encode(
                 [image],
@@ -175,7 +176,7 @@ def get_embedding_backend(prefer_clip: bool | None = None):
 
 
 def _image_fingerprint(record):
-    stat = Path(record.image_path).stat()
+    stat = storage.local_file(record.image_path).stat()
     return f"{record.id}:{record.image_path}:{stat.st_size}:{stat.st_mtime_ns}"
 
 
@@ -228,7 +229,7 @@ def build_index(
     dim = getattr(backend, "dim", LOCAL_DIM)
 
     eligible = library_records(records) if include_pending else approved_records(records)
-    usable = [r for r in eligible if Path(r.image_path).exists()]
+    usable = [r for r in eligible if storage.is_file(r.image_path)]
     if not usable:
         meta = {"ids": [], "backend": backend.name, "dim": dim}
         (target / META_FILE).write_text(
@@ -276,7 +277,7 @@ def current_index(records: list[ImageRecord], backend, include_pending: bool = F
     """Refresh index membership after review decisions; share one snapshot per search."""
     with INDEX_LOCK:
         eligible = library_records(records) if include_pending else approved_records(records)
-        usable = [r for r in eligible if Path(r.image_path).exists()]
+        usable = [r for r in eligible if storage.is_file(r.image_path)]
         expected = [r.id for r in usable]
         target = INDEX_DIR / "including-pending" if include_pending else INDEX_DIR
         try:
