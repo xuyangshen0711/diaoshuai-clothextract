@@ -68,6 +68,9 @@ def _sniff_mime(raw: bytes) -> str | None:
 
 
 def _image_data_url(path: Path) -> str:
+    from src.storage import local_file
+
+    path = local_file(path)
     if not path.is_file():
         raise FileNotFoundError(path)
     if path.stat().st_size > MAX_IMAGE_BYTES:
@@ -200,6 +203,8 @@ class DeepSeekTagger:
         raise last_error
 
     def tag(self, image_path: str | Path, context: str = "") -> FashionTags | None:
-        response = self._complete(self._payload(Path(image_path), context))
+        from src.storage import local_file
+
+        response = self._complete(self._payload(local_file(image_path), context))
         message = response.choices[0].message if response.choices else None
         return _tags_from_content(_answer_text(message))

@@ -11,6 +11,8 @@ from uuid import uuid4
 
 from src import catalog
 from src.catalog import CatalogConflict
+from src.db import MYSQL_IMPORT_JOBS, insert_order, is_mysql, on_conflict_update
+from src import storage
 from src.extract.office import extract_from_file
 from src.factory.codes import image_style_code
 from src.factory.excel_io import workbook_table_kind
@@ -35,6 +37,12 @@ def seconds(start, end=None):
 
 
 def _table(conn):
+    # Created with the rest of the schema before the write transaction starts.
+    # Running CREATE on MySQL would implicitly commit that transaction.
+    if is_mysql(conn):
+        if not conn.in_transaction:
+            conn.executescript(MYSQL_IMPORT_JOBS)
+        return
     conn.execute("CREATE TABLE IF NOT EXISTS import_jobs (id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
 
 
@@ -48,8 +56,11 @@ def _get(conn, job_id):
 
 def _put(conn, job):
     job["updated_at"] = now()
-    conn.execute("INSERT INTO import_jobs VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
-                 (job["id"], json.dumps(job, ensure_ascii=False)))
+    conn.execute(
+        "INSERT INTO import_jobs (id, payload) VALUES (?, ?) "
+        + on_conflict_update("id", ["payload"]),
+        (job["id"], json.dumps(job, ensure_ascii=False)),
+    )
 
 
 def get_job(job_id):
@@ -61,7 +72,7 @@ def list_jobs(limit=50):
     with catalog._database() as conn:
         _table(conn)
         return [json.loads(row[0]) for row in conn.execute(
-            "SELECT payload FROM import_jobs ORDER BY rowid DESC" + (" LIMIT ?" if limit else ""),
+            f"SELECT payload FROM import_jobs ORDER BY {insert_order('DESC')}" + (" LIMIT ?" if limit else ""),
             (limit,) if limit else (),
         )]
 
@@ -181,6 +192,8 @@ def _finish(job, status, message, end=None):
 
 
 def _same_file(left, right) -> bool:
+    if storage.is_remote(left) or storage.is_remote(right):
+        return storage.same_bytes(left, right)
     left_path, right_path = Path(left), Path(right)
     if not left_path.is_file() or not right_path.is_file() or left_path.stat().st_size != right_path.stat().st_size:
         return False
@@ -242,7 +255,7 @@ def _tag_replacement(item, tagger, job) -> str:
 def _drop_non_garment(conn, record: ImageRecord, existing: bool):
     """New images are discarded; already-catalogued ones are rejected so their history survives."""
     if not existing:
-        Path(record.image_path).unlink(missing_ok=True)
+        storage.remove(record.image_path)
         return
     record.review_status, record.reviewer = "rejected", "AI"
     record.reviewed_at, record.review_note = now(), NON_GARMENT_NOTE

@@ -179,12 +179,21 @@ def _seed_taxonomy() -> Taxonomy:
 
 
 def _db_key(conn) -> str:
+    from src.db import is_mysql
+
+    if is_mysql(conn):
+        row = conn.execute("SELECT DATABASE()").fetchone()
+        return "mysql:" + str(row[0] if row else "")
     row = conn.execute("PRAGMA database_list").fetchone()
     return str(row[2] if row else "")
 
 
 def _remember(conn, taxonomy: Taxonomy) -> Taxonomy:
+    from src.db import is_mysql
+
     _CACHE[_db_key(conn)] = taxonomy
+    if is_mysql(conn):
+        return taxonomy
     try:
         from pathlib import Path
 
@@ -202,6 +211,15 @@ def active() -> Taxonomy:
     from pathlib import Path
 
     from src import catalog
+    from src.db import mysql_config
+
+    try:
+        settings = mysql_config()
+    except RuntimeError:
+        settings = None
+    if settings:
+        cached = _CACHE.get("mysql:" + settings["database"])
+        return cached if cached is not None else _seed_taxonomy()
 
     for key in (str(catalog.DATABASE_PATH), str(Path(catalog.DATABASE_PATH).resolve())):
         if key in _CACHE:
@@ -210,23 +228,28 @@ def active() -> Taxonomy:
 
 
 def ensure_taxonomy(conn) -> Taxonomy:
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS garment_categories (
-            level1 TEXT NOT NULL,
-            level2 TEXT NOT NULL DEFAULT '',
-            position INTEGER NOT NULL,
-            PRIMARY KEY (level1, level2)
-        );
-        CREATE TABLE IF NOT EXISTS category_synonyms (
-            phrase_key TEXT PRIMARY KEY,
-            phrase TEXT NOT NULL,
-            level1 TEXT NOT NULL,
-            level2 TEXT NOT NULL DEFAULT '',
-            sleeve_length TEXT NOT NULL DEFAULT '',
-            fabric TEXT NOT NULL DEFAULT '',
-            learned INTEGER NOT NULL DEFAULT 0
-        );
-    """)
+    from src.db import MYSQL_TAXONOMY_SCHEMA, exec_script, is_mysql
+
+    if is_mysql(conn):
+        exec_script(conn, MYSQL_TAXONOMY_SCHEMA)
+    else:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS garment_categories (
+                level1 TEXT NOT NULL,
+                level2 TEXT NOT NULL DEFAULT '',
+                position INTEGER NOT NULL,
+                PRIMARY KEY (level1, level2)
+            );
+            CREATE TABLE IF NOT EXISTS category_synonyms (
+                phrase_key TEXT PRIMARY KEY,
+                phrase TEXT NOT NULL,
+                level1 TEXT NOT NULL,
+                level2 TEXT NOT NULL DEFAULT '',
+                sleeve_length TEXT NOT NULL DEFAULT '',
+                fabric TEXT NOT NULL DEFAULT '',
+                learned INTEGER NOT NULL DEFAULT 0
+            );
+        """)
     if conn.execute("SELECT 1 FROM garment_categories LIMIT 1").fetchone() is None:
         conn.executemany(
             "INSERT INTO garment_categories (level1, level2, position) VALUES (?, ?, ?)",
@@ -463,14 +486,16 @@ def save_synonym(conn, phrase: str, level1: str, level2: str = "", sleeve: str =
         _require_node(taxonomy, level1, level2)
     elif not taxonomy.has(UNSORTED, ""):
         raise TaxonomyError("待归类不在品类表里")
+    from src.db import on_conflict_update
+
     conn.execute(
         """
         INSERT INTO category_synonyms (phrase_key, phrase, level1, level2, sleeve_length, fabric, learned)
         VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(phrase_key) DO UPDATE SET
-            phrase=excluded.phrase, level1=excluded.level1, level2=excluded.level2,
-            sleeve_length=excluded.sleeve_length, fabric=excluded.fabric, learned=excluded.learned
-        """,
+        """ + on_conflict_update(
+            "phrase_key",
+            ["phrase", "level1", "level2", "sleeve_length", "fabric", "learned"],
+        ),
         (phrase_key(phrase), phrase, level1, level2, sleeve, fabric, 1 if learned else 0),
     )
     return _remember(conn, read_taxonomy(conn))

@@ -1,16 +1,29 @@
-"""Transactional SQLite catalog and append-only classification/review history."""
+"""Transactional catalog and append-only classification/review history.
+
+The default database is SQLite. DATABASE_URL or MYSQL_* switches the same schema to MySQL.
+"""
 
 from __future__ import annotations
 
 import json
 import os
-import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+from src.db import (
+    MYSQL_CORE_SCHEMA,
+    MYSQL_IMPORT_JOBS,
+    connect,
+    exec_script,
+    insert_order,
+    is_mysql,
+    json_extract,
+    on_conflict_update,
+)
 from src.schema import DesignNotes, FashionTags, ImageRecord, coerce_source_category
+from src.storage import bind_cleanups, is_file, is_remote, publish_record, remove, reset_cleanups
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = Path(os.getenv("CLOTHEXTRACT_DATA_DIR", str(ROOT / "data"))).resolve()
@@ -41,41 +54,61 @@ def _event(conn, record, action, actor="", note="", before=None):
     )
 
 
+_SQLITE_CORE = """
+    CREATE TABLE IF NOT EXISTS records (
+        id TEXT PRIMARY KEY,
+        image_path TEXT NOT NULL UNIQUE,
+        review_status TEXT NOT NULL CHECK(review_status IN ('pending','approved','rejected')),
+        revision INTEGER NOT NULL,
+        payload TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS records_review_status ON records(review_status);
+    CREATE TABLE IF NOT EXISTS review_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        record_id TEXT NOT NULL REFERENCES records(id),
+        action TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        note TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        before_json TEXT,
+        after_json TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS events_record ON review_events(record_id, id);
+    CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY);
+    CREATE TABLE IF NOT EXISTS import_jobs (
+        id TEXT PRIMARY KEY,
+        payload TEXT NOT NULL
+    );
+"""
+
+
+def _ensure_core(conn) -> None:
+    if is_mysql(conn):
+        exec_script(conn, MYSQL_CORE_SCHEMA)
+        exec_script(conn, MYSQL_IMPORT_JOBS)
+    else:
+        exec_script(conn, _SQLITE_CORE)
+
+
 @contextmanager
 def _database():
     ensure_data_dirs()
-    conn = sqlite3.connect(DATABASE_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
+    conn = connect(DATABASE_PATH)
+    cleanups: list[Path] = []
+    token = bind_cleanups(cleanups)
     try:
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS records (
-                id TEXT PRIMARY KEY,
-                image_path TEXT NOT NULL UNIQUE,
-                review_status TEXT NOT NULL CHECK(review_status IN ('pending','approved','rejected')),
-                revision INTEGER NOT NULL,
-                payload TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS records_review_status ON records(review_status);
-            CREATE TABLE IF NOT EXISTS review_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                record_id TEXT NOT NULL REFERENCES records(id),
-                action TEXT NOT NULL,
-                actor TEXT NOT NULL,
-                note TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                before_json TEXT,
-                after_json TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS events_record ON review_events(record_id, id);
-            CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY);
-        """)
+        if not is_mysql(conn):
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA journal_mode=WAL")
+        _ensure_core(conn)
         from src.factory.tables import ensure_factory, migrate_source_categories
         from src.taxonomy import ensure_taxonomy, migrate_record_labels
         ensure_factory(conn)
         ensure_taxonomy(conn)
-        conn.execute("BEGIN IMMEDIATE")
+        if is_mysql(conn):
+            conn.begin()
+        else:
+            conn.execute("BEGIN IMMEDIATE")
         if not conn.execute("SELECT 1 FROM migrations WHERE name='legacy_json'").fetchone():
             if CATALOG_PATH.exists():
                 for item in json.loads(CATALOG_PATH.read_text(encoding="utf-8")):
@@ -88,8 +121,9 @@ def _database():
                         record.ai_tags = record.tags.model_copy(deep=True)
                         record.ai_tags_source = record.tags_source
                     record.revision = 1
+                    publish_record(record)
                     conn.execute(
-                        "INSERT INTO records VALUES (?, ?, ?, ?, ?)",
+                        "INSERT INTO records (id, image_path, review_status, revision, payload) VALUES (?, ?, ?, ?, ?)",
                         (record.id, record.image_path, record.review_status, 1, record.model_dump_json()),
                     )
                     _event(conn, record, "legacy_imported", note="历史 JSON 导入，等待人工审核")
@@ -98,17 +132,20 @@ def _database():
         migrate_record_labels(conn)
         yield conn
         conn.commit()
+        for path in cleanups:
+            path.unlink(missing_ok=True)
     except Exception:
         conn.rollback()
         raise
     finally:
+        reset_cleanups(token)
         conn.close()
 
 
 def load_catalog() -> list[ImageRecord]:
     with _database() as conn:
         return [ImageRecord.model_validate_json(row[0]) for row in conn.execute(
-            "SELECT payload FROM records ORDER BY rowid"
+            f"SELECT payload FROM records ORDER BY {insert_order()}"
         )]
 
 
@@ -124,6 +161,7 @@ def library_records(records: Iterable[ImageRecord]) -> list[ImageRecord]:
 
 
 def _save(conn, record: ImageRecord, action: str | None = None, actor="", note="") -> int:
+    publish_record(record)
     row = conn.execute("SELECT payload FROM records WHERE id=?", (record.id,)).fetchone()
     previous = ImageRecord.model_validate_json(row[0]) if row else None
     if previous and previous.model_dump(exclude={"revision"}) == record.model_dump(exclude={"revision"}):
@@ -136,16 +174,15 @@ def _save(conn, record: ImageRecord, action: str | None = None, actor="", note="
     stored.revision = (previous.revision if previous else 0) + 1
     if stored.source_category == "本厂产品" and stored.style_code:
         clash = conn.execute(
-            "SELECT id FROM records WHERE id != ? AND json_extract(payload, '$.source_category') = '本厂产品' "
-            "AND json_extract(payload, '$.style_code') = ?",
+            f"SELECT id FROM records WHERE id != ? AND {json_extract('payload', '$.source_category')} = '本厂产品' "
+            f"AND {json_extract('payload', '$.style_code')} = ?",
             (stored.id, stored.style_code),
         ).fetchone()
         if clash:
             raise CatalogConflict(f"款号 {stored.style_code} 已有图片")
     conn.execute(
-        "INSERT INTO records VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
-        "image_path=excluded.image_path, review_status=excluded.review_status, "
-        "revision=excluded.revision, payload=excluded.payload",
+        "INSERT INTO records (id, image_path, review_status, revision, payload) VALUES (?, ?, ?, ?, ?) "
+        + on_conflict_update("id", ["image_path", "review_status", "revision", "payload"]),
         (stored.id, stored.image_path, stored.review_status, stored.revision, stored.model_dump_json()),
     )
     _event(conn, stored, action or ("classification_proposed" if previous else "record_created"),
@@ -319,25 +356,29 @@ def assign_garment_category(record_id: str, *, level1: str, level2: str = "", sl
 
 def _adopt_pending_image(record: ImageRecord) -> None:
     pending = record.pending_image_path or ""
-    path = Path(pending)
-    if not path.is_file():
+    if not is_file(pending):
         raise ValueError("待确认的新图片文件已缺失")
     record.image_history.append({
         "image_path": record.image_path,
         "archived_at": datetime.now(timezone.utc).isoformat(),
         "note": "替换前保留的原图",
     })
-    record.image_path = str(path.resolve())
+    record.image_path = pending if is_remote(pending) else str(Path(pending).resolve())
     record.pending_image_path = None
 
 
 def discard_unreferenced_image(path_str: str, record: ImageRecord) -> None:
     if not path_str:
         return
+    if is_remote(path_str):
+        referenced = {record.image_path, *(entry.get("image_path") for entry in record.image_history)}
+        if path_str not in referenced:
+            remove(path_str)
+        return
     path = Path(path_str)
     referenced = {str(Path(item).resolve()) for item in [record.image_path, *(
         entry.get("image_path") for entry in record.image_history
-    )] if item and Path(item).exists()}
+    )] if item and not is_remote(item) and Path(item).exists()}
     try:
         resolved = path.resolve()
         resolved.relative_to(EXTRACTED_DIR.resolve())

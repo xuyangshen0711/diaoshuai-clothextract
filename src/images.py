@@ -10,11 +10,11 @@ from pathlib import Path
 from PIL import Image, ImageOps
 
 from src import catalog
+from src import storage
 
 
-def image_version(path: Path) -> str:
-    stat = path.stat()
-    return f"{stat.st_mtime_ns:x}-{stat.st_size:x}"
+def image_version(path: str | Path) -> str:
+    return storage.version(path)
 
 
 @lru_cache(maxsize=2048)
@@ -24,24 +24,26 @@ def _dimensions(path: str, version: str) -> tuple[int, int]:
         return (height, width) if image.getexif().get(274, 1) in (5, 6, 7, 8) else (width, height)
 
 
-def image_metadata(path: Path) -> dict:
+def image_metadata(path: str | Path) -> dict:
     try:
         version = image_version(path)
-        width, height = _dimensions(str(path), version)
+        local = storage.local_file(path)
+        width, height = _dimensions(str(local), version)
         return {"image_width": width, "image_height": height, "version": version}
     except (OSError, ValueError):
         return {"image_width": None, "image_height": None, "version": "missing"}
 
 
-def thumbnail_path(record_id: str, source: Path) -> Path:
+def thumbnail_path(record_id: str, source: str | Path) -> Path:
     folder = catalog.PROCESSED_DIR / "thumbnails"
     folder.mkdir(parents=True, exist_ok=True)
     # IDs can come from legacy JSON; hash them rather than treating them as paths.
     key = hashlib.sha256(record_id.encode()).hexdigest()[:24]
+    local = storage.local_file(source)
     target = folder / f"{key}-{image_version(source)}.jpg"
     if target.exists():
         return target
-    with Image.open(source) as original:
+    with Image.open(local) as original:
         image = ImageOps.exif_transpose(original)
         image.thumbnail((480, 640), Image.Resampling.LANCZOS)
         if image.mode == "RGBA" or "transparency" in image.info:

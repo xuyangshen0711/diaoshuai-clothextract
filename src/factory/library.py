@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass, field
 
 from src import catalog
+from src.db import insert_order
 from src.factory.codes import OWN_CUSTOMER
 from src.factory.colors import COLOR_FAMILIES, classify_color
 from src.factory.context import set_search_blobs
@@ -65,7 +66,7 @@ def load_index() -> FactoryIndex:
     with catalog._database() as conn:
         for row in conn.execute(
             "SELECT style_code, variant_code, customer, season, needle, series, category, material, colors_json, sizes_json "
-            "FROM style_variants ORDER BY rowid"
+            f"FROM style_variants ORDER BY {insert_order()}"
         ):
             view = VariantView(
                 style_code=row["style_code"], variant_code=row["variant_code"], customer=row["customer"],

@@ -11,7 +11,8 @@
 | 抽图 | `python-pptx` + `openpyxl` + `pymupdf` |
 | 打标 | GPT-4o-mini 或 DeepSeek Flash + JSON Output |
 | 检索 | CLIP（多语言文本塔）+ FAISS |
-| 存储 | 本地图片 + SQLite（含审核状态与操作历史） |
+| 存储 | 默认本地图片 + SQLite。配置 `DATABASE_URL`（或 `MYSQL_*`）后改用阿里云 RDS MySQL；配置 `OSS_*` 后图片改存阿里云 OSS，可选 CDN |
+| 检索索引 | FAISS 文件放在运行服务的那台机器上（ECS 本地磁盘），需要时重建 |
 | 界面 | Vue 3 + FastAPI |
 
 ## 快速开始
@@ -55,11 +56,36 @@ DEEPSEEK_THINKING=true
 python scripts/run_pipeline.py --input data/raw --backend deepseek
 ```
 
-启用 CLIP 语义检索前，在本机准备权重并建索引：
+启用 CLIP 语义检索前，在本机准备权重并建索引。索引文件留在这台机器的 `data/processed/index`，不进数据库，也不进 OSS：
 
 ```bash
 python scripts/prepare_local_search.py --index
 ```
+
+服务已经在跑时，也可以只重建索引：
+
+```bash
+curl -X POST http://127.0.0.1:8520/api/index/rebuild
+```
+
+## 数据库和图片放哪里
+
+什么都不填时，和以前一样：SQLite 文件在 `data/processed/catalog.sqlite3`，图片在 `data/` 下面。
+
+要接到阿里云时，在 `.env` 里填写（示例都是占位符，见 [`.env.example`](.env.example)）：
+
+- `DATABASE_URL` 或 `MYSQL_HOST` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE`：改用 RDS MySQL。只填了一半会直接报错，不会悄悄退回 SQLite。
+- `OSS_ENDPOINT` / `OSS_BUCKET` / `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET`：新图片上传到 OSS。可选 `OSS_CDN_BASE_URL`，配置后页面上的图片地址走 CDN。
+
+已有本机数据可以一次性搬过去：
+
+```bash
+python scripts/init_mysql.py
+python scripts/migrate_sqlite_to_mysql.py
+python scripts/upload_images_to_oss.py
+```
+
+确认 OSS 上的图能打开后，再加 `--delete-local` 删掉已经上传的本地副本。公司服务器的安装步骤、Nginx、systemd 和备份写在 [部署指南](docs/部署指南.md)。
 
 - 前端：<http://127.0.0.1:8518>
 - API：<http://127.0.0.1:8520/docs>

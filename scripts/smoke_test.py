@@ -24,7 +24,9 @@ def main() -> None:
     text_hits = search_by_text(records, "裤装", backend=backend)
     assert text_hits and text_hits[0][0].tags.品类 == "裤装", text_hits[:3]
 
-    sample = next(r for r in records if Path(r.image_path).exists())
+    from src.storage import is_file
+
+    sample = next(r for r in records if is_file(r.image_path))
     image_hits = search_by_image(records, sample.image_path, backend=backend)
     assert image_hits and image_hits[0][0].id == sample.id
 

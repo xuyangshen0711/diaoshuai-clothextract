@@ -14,6 +14,7 @@ from src.factory.excel_io import (
     as_number, cell_at, column_index, find_header, load_sheet_rows, parse_number, plain_text,
     sheet_headers, table_kind_from_headers,
 )
+from src.db import on_conflict_update
 from src.factory.tables import gap_report, now
 
 SALES_COLUMNS = ("款号", "颜色", "尺码", "订单数量", "订单金额")
@@ -64,19 +65,19 @@ def import_sales(path: Path, source_name: str | None = None) -> dict:
     with catalog._database() as conn:
         for item in sales_rows:
             existed = conn.execute(
-                "SELECT 1 FROM style_sales WHERE variant_code=? AND color=? AND size_label=? AND year=? AND period=?",
+                "SELECT 1 FROM style_sales WHERE variant_code=? AND color=? AND size_label=? AND `year`=? AND period=?",
                 (item["variant_code"], item["color"], item["size_label"], item["year"], item["period"]),
             ).fetchone()
             conn.execute(
                 """
                 INSERT INTO style_sales (
                     variant_code, color, size_label, quantity, amount, style_code, customer,
-                    year, period, source_file, extra_json, updated_at
+                    `year`, period, source_file, extra_json, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?)
-                ON CONFLICT(variant_code, color, size_label, year, period) DO UPDATE SET
-                    quantity=excluded.quantity, amount=excluded.amount, style_code=excluded.style_code,
-                    customer=excluded.customer, source_file=excluded.source_file, updated_at=excluded.updated_at
-                """,
+                """ + on_conflict_update(
+                    "variant_code, color, size_label, `year`, period",
+                    ["quantity", "amount", "style_code", "customer", "source_file", "updated_at"],
+                ),
                 (
                     item["variant_code"], item["color"], item["size_label"], item["quantity"], item["amount"],
                     item["style_code"], item["customer"], item["year"], item["period"], source_name, now(),

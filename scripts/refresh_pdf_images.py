@@ -75,10 +75,21 @@ def refresh_pdf_images(*, apply=False):
         if not apply or not plans:
             return report
 
+        from src.db import mysql_config
+        from src.storage import is_remote
+
+        if any(is_remote(record.image_path) for record, _, _ in plans):
+            raise SystemExit("有图片已经在 OSS 上，这个脚本只处理还在本机磁盘上的原图。")
         backup = catalog.DATA_DIR / "backups" / ("image-quality-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:6])
         backup.mkdir(parents=True)
-        with sqlite3.connect(catalog.DATABASE_PATH) as source_db, sqlite3.connect(backup / "catalog.before.sqlite3") as dest_db:
-            source_db.backup(dest_db)
+        if mysql_config():
+            (backup / "database.txt").write_text(
+                "当前数据库是 MySQL，请另外用 mysqldump 备份。此目录只复制了即将替换的图片。\n",
+                encoding="utf-8",
+            )
+        else:
+            with sqlite3.connect(catalog.DATABASE_PATH) as source_db, sqlite3.connect(backup / "catalog.before.sqlite3") as dest_db:
+                source_db.backup(dest_db)
         (backup / "images").mkdir()
         for record, _, _ in plans:
             old = Path(record.image_path)

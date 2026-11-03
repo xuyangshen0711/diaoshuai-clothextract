@@ -25,6 +25,9 @@ def _load_system_prompt() -> str:
 
 
 def _image_data_url(image_path: Path) -> str:
+    from src.storage import local_file
+
+    image_path = local_file(image_path)
     mime, _ = mimetypes.guess_type(str(image_path))
     if mime is None:
         mime = "image/jpeg"
@@ -97,9 +100,11 @@ class OpenAITagger:
         self.system_prompt = _load_system_prompt()
 
     def tag(self, image_path: str | Path, context: str = "") -> FashionTags | None:
-        path = Path(image_path)
-        if not path.exists():
-            raise FileNotFoundError(path)
+        from src.storage import is_file, local_file
+
+        if not is_file(image_path):
+            raise FileNotFoundError(image_path)
+        path = local_file(image_path)
 
         response = self.client.chat.completions.create(
             model=self.model,

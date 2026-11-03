@@ -48,7 +48,9 @@ class MockTagger:
     name = "mock"
 
     def tag(self, image_path: str | Path, context: str = "") -> FashionTags:
-        path = Path(image_path)
+        from src.storage import local_file
+
+        path = local_file(image_path)
         color = _dominant_color_name(path)
         if color not in COLOR:
             color = "其他"
