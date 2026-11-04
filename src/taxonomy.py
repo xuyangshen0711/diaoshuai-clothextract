@@ -15,7 +15,7 @@ _SLEEVE_PREFIXES = ("长袖", "短袖", "中袖", "无袖")
 
 # level1, child names. A row with an empty child is the level itself.
 TREE = (
-    ("上衣", ("套衫", "开衫", "背心/马甲", "T恤", "衬衫", "卫衣")),
+    ("上衣", ("套衫", "假两件套衫", "开衫", "背心/马甲", "T恤", "衬衫", "卫衣")),
     ("外套", ("针织外套", "大衣", "夹克", "西装", "羽绒/棉服")),
     ("连衣裙", ()),
     ("半身裙", ()),
@@ -27,6 +27,7 @@ TREE = (
 # phrase, level1, level2, sleeve, fabric. Covers archive wording and common aliases.
 SEED_SYNONYMS = (
     ("长袖套衫", "上衣", "套衫", "长袖", "针织"),
+    ("假两件套衫", "上衣", "假两件套衫", "长袖", "针织"),
     ("短袖套衫", "上衣", "套衫", "短袖", "针织"),
     ("套衫", "上衣", "套衫", "", "针织"),
     ("套头衫", "上衣", "套衫", "", "针织"),
@@ -264,10 +265,35 @@ def ensure_taxonomy(conn) -> Taxonomy:
                 for phrase, level1, level2, sleeve, fabric in SEED_SYNONYMS
             ],
         )
+    _ensure_builtin_category(conn, "上衣", "假两件套衫", "长袖", "针织", "category_jia_liangjian_v1")
     # Seeding runs before the catalog transaction starts. Close it so BEGIN IMMEDIATE can open.
     if conn.in_transaction:
         conn.commit()
     return _remember(conn, read_taxonomy(conn))
+
+
+def _ensure_builtin_category(conn, level1: str, level2: str, sleeve: str, fabric: str, migration: str) -> None:
+    """Insert one fixed category into databases that were seeded before it existed."""
+    if conn.execute("SELECT 1 FROM migrations WHERE name=?", (migration,)).fetchone():
+        return
+    if not conn.execute(
+        "SELECT 1 FROM garment_categories WHERE level1=? AND level2=?",
+        (level1, level2),
+    ).fetchone():
+        row = conn.execute("SELECT COALESCE(MAX(position), 0) FROM garment_categories").fetchone()
+        position = int(row[0] or 0) + 1
+        conn.execute(
+            "INSERT INTO garment_categories (level1, level2, position) VALUES (?, ?, ?)",
+            (level1, level2, position),
+        )
+    key = phrase_key(level2)
+    if not conn.execute("SELECT 1 FROM category_synonyms WHERE phrase_key=?", (key,)).fetchone():
+        conn.execute(
+            "INSERT INTO category_synonyms (phrase_key, phrase, level1, level2, sleeve_length, fabric, learned) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0)",
+            (key, level2, level1, level2, sleeve, fabric),
+        )
+    conn.execute("INSERT INTO migrations VALUES (?)", (migration,))
 
 
 def read_taxonomy(conn) -> Taxonomy:

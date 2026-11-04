@@ -26,6 +26,7 @@ _COPY_ORDER = (
     "import_jobs",
     "style_variants",
     "style_sales",
+    "style_order_lines",
     "garment_categories",
     "category_synonyms",
 )
@@ -65,7 +66,7 @@ def copy_sqlite_to_mysql(sqlite_path: Path, mysql: MySQLConnection, *, replace: 
     if replace:
         mysql.execute("SET FOREIGN_KEY_CHECKS=0")
         for table in (
-            "review_events", "import_jobs", "style_sales", "style_variants",
+            "review_events", "import_jobs", "style_order_lines", "style_sales", "style_variants",
             "category_synonyms", "garment_categories", "records", "migrations",
         ):
             mysql.execute(f"TRUNCATE TABLE {table}")
