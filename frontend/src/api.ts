@@ -122,8 +122,26 @@ export type FilterMeta = {
   detail_groups: Record<string, string[]>
 }
 
+export type SiteSession = { required: boolean; authenticated: boolean }
+
+let sessionCache: SiteSession | null = null
+
+export function rememberSession(session: SiteSession) {
+  sessionCache = session
+}
+
+function redirectToLogin() {
+  if (window.location.pathname.startsWith('/login')) return
+  const next = window.location.pathname + window.location.search
+  window.location.assign(`/login?next=${encodeURIComponent(next)}`)
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init)
+  if (res.status === 401 && !url.startsWith('/api/login')) {
+    rememberSession({ required: true, authenticated: false })
+    redirectToLogin()
+  }
   if (!res.ok) {
     let detail = res.statusText
     try {
@@ -135,6 +153,27 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     throw new Error(detail)
   }
   return res.json() as Promise<T>
+}
+
+export async function ensureSession(force = false) {
+  if (!force && sessionCache) return sessionCache
+  sessionCache = await request<SiteSession>('/api/auth/session')
+  return sessionCache
+}
+
+export async function loginSite(password: string) {
+  const result = await request<{ ok: boolean; required: boolean }>('/api/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password }),
+  })
+  rememberSession({ required: result.required, authenticated: true })
+  return result
+}
+
+export async function logoutSite() {
+  await request<{ ok: boolean }>('/api/logout', { method: 'POST' })
+  rememberSession({ required: true, authenticated: false })
 }
 
 export function getHealth() {

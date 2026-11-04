@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -76,6 +76,17 @@ from src.tag.tagger import (  # noqa: E402
 from src.images import image_metadata, image_version, thumbnail_path  # noqa: E402
 from src import storage  # noqa: E402
 from src.db import mysql_config  # noqa: E402
+from src.site_gate import (  # noqa: E402
+    COOKIE_NAME,
+    LOGIN_FAILURE,
+    MAX_AGE_SECONDS,
+    SiteGateMiddleware,
+    cookie_is_secure,
+    gate_enabled,
+    issue_token,
+    password_matches,
+    token_is_valid,
+)
 
 ensure_data_dirs()
 
@@ -89,6 +100,8 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="服装内部图片库 API", version="0.4.0", lifespan=lifespan)
+# Added first so CORS stays outside and can still label a 401.
+app.add_middleware(SiteGateMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -218,6 +231,55 @@ class TagJobRequest(BaseModel):
     backend: Literal["openai", "mock", "deepseek"] = "openai"
     overwrite: bool = False
     source_type: str | None = None
+
+
+class LoginBody(BaseModel):
+    password: str = ""
+
+
+def _session_cookie(response: Response, request: Request, token: str) -> None:
+    response.set_cookie(
+        COOKIE_NAME,
+        token,
+        max_age=MAX_AGE_SECONDS,
+        httponly=True,
+        samesite="lax",
+        secure=cookie_is_secure(request),
+        path="/",
+    )
+
+
+def _clear_session_cookie(response: Response, request: Request) -> None:
+    response.delete_cookie(
+        COOKIE_NAME,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=cookie_is_secure(request),
+    )
+
+
+@app.get("/api/auth/session")
+def auth_session(request: Request) -> dict[str, bool]:
+    required = gate_enabled()
+    authenticated = (not required) or token_is_valid(request.cookies.get(COOKIE_NAME))
+    return {"required": required, "authenticated": authenticated}
+
+
+@app.post("/api/login")
+def login(body: LoginBody, request: Request, response: Response) -> dict[str, bool]:
+    if not gate_enabled():
+        return {"ok": True, "required": False}
+    if not password_matches(body.password):
+        raise HTTPException(status_code=401, detail=LOGIN_FAILURE)
+    _session_cookie(response, request, issue_token())
+    return {"ok": True, "required": True}
+
+
+@app.post("/api/logout")
+def logout(request: Request, response: Response) -> dict[str, bool]:
+    _clear_session_cookie(response, request)
+    return {"ok": True}
 
 
 @app.get("/api/health")
