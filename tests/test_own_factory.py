@@ -20,7 +20,7 @@ from src import import_jobs
 from src.factory.codes import image_style_code, parse_style_code
 from src.factory.colors import classify_color, split_colors
 from src.factory.sizes import split_sizes
-from src.schema import FashionTags
+from src.schema import CoverCrop, FashionTags
 from test_review_workflow import approve, make_record, store
 
 FIXTURES = Path(__file__).parent / "fixtures" / "own_factory"
@@ -173,6 +173,8 @@ def test_image_upload_folder_case_replacement_and_filters(store, monkeypatch):
     assert record.notes.款号 == "516083"
     assert record.source.location == "season/516083 .JPG"
     assert record.pending_image_path is None
+    crop = CoverCrop(left=.1, top=.1, right=.9, bottom=.9)
+    record = catalog.update_cover(record.id, crop=crop, expected_revision=record.revision)
 
     upper = _upload(client, "s7529.JPG", _jpeg("green"), "本厂产品")
     assert upper["succeeded"] == 1
@@ -191,6 +193,7 @@ def test_image_upload_folder_case_replacement_and_filters(store, monkeypatch):
     assert "替换图" in replacement["message"]
     pending = next(item for item in catalog.load_catalog() if item.style_code == "516083")
     assert pending.review_status == "pending"
+    assert pending.cover_crop == crop
     assert pending.pending_image_path
     assert Path(pending.image_path).read_bytes() != Path(pending.pending_image_path).read_bytes()
     assert len(catalog.load_catalog()) == 2
@@ -249,6 +252,7 @@ def test_image_upload_folder_case_replacement_and_filters(store, monkeypatch):
     current = next(item for item in swapped if item.id == pending.id)
     assert current.review_status == "approved"
     assert current.pending_image_path is None
+    assert current.cover_crop is None
     assert current.image_history and Path(current.image_history[0]["image_path"]).is_file()
     history = client.get(f"/api/records/{pending.id}").json()["image_history"]
     assert history and client.get(history[0]["url"]).status_code == 200

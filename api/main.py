@@ -60,6 +60,7 @@ from src.schema import (  # noqa: E402
     SOURCE_CATEGORIES,
     UNCLASSIFIED_SOURCE,
     DesignNotes,
+    CoverCrop,
     FashionTags,
     ImageRecord,
     ReviewStatus,
@@ -75,7 +76,7 @@ from src.tag.tagger import (  # noqa: E402
     openai_key_is_placeholder,
     provider_ready,
 )
-from src.images import image_metadata, image_version, thumbnail_path  # noqa: E402
+from src.images import cover_path, cover_version, image_metadata, image_version, thumbnail_path  # noqa: E402
 from src import storage  # noqa: E402
 from src.db import mysql_config  # noqa: E402
 from src.site_gate import (  # noqa: E402
@@ -133,6 +134,7 @@ def _serialize(record: ImageRecord, score: float | None = None, index=None) -> d
         except OSError:
             thumb_cdn = None
     payload["thumbnail_url"] = thumb_cdn or f"{url}?variant=thumbnail&v={version}"
+    payload["cover_url"] = f"{url}?variant=cover&v={cover_version(record)}" if record.cover_crop else payload["thumbnail_url"]
     payload["download_url"] = f"{url}?download=true&v={version}"
     payload["display_tags"] = record.display_tags.model_dump()
     factory = index if index is not None else load_index()
@@ -658,7 +660,7 @@ def rebuild_index() -> dict[str, Any]:
 
 @app.get("/api/records/{record_id}/image")
 def record_image(record_id: str, download: bool = False,
-                 variant: Literal["original", "thumbnail", "pending", "history"] = "original",
+                 variant: Literal["original", "thumbnail", "cover", "pending", "history"] = "original",
                  index: int = 0, v: str | None = None):
     record = get_by_id(load_catalog(), record_id)
     if record is None:
@@ -678,11 +680,29 @@ def record_image(record_id: str, download: bool = False,
     if not storage.is_file(record.image_path):
         raise HTTPException(status_code=404, detail="图片不存在")
     original = storage.local_file(record.image_path)
-    path = thumbnail_path(record.id, record.image_path) if variant == "thumbnail" and not download else original
-    cache = "private, max-age=31536000, immutable" if v == image_version(record.image_path) else "no-cache"
+    if variant == "cover" and not download:
+        path = cover_path(record)
+    else:
+        path = thumbnail_path(record.id, record.image_path) if variant == "thumbnail" and not download else original
+    expected_version = cover_version(record) if variant == "cover" and not download else image_version(record.image_path)
+    cache = "private, max-age=31536000, immutable" if v == expected_version else "no-cache"
     return FileResponse(
         path, filename=storage.file_name(record.image_path) if download else None, headers={"Cache-Control": cache},
     )
+
+
+class CoverUpdate(BaseModel):
+    crop: CoverCrop | None
+    expected_revision: int
+
+
+@app.put("/api/records/{record_id}/cover")
+def update_record_cover(record_id: str, body: CoverUpdate):
+    try:
+        record = catalog_store.update_cover(record_id, crop=body.crop, expected_revision=body.expected_revision)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="款式不存在") from None
+    return _serialize(record)
 
 
 def _source_path(record: ImageRecord) -> Path | None:

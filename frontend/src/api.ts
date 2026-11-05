@@ -20,11 +20,15 @@ export type DesignNotes = Record<(typeof NOTE_FIELDS)[number], string>
 
 export type ReviewStatus = 'pending' | 'approved' | 'rejected'
 
+export type CoverCrop = { left: number; top: number; right: number; bottom: number }
+
 export type CatalogItem = {
   id: string
   image_path: string
   image_url: string
   thumbnail_url: string
+  cover_url?: string
+  cover_crop?: CoverCrop | null
   download_url: string
   image_width: number | null
   image_height: number | null
@@ -383,6 +387,14 @@ export function retryJob(id: string) {
 
 export function getRecord(id: string) {
   return request<CatalogItem>(`/api/records/${encodeURIComponent(id)}`)
+}
+
+export function updateRecordCover(item: CatalogItem, crop: CoverCrop | null) {
+  return request<CatalogItem>(`/api/records/${encodeURIComponent(item.id)}/cover`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ crop, expected_revision: item.revision }),
+  })
 }
 
 export function getSimilarRecords(id: string, includePending = false) {

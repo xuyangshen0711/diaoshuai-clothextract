@@ -11,6 +11,7 @@ import {
 import DesignNotesList from '../components/DesignNotesList.vue'
 import RecordHistory from '../components/RecordHistory.vue'
 import SalesAnalysis from '../components/SalesAnalysis.vue'
+import CoverEditor from '../components/CoverEditor.vue'
 import {
   formatTime,
   importTime,
@@ -301,6 +302,7 @@ async function changeCategory(event: Event) {
           ><span>补单 {{ money(item.sales.replenishment_quantity) }} 件</span>
         </div>
         <div class="product-actions">
+          <CoverEditor :item="item" @updated="item = $event" />
           <RouterLink :to="{ name: 'search', query: { record: item.id } }">找相似款</RouterLink
           ><RouterLink
             :to="{ path: '/review', query: { status: item.review_status, selected: item.id } }"

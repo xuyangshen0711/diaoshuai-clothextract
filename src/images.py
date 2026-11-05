@@ -11,6 +11,7 @@ from PIL import Image, ImageOps
 
 from src import catalog
 from src import storage
+from src.schema import CoverCrop, ImageRecord
 
 
 def image_version(path: str | Path) -> str:
@@ -34,17 +35,36 @@ def image_metadata(path: str | Path) -> dict:
         return {"image_width": None, "image_height": None, "version": "missing"}
 
 
-def thumbnail_path(record_id: str, source: str | Path) -> Path:
+def cover_version(record: ImageRecord) -> str:
+    crop = record.cover_crop.model_dump_json() if record.cover_crop else "full"
+    return f"{image_version(record.image_path)}-{hashlib.sha256(crop.encode()).hexdigest()[:12]}"
+
+
+def cover_path(record: ImageRecord) -> Path:
+    if record.cover_crop is None:
+        return thumbnail_path(record.id, record.image_path)
+    return thumbnail_path(record.id, record.image_path, record.cover_crop)
+
+
+def thumbnail_path(record_id: str, source: str | Path, crop: CoverCrop | None = None) -> Path:
     folder = catalog.PROCESSED_DIR / "thumbnails"
     folder.mkdir(parents=True, exist_ok=True)
     # IDs can come from legacy JSON; hash them rather than treating them as paths.
     key = hashlib.sha256(record_id.encode()).hexdigest()[:24]
     local = storage.local_file(source)
-    target = folder / f"{key}-{image_version(source)}.jpg"
+    crop_key = f"-crop-{hashlib.sha256(crop.model_dump_json().encode()).hexdigest()[:12]}" if crop else ""
+    target = folder / f"{key}-{image_version(source)}{crop_key}.jpg"
     if target.exists():
         return target
     with Image.open(local) as original:
         image = ImageOps.exif_transpose(original)
+        if crop is not None:
+            width, height = image.size
+            image = image.crop((
+                round(crop.left * width), round(crop.top * height),
+                max(round(crop.left * width) + 1, round(crop.right * width)),
+                max(round(crop.top * height) + 1, round(crop.bottom * height)),
+            ))
         image.thumbnail((480, 640), Image.Resampling.LANCZOS)
         if image.mode == "RGBA" or "transparency" in image.info:
             rgba = image.convert("RGBA")

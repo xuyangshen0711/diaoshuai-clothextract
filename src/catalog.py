@@ -22,7 +22,7 @@ from src.db import (
     json_extract,
     on_conflict_update,
 )
-from src.schema import DesignNotes, FashionTags, ImageRecord, coerce_source_category
+from src.schema import CoverCrop, DesignNotes, FashionTags, ImageRecord, coerce_source_category
 from src.storage import bind_cleanups, is_file, is_remote, publish_record, remove, reset_cleanups
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -354,6 +354,21 @@ def assign_garment_category(record_id: str, *, level1: str, level2: str = "", sl
     return record
 
 
+def update_cover(record_id: str, *, crop: CoverCrop | None, expected_revision: int) -> ImageRecord:
+    with _database() as conn:
+        row = conn.execute("SELECT payload FROM records WHERE id=?", (record_id,)).fetchone()
+        if row is None:
+            raise KeyError(record_id)
+        record = ImageRecord.model_validate_json(row[0])
+        if record.revision != expected_revision:
+            raise CatalogConflict("款式已更新，请刷新后再调整封面")
+        record.cover_crop = crop
+        record.touch()
+        revision = _save(conn, record, "cover_updated", note="调整图库封面" if crop else "恢复完整原图封面")
+    record.revision = revision
+    return record
+
+
 def _adopt_pending_image(record: ImageRecord) -> None:
     pending = record.pending_image_path or ""
     if not is_file(pending):
@@ -364,6 +379,7 @@ def _adopt_pending_image(record: ImageRecord) -> None:
         "note": "替换前保留的原图",
     })
     record.image_path = pending if is_remote(pending) else str(Path(pending).resolve())
+    record.cover_crop = None
     record.pending_image_path = None
 
 

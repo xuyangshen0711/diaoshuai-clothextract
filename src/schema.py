@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from src.taxonomy import FABRICS, SLEEVE_LENGTHS, default_labels
 
@@ -189,9 +189,23 @@ class SourceMeta(BaseModel):
 ReviewStatus = Literal["pending", "approved", "rejected"]
 
 
+class CoverCrop(BaseModel):
+    left: float = Field(ge=0, le=1, allow_inf_nan=False)
+    top: float = Field(ge=0, le=1, allow_inf_nan=False)
+    right: float = Field(ge=0, le=1, allow_inf_nan=False)
+    bottom: float = Field(ge=0, le=1, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def valid_rectangle(self):
+        if self.right - self.left < 0.01 or self.bottom - self.top < 0.01:
+            raise ValueError("封面选区的宽度和高度不能小于原图的 1%")
+        return self
+
+
 class ImageRecord(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex[:12])
     image_path: str
+    cover_crop: CoverCrop | None = None
     source: SourceMeta
     # Migrated rows stay 未分类 until someone assigns a 大类. Own-factory photos keep one image per 款号.
     source_category: str = UNCLASSIFIED_SOURCE

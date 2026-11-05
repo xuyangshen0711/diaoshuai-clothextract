@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+from pathlib import Path
 
 import pymupdf
 from fastapi.testclient import TestClient
@@ -100,6 +101,46 @@ def test_preview_original_download_and_cache_version_are_separate(store):
     assert (updated['image_width'], updated['image_height']) == (900, 1440)
     assert Image.open(io.BytesIO(client.get(updated['thumbnail_url']).content)).size == (400, 640)
     assert client.get(f'/api/records/{record.id}/image?variant=unknown').status_code == 422
+
+
+def test_gallery_cover_crop_preserves_original_review_and_thumbnail(store):
+    record = make_record(store)
+    image = Image.new('RGB', (1000, 1000), 'red')
+    image.paste('blue', (500, 0, 1000, 1000))
+    image.save(record.image_path, format='PNG')
+    original = Path(record.image_path).read_bytes()
+    catalog.save_catalog([record])
+    client = TestClient(api.app)
+    before = client.get(f'/api/records/{record.id}').json()
+    crop = {'left': .5, 'top': 0, 'right': 1, 'bottom': 1}
+    response = client.put(f'/api/records/{record.id}/cover', json={
+        'crop': crop, 'expected_revision': before['revision'],
+    })
+    assert response.status_code == 200
+    updated = response.json()
+    assert updated['cover_url'] != before['cover_url']
+    assert updated['thumbnail_url'] == before['thumbnail_url']
+    assert updated['review_status'] == before['review_status']
+    assert updated['display_tags'] == before['display_tags']
+    cover = client.get(updated['cover_url'])
+    with Image.open(io.BytesIO(cover.content)) as preview:
+        assert preview.size == (320, 640)
+        red, green, blue = preview.getpixel((160, 320))
+        assert blue > 245 and red < 10 and green < 10
+    assert 'immutable' in cover.headers['cache-control']
+    assert client.get(updated['download_url']).content == original
+    assert Path(record.image_path).read_bytes() == original
+    assert client.put(f'/api/records/{record.id}/cover', json={
+        'crop': None, 'expected_revision': before['revision'],
+    }).status_code == 409
+    assert client.put(f'/api/records/{record.id}/cover', json={
+        'crop': {**crop, 'right': .4}, 'expected_revision': updated['revision'],
+    }).status_code == 422
+    reset = client.put(f'/api/records/{record.id}/cover', json={
+        'crop': None, 'expected_revision': updated['revision'],
+    }).json()
+    assert reset['cover_crop'] is None
+    assert reset['cover_url'] == before['cover_url']
 
 
 def test_refresh_existing_pdf_preserves_approval_notes_and_ids_without_ai(store, monkeypatch):
