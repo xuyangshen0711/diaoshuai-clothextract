@@ -86,6 +86,61 @@ def workbook_table_kind(path: Path) -> str:
     return table_kind_from_headers(sheet_headers(rows))
 
 
+# Columns that mark the newer 款式档案. 设计款号 already appeared on older exports;
+# 设计师 / 工艺师 / 二级品类 are what make a sheet the new template.
+ARCHIVE_IDENTITY = ("大货款号", "季节", "颜色", "尺码", "原料名称", "一级品类", "系列", "设计款号")
+ARCHIVE_NEW_MARKERS = ("设计师", "工艺师", "二级品类")
+SALES_SUMMARY_IDENTITY = ("款号", "颜色", "尺码", "订单数量", "订单金额")
+SALES_LINE_MARKERS = ("订单分类", "订单日期", "客户", "业务员", "客户款号")
+
+
+def describe_headers(headers: list[str]) -> dict:
+    """Name the sheet the user already chose a button for, plus the columns that decided it.
+
+    This does not choose between 款式档案 and 销量. Each import button asks for its own kind
+    and then tells the old template apart from the new one.
+    """
+    present = [name for name in headers if name]
+    names = set(present)
+    kind = table_kind_from_headers(names)
+    if kind == "archive":
+        new_columns = [name for name in ("设计款号", *ARCHIVE_NEW_MARKERS) if name in names]
+        if any(name in names for name in ARCHIVE_NEW_MARKERS):
+            return {
+                "kind": "archive",
+                "format": "archive_v2",
+                "format_label": "新版款式档案",
+                "evidence_columns": new_columns,
+            }
+        evidence = [name for name in ARCHIVE_IDENTITY if name in names]
+        return {
+            "kind": "archive",
+            "format": "archive",
+            "format_label": "款式档案",
+            "evidence_columns": evidence,
+        }
+    if kind == "sales":
+        order_column = "订单号" if "订单号" in names else ("订单" if "订单" in names else "")
+        if order_column:
+            evidence = []
+            for name in ("订单分类", "订单日期", "客户", order_column, "业务员", "客户款号"):
+                if name in names and name not in evidence:
+                    evidence.append(name)
+            return {
+                "kind": "sales",
+                "format": "sales_lines",
+                "format_label": "ERP 订单明细",
+                "evidence_columns": evidence,
+            }
+        return {
+            "kind": "sales",
+            "format": "sales_summary",
+            "format_label": "销量汇总",
+            "evidence_columns": [name for name in SALES_SUMMARY_IDENTITY if name in names],
+        }
+    return {"kind": "", "format": "", "format_label": "", "evidence_columns": []}
+
+
 def cell_at(row: tuple, index: int | None):
     if index is None or index >= len(row):
         return None

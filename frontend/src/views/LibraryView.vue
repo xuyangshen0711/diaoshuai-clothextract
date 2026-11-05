@@ -35,6 +35,8 @@ const filters = computed(() => ({
   pattern: queryText('pattern'),
   archive_season: queryText('archive_season'),
   color_family: queryText('color_family'),
+  ordered_from: queryText('ordered_from'),
+  ordered_to: queryText('ordered_to'),
 }))
 function setFilter(key: string, value: string) {
   const next = { ...route.query, [key]: value === '全部' ? undefined : value }
@@ -44,7 +46,8 @@ function setFilter(key: string, value: string) {
 const q = computed(() => (typeof route.query.q === 'string' ? route.query.q : ''))
 const reviewStatus = computed(() => ['pending', 'approved'].includes(String(route.query.review_status)) ? String(route.query.review_status) : '')
 const sourceCategory = computed(() => typeof route.query.source_category === 'string' ? route.query.source_category : '全部')
-const sort = computed(() => route.query.sort === 'sales' || route.query.sort === 'amount' ? route.query.sort : 'imported')
+const sort = computed(() => ['sales', 'amount', 'ordered', 'replenishment'].includes(String(route.query.sort)) ? String(route.query.sort) : 'imported')
+const periodOptions = computed(() => libraryMeta.value.factory['下单'] || [])
 const ownFactory = computed(() => sourceCategory.value === '本厂产品')
 const statusOptions = [{ value: '', label: '全部' }, { value: 'pending', label: '未审核' }, { value: 'approved', label: '已审核' }]
 const sourceTabs = computed(() => ['全部', ...libraryMeta.value.source_categories, libraryMeta.value.unclassified])
@@ -79,6 +82,8 @@ const selectedChips = computed(() => {
   if (ownFactory.value && filters.value.sleeve_length !== '全部') chips.push({ key: 'sleeve_length', label: filters.value.sleeve_length })
   if (ownFactory.value && filters.value.fabric !== '全部') chips.push({ key: 'fabric', label: filters.value.fabric })
   if (seasonValue.value !== '全部') chips.push({ key: seasonKey.value, label: seasonValue.value })
+  if (ownFactory.value && filters.value.ordered_from !== '全部') chips.push({ key: 'ordered_from', label: `从 ${filters.value.ordered_from}` })
+  if (ownFactory.value && filters.value.ordered_to !== '全部') chips.push({ key: 'ordered_to', label: `到 ${filters.value.ordered_to}` })
   if (activeColor.value !== '全部') chips.push({ key: colorKey.value, label: activeColor.value })
   if (filters.value.pattern !== '全部') chips.push({ key: 'pattern', label: filters.value.pattern })
   if (!ownFactory.value) {
@@ -91,13 +96,23 @@ const selectedChips = computed(() => {
   return chips
 })
 
-const facetQueryKeys = ['category', 'subcategory', 'sleeve_length', 'fabric', 'color', 'style', 'season', 'fit', 'neckline', 'sleeve', 'pattern', 'archive_season', 'color_family', 'size', 'series', 'needle', 'customer', 'group']
+const facetQueryKeys = ['category', 'subcategory', 'sleeve_length', 'fabric', 'color', 'style', 'season', 'fit', 'neckline', 'sleeve', 'pattern', 'archive_season', 'color_family', 'size', 'series', 'needle', 'customer', 'group', 'ordered_from', 'ordered_to']
 function setSource(value: string) {
   const next = { ...route.query }
   for (const key of facetQueryKeys) delete next[key]
   if (value === '全部') delete next.source_category
   else next.source_category = value
   router.replace({ query: next })
+}
+function categoryLine(item: CatalogItem) {
+  const parts: string[] = []
+  if (item.library_category) parts.push(item.library_category.replace('>', ' · '))
+  if (item.subcategory && !item.library_category?.includes(item.subcategory)) parts.push(item.subcategory)
+  return parts.join(' · ')
+}
+function formatWan(amount: number) {
+  const text = (amount / 10000).toLocaleString('zh-CN', { maximumFractionDigits: 1 })
+  return `${text} 万元`
 }
 function clearFacets() {
   const next = { ...route.query }
@@ -138,6 +153,8 @@ async function load() {
       pattern: filters.value.pattern,
       archive_season: ownFactory.value ? filters.value.archive_season : '',
       color_family: ownFactory.value ? filters.value.color_family : '',
+      ordered_from: ownFactory.value ? filters.value.ordered_from : '',
+      ordered_to: ownFactory.value ? filters.value.ordered_to : '',
       source_category: sourceCategory.value,
       sort: sort.value,
       exclude_samples: true,
@@ -198,6 +215,8 @@ watch(() => route.query, load, { deep: true })
             <option value="imported">最新导入</option>
             <option value="sales">按订单件数</option>
             <option value="amount">按订单金额</option>
+            <option value="ordered">最近下单</option>
+            <option value="replenishment">补单次数</option>
           </select>
         </label>
       </div>
@@ -225,6 +244,23 @@ watch(() => route.query, load, { deep: true })
         <span class="filter-row-label">季节</span>
         <div class="filter-scroll" role="group" aria-label="季节">
           <button v-for="opt in seasonOptions" :key="`s-${opt}`" type="button" class="chip" :aria-pressed="seasonValue === opt" @click="setFilter(seasonKey, opt)">{{ opt }}</button>
+        </div>
+      </div>
+      <div v-if="ownFactory" class="filter-row">
+        <span class="filter-row-label">下单</span>
+        <div class="period-range">
+          <label>从
+            <select aria-label="下单开始" :value="filters.ordered_from" @change="setFilter('ordered_from', ($event.target as HTMLSelectElement).value)">
+              <option value="全部">不限</option>
+              <option v-for="opt in periodOptions" :key="`from-${opt}`" :value="opt">{{ opt }}</option>
+            </select>
+          </label>
+          <label>到
+            <select aria-label="下单结束" :value="filters.ordered_to" @change="setFilter('ordered_to', ($event.target as HTMLSelectElement).value)">
+              <option value="全部">不限</option>
+              <option v-for="opt in periodOptions" :key="`to-${opt}`" :value="opt">{{ opt }}</option>
+            </select>
+          </label>
         </div>
       </div>
       <div class="filter-row">
@@ -289,16 +325,22 @@ watch(() => route.query, load, { deep: true })
           <div class="card-body">
             <div class="card-title-row">
               <strong>{{ item.style_code || item.library_category || item.display_tags.品类 }}</strong>
-              <span v-if="item.style_code">{{ item.library_category || item.display_tags.品类 }}</span>
+              <span v-if="item.seasons?.length">{{ item.seasons.join(' · ') }}</span>
+              <span v-else-if="item.style_code">{{ item.library_category || item.display_tags.品类 }}</span>
               <span v-else-if="item.display_tags.风格">{{ item.display_tags.风格 }}</span>
             </div>
+            <p v-if="item.source_category === '本厂产品' && categoryLine(item)" class="card-meta">{{ categoryLine(item) }}</p>
             <div v-if="item.color_families?.length" class="card-dots" :aria-label="item.color_families.join('、')">
               <span v-for="name in item.color_families" :key="name" class="card-dot" :class="{ light: swatchLight(name) }" :style="{ background: swatchColor(name) }" :title="name"></span>
             </div>
+            <p v-if="item.designer" class="card-quiet">{{ item.designer }}</p>
             <div v-if="item.source_category === '本厂产品'" class="card-pills">
               <span v-if="item.variant_count" class="mini-pill">{{ item.variant_count }} 个客户版本</span>
-              <span class="sold-label">已售 {{ item.sales_quantity.toLocaleString('zh-CN') }} 件</span>
+              <span class="sold-label">{{ item.sales_quantity.toLocaleString('zh-CN') }} 件<template v-if="item.sales_amount"> · {{ formatWan(item.sales_amount) }}</template></span>
             </div>
+            <p v-if="item.last_order_date" class="card-quiet">最近下单 {{ item.last_order_date }}</p>
+            <p v-if="item.order_count" class="card-quiet">{{ item.customer_count }} 家客户 · {{ item.order_count }} 张单</p>
+            <p v-if="item.replenishment_count" class="card-quiet">补单 {{ item.replenishment_count }} 次</p>
           </div>
         </RouterLink>
       </article>

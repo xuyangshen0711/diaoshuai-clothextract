@@ -290,7 +290,7 @@ watch(() => jobs.value.map(job => `${job.id}:${job.status}`).join(','), () => { 
     </section>
     <section class="import-upload factory-import" aria-label="本厂款式档案与销量">
       <h3>本厂款式档案与销量</h3>
-      <p class="meta">这两类 Excel 不抽图、不打标。款式档案按大货款号更新；销量按款号、颜色、尺码覆盖，不会重复累计。请不要把它们和图片放在上面的抽图任务里。</p>
+      <p class="meta">这两类 Excel 不抽图、不打标。款式档案按大货款号更新，新旧表都能导入。销量按订单明细入库，重复导入不会重复计数；旧的汇总表仍可导入，相同款号、颜色、尺码会相加。请不要把它们和图片放在上面的抽图任务里。</p>
       <div class="toolbar">
         <label class="btn" for="archive-file">{{ tableBusy === 'archive' ? '正在导入档案…' : '导入款式档案' }}</label>
         <input id="archive-file" type="file" accept=".xlsx,.xlsm" :disabled="tableBusy !== ''" @change="uploadTable('archive', $event)" />
@@ -300,15 +300,19 @@ watch(() => jobs.value.map(job => `${job.id}:${job.status}`).join(','), () => { 
       <p v-if="tableError" class="error" role="alert">{{ tableError }}</p>
       <div v-if="archiveReport" class="import-report" role="status">
         <strong>款式档案 {{ archiveReport.source_file }}</strong>
-        <p>新增 {{ archiveReport.imported }} 条，更新 {{ archiveReport.updated }} 条，跳过 {{ archiveReport.skipped_rows }} 行，涉及款号 {{ archiveReport.style_codes.length }} 个。</p>
+        <p v-if="archiveReport.format_label">识别为「{{ archiveReport.format_label }}」<template v-if="archiveReport.evidence_columns?.length">，依据列：{{ archiveReport.evidence_columns.join('、') }}</template>。</p>
+        <p>解析 {{ archiveReport.parsed_rows ?? archiveReport.variant_count }} 行，入库 {{ archiveReport.variant_count }} 行（新增 {{ archiveReport.imported }}，更新 {{ archiveReport.updated }}），跳过 {{ archiveReport.skipped_rows }} 行，涉及款号 {{ archiveReport.style_codes.length }} 个。</p>
         <p v-if="archiveReport.warnings?.length" class="meta">{{ archiveReport.warnings.join('；') }}</p>
         <p>有档案、还没有图片的款号：{{ preview(archiveReport.archive_without_image) }}</p>
         <p>已有本厂图片、还没有档案的款号：{{ preview(archiveReport.image_without_archive) }}</p>
       </div>
       <div v-if="salesReport" class="import-report" role="status">
         <strong>销量 {{ salesReport.source_file }}</strong>
-        <p>写入 {{ salesReport.row_count }} 行（新增 {{ salesReport.imported }}，覆盖 {{ salesReport.updated }}），跳过 {{ salesReport.skipped_rows }} 行。</p>
-        <p>本次款号合计 {{ salesReport.stored_quantity?.toLocaleString('zh-CN') }} 件 / {{ salesReport.stored_amount?.toLocaleString('zh-CN') }} 元。</p>
+        <p v-if="salesReport.format_label">识别为「{{ salesReport.format_label }}」<template v-if="salesReport.evidence_columns?.length">，依据列：{{ salesReport.evidence_columns.join('、') }}</template>。</p>
+        <p>解析 {{ salesReport.parsed_rows ?? salesReport.row_count }} 行，入库 {{ salesReport.row_count }} 行（新增 {{ salesReport.imported }}，更新 {{ salesReport.updated }}），跳过 {{ salesReport.skipped_rows }} 行。</p>
+        <p>解析合计 {{ salesReport.parsed_quantity?.toLocaleString('zh-CN') }} 件 / {{ salesReport.parsed_amount?.toLocaleString('zh-CN') }} 元。库内该款合计 {{ salesReport.stored_quantity?.toLocaleString('zh-CN') }} 件 / {{ salesReport.stored_amount?.toLocaleString('zh-CN') }} 元。</p>
+        <p v-if="salesReport.reconcile_note" :class="{ error: salesReport.reconciled === false }">{{ salesReport.reconcile_note }}<template v-if="salesReport.sheet_quantity != null">（表底 {{ salesReport.sheet_quantity.toLocaleString('zh-CN') }} 件 / {{ salesReport.sheet_amount?.toLocaleString('zh-CN') }} 元）</template></p>
+        <p v-if="salesReport.order_count">订单 {{ salesReport.order_count }} 张，客户 {{ salesReport.customer_count }} 家。</p>
         <p>有档案、还没有图片的款号：{{ preview(salesReport.archive_without_image) }}</p>
         <p>已有本厂图片、还没有档案的款号：{{ preview(salesReport.image_without_archive) }}</p>
         <p v-if="salesWithoutLibrary(salesReport).length">有销量、还没有图片或档案的款号：{{ salesGapLabel(salesReport, salesWithoutLibrary(salesReport)) }}。补上图片后就会在图库显示。</p>

@@ -60,10 +60,23 @@ export type CatalogItem = {
   fabric?: string
   archive_category?: string
   category_raw?: string
+  subcategory?: string
+  designer?: string
+  craftsman?: string
+  design_codes?: string[]
+  seasons?: string[]
   sales_quantity: number
   sales_amount: number
   color_families?: string[]
   variant_count?: number
+  order_count?: number
+  customer_count?: number
+  replenishment_count?: number
+  replenishment_quantity?: number
+  first_order_date?: string
+  last_order_date?: string
+  average_price?: number
+  has_order_lines?: boolean
   has_pending_image: boolean
   pending_image_url: string | null
   variants?: StyleVariant[]
@@ -83,14 +96,52 @@ export type StyleVariant = {
   sizes: { label: string; number: string; letter: string }[]
   quantity: number
   amount: number
+  design_code?: string
+  designer?: string
+  craftsman?: string
+  subcategory?: string
+  customer_style_code?: string
+  order_count?: number
+  buyer_count?: number
+  unit_price?: number
+  last_order_date?: string
+  size_span?: string
 }
 
 export type SalesSummary = {
   total_quantity: number
   total_amount: number
+  order_count?: number
+  customer_count?: number
+  average_price?: number
+  replenishment_count?: number
+  replenishment_quantity?: number
+  first_order_date?: string
+  last_order_date?: string
+  has_order_lines?: boolean
   by_color: { name: string; family?: string; quantity: number; amount: number }[]
   by_size: { name: string; quantity: number; amount: number }[]
   by_customer: { variant_code: string; customer: string; season: string; quantity: number; amount: number }[]
+  monthly?: { month: string; order_quantity: number; replenishment_quantity: number }[]
+  heatmap?: { sizes: string[]; rows: { color: string; family?: string; quantities: number[]; total: number }[]; totals: number[]; total: number }
+  top_customers?: { customer: string; variant_code: string; salesperson: string; order_count: number; quantity: number; amount: number; last_order_date: string }[]
+  salespeople?: { name: string; quantity: number; amount: number }[]
+  orders?: OrderLine[]
+}
+
+export type OrderLine = {
+  order_no: string
+  order_kind: string
+  variant_code: string
+  customer: string
+  customer_style_code: string
+  color: string
+  size_label: string
+  quantity: number
+  amount: number
+  order_date: string
+  salesperson: string
+  season: string
 }
 
 export type LibraryMeta = {
@@ -115,6 +166,16 @@ export type TableReport = {
   parsed_amount?: number
   stored_quantity?: number
   stored_amount?: number
+  parsed_rows?: number
+  format?: string
+  format_label?: string
+  evidence_columns?: string[]
+  sheet_quantity?: number | null
+  sheet_amount?: number | null
+  reconciled?: boolean | null
+  reconcile_note?: string
+  order_count?: number
+  customer_count?: number
 }
 
 export type FilterMeta = {
