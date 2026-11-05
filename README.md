@@ -106,7 +106,7 @@ python scripts/upload_images_to_oss.py
 
 导入页支持后台任务进度和失败续跑；审核页支持批次筛选、快捷操作及位置恢复；点击图库图片可查看款式详情、来源、审核记录并下载原图。
 
-详细流程、迁移和测试说明见 [人工审核与 SQLite 存储](docs/review-workflow.md)。本期审核人手动填写，尚未接入登录和角色权限。
+详细流程、迁移和测试说明见 [人工审核与 SQLite 存储](docs/review-workflow.md)。网站可以在 `.env` 里用 `SITE_PASSWORD` 加一把只认密码的门锁，那不是审核账号。审核人仍手动填写姓名，没有角色权限。
 
 ## 本厂产品
 
