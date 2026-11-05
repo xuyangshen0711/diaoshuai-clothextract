@@ -3,7 +3,7 @@ import { computed } from 'vue'
 import { NOTE_FIELDS, type DesignNotes } from '../api'
 
 const props = defineProps<{ notes: DesignNotes | undefined }>()
-const filled = computed(() => NOTE_FIELDS.filter(key => props.notes?.[key]))
+const filled = computed(() => NOTE_FIELDS.filter(key => key !== '款号' && props.notes?.[key]?.trim()))
 </script>
 
 <template>

@@ -1,7 +1,8 @@
 """销量 Excel import.
 
-One stored row per (大货款号, 颜色, 尺码, 年份, 周期). The sample has no date
-column, so year and period stay empty and a re-import overwrites that key.
+One stored row per (大货款号, 颜色, 尺码, 年份, 周期). Repeated order lines
+within a key are summed before upserting, so re-importing the same sheet replaces
+the stored total instead of counting it twice.
 """
 
 from __future__ import annotations
@@ -29,6 +30,12 @@ def parse_sales_rows(path: Path) -> tuple[list[dict], int]:
     if missing:
         raise ValueError("销量表缺少列：" + "、".join(missing))
     indexes = {name: column_index(headers, name) for name in SALES_COLUMNS}
+    year_index = column_index(headers, "年度")
+    if year_index is None:
+        year_index = column_index(headers, "年份")
+    period_index = column_index(headers, "周期")
+    if period_index is None:
+        period_index = column_index(headers, "季节")
     collapsed: dict[tuple, dict] = {}
     skipped = 0
     for row in rows[header_index + 1:]:
@@ -43,18 +50,25 @@ def parse_sales_rows(path: Path) -> tuple[list[dict], int]:
         if code is None or quantity is None or amount is None or not color or not size_label:
             skipped += 1
             continue
-        key = (code.raw, color, size_label, "", "")
-        collapsed[key] = {
-            "variant_code": code.raw,
-            "style_code": code.base,
-            "customer": code.customer,
-            "color": color,
-            "size_label": size_label,
-            "quantity": int(round(quantity)),
-            "amount": float(amount),
-            "year": "",
-            "period": "",
-        }
+        year = plain_text(cell_at(row, year_index))
+        period = plain_text(cell_at(row, period_index))
+        key = (code.raw, color, size_label, year, period)
+        item = collapsed.get(key)
+        if item is None:
+            collapsed[key] = {
+                "variant_code": code.raw,
+                "style_code": code.base,
+                "customer": code.customer,
+                "color": color,
+                "size_label": size_label,
+                "quantity": int(round(quantity)),
+                "amount": float(amount),
+                "year": year,
+                "period": period,
+            }
+        else:
+            item["quantity"] += int(round(quantity))
+            item["amount"] += float(amount)
     return list(collapsed.values()), skipped
 
 

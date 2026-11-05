@@ -2,7 +2,6 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { assignSourceCategory, getCatalog, getFilters, getLibraryMeta, getTaxonomy, type CatalogItem, type FilterMeta, type LibraryMeta, type Taxonomy } from '../api'
-import { swatchColor, swatchLight } from '../utils/source'
 
 const route = useRoute()
 const router = useRouter()
@@ -17,6 +16,7 @@ const taxonomy = ref<Taxonomy>({ unsorted: '待归类', sleeves: [], fabrics: []
 const bulkCategory = ref('本厂产品')
 const bulkMessage = ref('')
 const queryDraft = ref('')
+const viewMode = ref<'grid' | 'list'>('grid')
 let searchTimer = 0
 
 const FACTORY_COLORS = ['红', '橙', '黄', '绿', '蓝', '紫', '粉', '棕咖', '米白', '灰', '黑', '白', '其他']
@@ -56,14 +56,18 @@ const subcategoryOptions = computed(() => {
 const seasonKey = computed(() => ownFactory.value ? 'archive_season' : 'season')
 const seasonValue = computed(() => ownFactory.value ? filters.value.archive_season : filters.value.season)
 const seasonOptions = computed(() => ['全部', ...(ownFactory.value ? libraryMeta.value.factory['季节'] || [] : meta.value.fields['季节'] || [])])
+const sleeveKey = computed(() => ownFactory.value ? 'sleeve_length' : 'sleeve')
+const sleeveValue = computed(() => ownFactory.value ? filters.value.sleeve_length : filters.value.sleeve)
+const sleeveLabel = computed(() => ownFactory.value ? '袖长' : '袖型')
+const sleeveOptions = computed(() => ['全部', ...(ownFactory.value ? taxonomy.value.sleeves : meta.value.fields['袖型'] || [])])
 const colorKey = computed(() => ownFactory.value ? 'color_family' : 'color')
 const activeColor = computed(() => ownFactory.value ? filters.value.color_family : filters.value.color)
-const swatches = computed(() => {
+const colorOptions = computed(() => {
   const order = ownFactory.value ? FACTORY_COLORS : (meta.value.fields['颜色主色调'] || [])
-  const names = order.filter(name => colorCounts.value[name])
+  const names = order.filter(name => ownFactory.value || colorCounts.value[name])
   for (const name of Object.keys(colorCounts.value)) if (!names.includes(name)) names.push(name)
   if (activeColor.value !== '全部' && !names.includes(activeColor.value)) names.push(activeColor.value)
-  return names.map(name => ({ name, count: colorCounts.value[name] || 0 }))
+  return ['全部', ...names]
 })
 const extraFilters = computed(() => [
   ['style', '风格', meta.value.fields['风格'] || []],
@@ -80,6 +84,7 @@ const selectedChips = computed(() => {
   if (ownFactory.value && filters.value.fabric !== '全部') chips.push({ key: 'fabric', label: filters.value.fabric })
   if (seasonValue.value !== '全部') chips.push({ key: seasonKey.value, label: seasonValue.value })
   if (activeColor.value !== '全部') chips.push({ key: colorKey.value, label: activeColor.value })
+  if (reviewStatus.value) chips.push({ key: 'review_status', label: reviewStatus.value === 'pending' ? '未审核' : '已审核' })
   if (filters.value.pattern !== '全部') chips.push({ key: 'pattern', label: filters.value.pattern })
   if (!ownFactory.value) {
     for (const [key, , options] of extraFilters.value) {
@@ -91,7 +96,7 @@ const selectedChips = computed(() => {
   return chips
 })
 
-const facetQueryKeys = ['category', 'subcategory', 'sleeve_length', 'fabric', 'color', 'style', 'season', 'fit', 'neckline', 'sleeve', 'pattern', 'archive_season', 'color_family', 'size', 'series', 'needle', 'customer', 'group']
+const facetQueryKeys = ['category', 'subcategory', 'sleeve_length', 'fabric', 'color', 'style', 'season', 'fit', 'neckline', 'sleeve', 'pattern', 'archive_season', 'color_family', 'size', 'series', 'needle', 'customer', 'group', 'review_status']
 function setSource(value: string) {
   const next = { ...route.query }
   for (const key of facetQueryKeys) delete next[key]
@@ -186,7 +191,7 @@ watch(() => route.query, load, { deep: true })
     <h2 class="visually-hidden">款式列表</h2>
     <div class="library-filters">
       <div class="library-top">
-        <div class="source-tabs filter-scroll" role="group" aria-label="资料大类">
+        <div class="source-tabs library-source-tabs filter-scroll" role="group" aria-label="资料大类">
           <button v-for="item in sourceTabs" :key="item" type="button" :aria-pressed="sourceCategory === item" @click="setSource(item)">{{ item }}</button>
         </div>
         <form class="library-search" @submit.prevent="applySearch(queryDraft)">
@@ -202,68 +207,65 @@ watch(() => route.query, load, { deep: true })
         </label>
       </div>
 
-      <div class="filter-row">
-        <span class="filter-row-label">品类</span>
-        <div class="filter-scroll" role="group" aria-label="品类">
-          <button v-for="opt in level1Options" :key="`c-${opt}`" type="button" class="chip" :aria-pressed="filters.category === opt" @click="setFilter('category', opt)">{{ opt }}</button>
+      <div class="library-filterbar">
+        <div class="library-select-filters">
+          <label class="compact-filter" for="library-category">品类
+            <select id="library-category" :value="filters.category" @change="setFilter('category', ($event.target as HTMLSelectElement).value)">
+              <option v-for="option in level1Options" :key="option" :value="option">{{ option }}</option>
+            </select>
+          </label>
+          <label class="compact-filter" for="library-sleeve">{{ sleeveLabel }}
+            <select id="library-sleeve" :value="sleeveValue" @change="setFilter(sleeveKey, ($event.target as HTMLSelectElement).value)">
+              <option v-for="option in sleeveOptions" :key="option" :value="option">{{ option }}</option>
+            </select>
+          </label>
+          <label class="compact-filter" for="library-season">季节
+            <select id="library-season" :value="seasonValue" @change="setFilter(seasonKey, ($event.target as HTMLSelectElement).value)">
+              <option v-for="option in seasonOptions" :key="option" :value="option">{{ option }}</option>
+            </select>
+          </label>
+          <label class="compact-filter" for="library-color">颜色
+            <select id="library-color" :value="activeColor" @change="setFilter(colorKey, ($event.target as HTMLSelectElement).value)">
+              <option v-for="option in colorOptions" :key="option" :value="option">{{ option }}</option>
+            </select>
+          </label>
+          <details class="more-filters">
+            <summary>更多筛选</summary>
+            <div class="advanced-filters">
+              <label v-if="subcategoryOptions.length" class="compact-filter" for="library-subcategory">二级品类
+                <select id="library-subcategory" :value="filters.subcategory" @change="setFilter('subcategory', ($event.target as HTMLSelectElement).value)">
+                  <option v-for="option in subcategoryOptions" :key="option" :value="option">{{ option }}</option>
+                </select>
+              </label>
+              <div v-if="ownFactory" class="filter-row">
+                <span class="filter-row-label">面料</span>
+                <div class="filter-scroll" role="group" aria-label="面料">
+                  <button type="button" class="chip" :aria-pressed="filters.fabric === '全部'" @click="setFilter('fabric', '全部')">全部</button>
+                  <button v-for="option in taxonomy.fabrics" :key="`fabric-${option}`" type="button" class="chip" :aria-pressed="filters.fabric === option" @click="setFilter('fabric', option)">{{ option }}</button>
+                </div>
+              </div>
+              <div v-for="[key, label, options] in extraFilters" v-show="!ownFactory || key === 'pattern'" :key="key" class="filter-row">
+                <span class="filter-row-label">{{ label }}</span>
+                <div class="filter-scroll" role="group" :aria-label="label">
+                  <button type="button" class="chip" :aria-pressed="filters[key] === '全部'" @click="setFilter(key, '全部')">全部</button>
+                  <button v-for="option in options" :key="`${key}-${option}`" type="button" class="chip" :aria-pressed="filters[key] === option" @click="setFilter(key, option)">{{ option }}</button>
+                </div>
+              </div>
+              <div class="filter-row">
+                <span class="filter-row-label">审核状态</span>
+                <div class="library-status-filter" role="group" aria-label="按审核状态筛选">
+                  <button v-for="option in statusOptions" :key="option.value || 'all'" type="button" :aria-pressed="reviewStatus === option.value" @click="setFilter('review_status', option.value || '全部')">{{ option.label }}</button>
+                </div>
+              </div>
+            </div>
+          </details>
         </div>
-      </div>
-      <div v-if="subcategoryOptions.length" class="filter-row">
-        <span class="filter-row-label">二级</span>
-        <div class="filter-scroll" role="group" aria-label="二级品类">
-          <button v-for="opt in subcategoryOptions" :key="`sub-${opt}`" type="button" class="chip" :aria-pressed="filters.subcategory === opt" @click="setFilter('subcategory', opt)">{{ opt }}</button>
-        </div>
-      </div>
-      <div v-if="ownFactory" class="filter-row">
-        <span class="filter-row-label">袖长</span>
-        <div class="filter-scroll" role="group" aria-label="袖长">
-          <button type="button" class="chip" :aria-pressed="filters.sleeve_length === '全部'" @click="setFilter('sleeve_length', '全部')">全部</button>
-          <button v-for="opt in taxonomy.sleeves" :key="`sleeve-${opt}`" type="button" class="chip" :aria-pressed="filters.sleeve_length === opt" @click="setFilter('sleeve_length', opt)">{{ opt }}</button>
-        </div>
-      </div>
-      <div class="filter-row">
-        <span class="filter-row-label">季节</span>
-        <div class="filter-scroll" role="group" aria-label="季节">
-          <button v-for="opt in seasonOptions" :key="`s-${opt}`" type="button" class="chip" :aria-pressed="seasonValue === opt" @click="setFilter(seasonKey, opt)">{{ opt }}</button>
-        </div>
-      </div>
-      <div class="filter-row">
-        <span class="filter-row-label">颜色</span>
-        <div class="filter-scroll swatch-row" role="group" aria-label="颜色">
-          <button v-for="swatch in swatches" :key="swatch.name" type="button" class="swatch" :class="{ light: swatchLight(swatch.name) }" :style="{ background: swatchColor(swatch.name) }" :aria-pressed="activeColor === swatch.name" :aria-label="`${swatch.name}，${swatch.count} 款`" @click="setFilter(colorKey, activeColor === swatch.name ? '全部' : swatch.name)">
-            <span class="swatch-tip">{{ swatch.name }} · {{ swatch.count }} 款</span>
-          </button>
-          <span v-if="!swatches.length" class="meta">暂无颜色</span>
-        </div>
-      </div>
-      <details class="more-filters">
-        <summary>更多筛选</summary>
-        <div v-if="ownFactory" class="filter-row">
-          <span class="filter-row-label">面料</span>
-          <div class="filter-scroll" role="group" aria-label="面料">
-            <button type="button" class="chip" :aria-pressed="filters.fabric === '全部'" @click="setFilter('fabric', '全部')">全部</button>
-            <button v-for="opt in taxonomy.fabrics" :key="`fabric-${opt}`" type="button" class="chip" :aria-pressed="filters.fabric === opt" @click="setFilter('fabric', opt)">{{ opt }}</button>
+        <div class="library-tools">
+          <p class="meta" role="status">{{ loading ? '正在统计…' : count > 0 && count <= 3 ? `当前结果共 ${count} 款` : `共 ${count} 款` }}</p>
+          <div class="library-view-switch" role="group" aria-label="款式显示方式">
+            <button type="button" :aria-pressed="viewMode === 'grid'" @click="viewMode = 'grid'">网格</button>
+            <button type="button" :aria-pressed="viewMode === 'list'" @click="viewMode = 'list'">列表</button>
           </div>
-        </div>
-        <div v-for="[key, label, options] in extraFilters" v-show="!ownFactory || key === 'pattern'" :key="key" class="filter-row">
-          <span class="filter-row-label">{{ label }}</span>
-          <div class="filter-scroll" role="group" :aria-label="label">
-            <button type="button" class="chip" :aria-pressed="filters[key] === '全部'" @click="setFilter(key, '全部')">全部</button>
-            <button v-for="opt in options" :key="`${key}-${opt}`" type="button" class="chip" :aria-pressed="filters[key] === opt" @click="setFilter(key, opt)">{{ opt }}</button>
-          </div>
-        </div>
-      </details>
-
-      <div class="library-selected">
-        <div class="selected-chips">
-          <button v-for="chip in selectedChips" :key="chip.key" type="button" class="selected-chip" @click="setFilter(chip.key, '全部')">{{ chip.label }} <span aria-hidden="true">×</span><span class="visually-hidden">移除</span></button>
-          <button v-if="selectedChips.length" id="library-clear" type="button" class="text-button" @click="clearFacets">清空</button>
-        </div>
-        <div class="library-selected-side">
-          <div class="library-status-filter" role="group" aria-label="按审核状态筛选">
-            <button v-for="option in statusOptions" :key="option.value || 'all'" type="button" :aria-pressed="reviewStatus === option.value" @click="setFilter('review_status', option.value || '全部')">{{ option.label }}</button>
-          </div>
-          <p class="meta" role="status">共 {{ loading ? '…' : count }} 款</p>
           <details class="quiet-more">
             <summary>更多</summary>
             <div class="quiet-more-body">
@@ -277,28 +279,34 @@ watch(() => route.query, load, { deep: true })
           </details>
         </div>
       </div>
+
+      <div v-if="selectedChips.length" class="library-selected">
+        <div class="selected-chips">
+          <button v-for="chip in selectedChips" :key="chip.key" type="button" class="selected-chip" @click="setFilter(chip.key, '全部')">{{ chip.label }} <span aria-hidden="true">×</span><span class="visually-hidden">移除</span></button>
+          <button id="library-clear" type="button" class="text-button" @click="clearFacets">清空筛选</button>
+        </div>
+      </div>
     </div>
 
     <div v-if="error" class="error">{{ error }}</div>
-    <div v-if="!items.length && !loading && !error" class="empty">暂无匹配款式。可调整筛选，或<RouterLink to="/import" class="review-text-link">导入新资料</RouterLink>。</div>
-    <div v-else class="grid">
-      <article v-for="item in items" :key="item.id" class="card">
-        <RouterLink class="card-link" :to="{ name: 'record', params: { id: item.id }, query: { from: route.fullPath } }">
-          <span class="library-review-badge" :class="item.review_status">{{ item.review_status === 'approved' ? '已审核' : '未审核' }}</span>
-          <img :src="item.thumbnail_url || item.image_url" :alt="item.style_code || item.library_category || item.display_tags.品类" loading="lazy" width="180" height="240" />
-          <div class="card-body">
-            <div class="card-title-row">
+    <div v-else-if="loading && !items.length" class="library-empty" role="status">正在读取款式…</div>
+    <div v-else-if="!items.length" class="library-empty">
+      <p class="library-empty-title">{{ count === 0 && !q && !selectedChips.length ? '图库还没有款式' : '暂无匹配款式' }}</p>
+      <p>导入服装图片、PPT、Excel 或 PDF 后，款式会显示在这里。</p>
+      <RouterLink to="/import" class="review-text-link">导入新资料</RouterLink>
+    </div>
+    <div v-else class="library-grid" :class="{ 'is-list': viewMode === 'list', 'is-sparse': viewMode === 'grid' && items.length <= 3 }">
+      <article v-for="item in items" :key="item.id" class="library-card">
+        <RouterLink class="library-card-link" :to="{ name: 'record', params: { id: item.id }, query: { from: route.fullPath } }">
+          <img class="library-card-image" :src="item.thumbnail_url || item.image_url" :alt="item.style_code || item.library_category || item.display_tags.品类" loading="lazy" width="315" height="357" />
+          <div class="library-card-caption">
+            <div v-if="viewMode !== 'list'" class="library-card-description">
               <strong>{{ item.style_code || item.library_category || item.display_tags.品类 }}</strong>
-              <span v-if="item.style_code">{{ item.library_category || item.display_tags.品类 }}</span>
-              <span v-else-if="item.display_tags.风格">{{ item.display_tags.风格 }}</span>
+              <span class="library-card-divider" aria-hidden="true">|</span>
+              <span>{{ item.library_category || item.display_tags.品类 }}</span>
             </div>
-            <div v-if="item.color_families?.length" class="card-dots" :aria-label="item.color_families.join('、')">
-              <span v-for="name in item.color_families" :key="name" class="card-dot" :class="{ light: swatchLight(name) }" :style="{ background: swatchColor(name) }" :title="name"></span>
-            </div>
-            <div v-if="item.source_category === '本厂产品'" class="card-pills">
-              <span v-if="item.variant_count" class="mini-pill">{{ item.variant_count }} 个客户版本</span>
-              <span class="sold-label">已售 {{ item.sales_quantity.toLocaleString('zh-CN') }} 件</span>
-            </div>
+            <span v-if="viewMode === 'list'" class="visually-hidden">{{ item.review_status === 'approved' ? '已审核' : '未审核' }}</span>
+            <span v-else class="library-review-badge" :class="item.review_status">{{ item.review_status === 'approved' ? '已审核' : '未审核' }}</span>
           </div>
         </RouterLink>
       </article>

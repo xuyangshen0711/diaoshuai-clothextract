@@ -239,8 +239,8 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
       <RouterLink to="/import" class="btn">导入资料</RouterLink>
       <RouterLink to="/" class="btn">查看主页图库</RouterLink>
     </div>
-    <div v-else-if="items.length" class="review-workspace">
-      <aside class="review-queue" aria-label="图片审核队列">
+    <div v-else-if="items.length" class="review-workspace" :class="{ 'review-workspace--compact-queue': items.length <= 3 }">
+      <aside v-if="total > 1" class="review-queue" aria-label="图片审核队列">
         <p class="meta">共 {{ total }} 张，第 {{ page }} 页</p>
         <button v-for="item in items" :key="item.id" class="review-queue-item"
           :class="{ selected: selectedId === item.id }" :aria-pressed="selectedId === item.id"
@@ -252,15 +252,21 @@ onUnmounted(() => { window.removeEventListener('keydown', onKey); window.removeE
             <small v-if="item.has_pending_image">待确认替换图</small>
             <small v-else>{{ item.source.location }}</small></span>
         </button>
-        <div class="toolbar review-pagination">
+        <div v-if="total > 30" class="toolbar review-pagination">
           <button class="btn" :disabled="page === 1 || saving" @click="changePage(-1)">上一页</button>
           <button class="btn" :disabled="page * 30 >= total || saving" @click="changePage(1)">下一页</button>
         </div>
       </aside>
       <div v-if="current" class="review-content">
-        <div class="review-navigation"><span>第 {{ position }} / {{ total }} 张<span v-if="dirty" class="unsaved-mark"> · 有未提交修改</span></span><div class="toolbar">
-          <button class="btn" :disabled="saving || position <= 1" @click="move(-1)">上一张</button><button class="btn" :disabled="saving || position >= total" @click="move(1)">下一张</button>
+        <div class="review-navigation review-sticky-navigation"><span>第 {{ position }} / {{ total }} 张<span v-if="dirty" class="unsaved-mark"> · 有未提交修改</span></span><div class="toolbar">
+          <button v-if="total > 1" class="btn" :disabled="saving || position <= 1" @click="move(-1)">上一张</button><button v-if="total > 1" class="btn" :disabled="saving || position >= total" @click="move(1)">下一张</button>
           <RouterLink class="btn" :to="{ name: 'record', params: { id: current.id }, query: { from: route.fullPath } }">款式详情</RouterLink>
+          <template v-if="editable">
+            <button class="btn primary" type="button" :disabled="saving" @click="decide('approve')">{{ saving ? '提交中…' : current.has_pending_image ? '通过并替换图片' : edited ? '修改后通过' : '直接通过' }}</button>
+            <button class="btn" type="button" :disabled="saving" @click="move(1, true)">暂时跳过</button>
+            <button class="btn review-reject" type="button" :disabled="saving" @click="decide('reject')">驳回</button>
+          </template>
+          <button v-else class="btn" type="button" :disabled="saving" @click="decide('resubmit')">重新提交审核</button>
         </div></div>
         <p class="meta review-shortcuts">← / → 切图 · A 通过 · S 暂时跳过（在输入框外使用）</p>
         <div class="review-detail" :key="current.id">

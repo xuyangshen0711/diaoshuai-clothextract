@@ -67,6 +67,7 @@ export type CatalogItem = {
   has_pending_image: boolean
   pending_image_url: string | null
   variants?: StyleVariant[]
+  sales_details?: SalesDetail[]
   sales?: SalesSummary | null
   image_history?: { url: string; archived_at?: string | null; note?: string }[]
 }
@@ -81,6 +82,20 @@ export type StyleVariant = {
   material: string
   colors: { name: string; family: string }[]
   sizes: { label: string; number: string; letter: string }[]
+  quantity: number
+  amount: number
+  sales_by_color?: { name: string; family?: string; quantity: number; amount: number }[]
+  sales_by_size?: { name: string; quantity: number; amount: number }[]
+}
+
+export type SalesDetail = {
+  variant_code: string
+  customer: string
+  year: string
+  period: string
+  color: string
+  family: string
+  size_label: string
   quantity: number
   amount: number
 }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { getHealth, getLibraryMeta, getRecord, getSimilarRecords, searchImage, searchText, type LibraryMeta, type SearchInfo } from '../api'
 import { searchMode as mode, searchQuery as query, searchFile as file, searchItems as items,
@@ -14,6 +14,10 @@ const embeddingBackend = ref('')
 const libraryMeta = ref<LibraryMeta>({ source_categories: ['本厂产品', '网图趋势', '品牌资料包', '市调拍照'], unclassified: '未分类', factory: {} })
 const examples = ['秋日法式，奶油色，松弛感', '极简通勤的羊毛外套', '周末休闲，不要红色']
 const sourceTabs = () => ['全部', ...libraryMeta.value.source_categories, libraryMeta.value.unclassified]
+const canSearch = computed(() => mode.value === 'text' ? Boolean(query.value.trim()) : Boolean(file.value || referenceId.value))
+const searchPrerequisiteHint = computed(() => mode.value === 'text'
+  ? '请输入风格、场景或款式描述后再搜索。'
+  : '请选择参考图片，或从图库款式详情发起以图搜款。')
 onMounted(async () => {
   try { libraryMeta.value = await getLibraryMeta() } catch { /* 筛选仍可用全部 */ }
   try { embeddingBackend.value = (await getHealth()).embedding_backend || '' } catch { /* 引擎名称留到检索返回 */ }
@@ -104,18 +108,26 @@ watch(() => route.fullPath, async () => {
   <main class="panel search-page">
     <div class="page-head"><div><h2>{{ mode === 'image' ? '以图找款' : '灵感找款' }}</h2>
       <p class="meta">{{ mode === 'text' ? '写下风格、氛围、穿着场景，也可以补充颜色、材质和不想要的元素。' : '上传参考图，或以图库中的款式为参考寻找相似款。' }}</p></div></div>
-    <div class="inspiration-modes" role="group" aria-label="检索方式">
-      <button class="btn" :aria-pressed="mode === 'text'" @click="switchMode('text')">灵感文字</button>
-      <button class="btn" :aria-pressed="mode === 'image'" @click="switchMode('image')">参考图片</button>
+    <div class="inspiration-modes library-view-switch" role="group" aria-label="检索方式">
+      <button :aria-pressed="mode === 'text'" @click="switchMode('text')">灵感文字</button>
+      <button :aria-pressed="mode === 'image'" @click="switchMode('image')">参考图片</button>
     </div>
     <form class="inspiration-form" @submit.prevent="submitSearch">
       <label v-if="mode === 'text'" for="inspiration-query" class="visually-hidden">灵感描述</label>
       <input v-if="mode === 'text'" id="inspiration-query" v-model="query" type="search" maxlength="500" placeholder="例如：秋日法式，奶油色，松弛感" />
-      <input v-else type="file" accept="image/*" aria-label="上传参考图" @change="onFile" />
-      <button class="btn primary" type="submit" :disabled="loading">{{ loading ? '正在找款…' : '搜索款式' }}</button>
+      <label v-else class="search-image-picker">
+        <input class="search-image-picker-input" type="file" accept="image/*" aria-label="上传参考图" @change="onFile" />
+        <span class="search-image-picker-action">选择图片</span>
+        <span class="search-image-picker-copy">
+          <strong>{{ file?.name || (referenceId ? referenceTitle : '尚未选择图片') }}</strong>
+          <small>{{ file ? '已选择文件 · 点击此处可更换' : referenceId ? '当前参考图库中的款式' : '支持 JPG、PNG、WEBP 等常见图片格式' }}</small>
+        </span>
+      </label>
+      <button class="btn primary" type="submit" :disabled="loading || !canSearch">{{ loading ? '正在找款…' : '搜索款式' }}</button>
     </form>
-    <div v-if="mode === 'text'" class="inspiration-examples" role="group" aria-label="灵感示例"><span>试试看</span><button v-for="example in examples" :key="example" type="button" :disabled="loading" @click="useExample(example)">{{ example }}</button></div>
-    <div class="source-tabs" role="group" aria-label="资料大类">
+    <p v-if="!canSearch && !loading" class="meta search-action-hint" role="status">{{ searchPrerequisiteHint }}</p>
+    <div v-if="mode === 'text'" class="inspiration-examples" role="group" aria-label="灵感示例"><span>试试看</span><button v-for="example in examples" :key="example" class="chip" type="button" :disabled="loading" @click="useExample(example)">{{ example }}</button></div>
+    <div class="source-tabs library-source-tabs search-source-tabs" :class="{ 'search-source-tabs--image': mode === 'image' }" role="group" aria-label="资料大类">
       <button v-for="item in sourceTabs()" :key="item" type="button" :aria-pressed="sourceCategory() === item" @click="setSource(item)">{{ item }}</button>
     </div>
     <div class="inspiration-options"><label><input v-model="includePending" type="checkbox" @change="submitSearch" />包含未审核图片</label>
@@ -125,7 +137,10 @@ watch(() => route.fullPath, async () => {
     <p v-if="error" class="error" role="alert">{{ error }}</p>
     <p v-if="loading" class="meta" role="status">正在本机匹配款式，首次搜索需要准备图片索引…</p>
     <p v-else-if="searched && !error" class="meta" role="status">找到 {{ items.length }} 款，按相似程度排序；结果可能只符合部分偏好。</p>
-    <p v-if="!items.length && !loading && !error" class="empty">{{ searched ? includePending ? '暂时没有匹配款式，试试更具体的颜色、版型或材质描述。' : '暂时没有匹配的已审核款式，可勾选包含未审核图片，或调整描述。' : '选择一个灵感示例，或输入你想找的款式。' }}</p>
+    <section v-if="!items.length && !loading && !error" class="library-empty search-empty" role="status">
+      <p class="library-empty-title">{{ searched ? '暂无匹配款式' : mode === 'image' ? '选择一张参考图片' : '从灵感开始找款' }}</p>
+      <p>{{ searched ? includePending ? '试试调整颜色、版型或材质描述。' : '当前只搜索已审核款式；也可以勾选包含未审核图片，或调整描述。' : mode === 'image' ? '上传一张参考图，或从图库款式详情页发起相似款搜索。' : '选择一个灵感示例，或输入风格、场景、颜色等描述。' }}</p>
+    </section>
     <div v-if="items.length" class="grid"><article v-for="item in items" :key="item.id" class="card"><RouterLink class="card-link" :to="{ name: 'record', params: { id: item.id }, query: { from: route.fullPath } }">
       <img :src="item.thumbnail_url || item.image_url" :alt="item.display_tags.一句话描述 || item.display_tags.品类" loading="lazy" width="180" height="240" />
       <div class="card-body"><div class="library-card-heading"><h3>{{ item.library_category || item.display_tags.品类 }}</h3><span class="library-review-badge" :class="item.review_status">{{ item.review_status === 'approved' ? '已审核' : '未审核' }}</span></div>

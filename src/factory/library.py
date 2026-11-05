@@ -38,6 +38,8 @@ class SaleView:
     size_label: str
     quantity: int
     amount: float
+    year: str
+    period: str
 
 
 @dataclass
@@ -75,11 +77,12 @@ def load_index() -> FactoryIndex:
             )
             index.variants.setdefault(view.style_code, []).append(view)
         for row in conn.execute(
-            "SELECT variant_code, style_code, customer, color, size_label, quantity, amount FROM style_sales"
+            "SELECT variant_code, style_code, customer, color, size_label, quantity, amount, `year`, period FROM style_sales"
         ):
             sale = SaleView(
                 variant_code=row["variant_code"], style_code=row["style_code"], customer=row["customer"],
                 color=row["color"], size_label=row["size_label"], quantity=int(row["quantity"]), amount=float(row["amount"]),
+                year=row["year"], period=row["period"],
             )
             index.sales.setdefault(sale.style_code, []).append(sale)
     index.facets = _facets(index)
@@ -247,33 +250,42 @@ def detail_fields(record: ImageRecord, index: FactoryIndex) -> dict:
     variants = index.variants.get(record.style_code) or []
     sales = index.sales.get(record.style_code) or []
     by_variant_qty: dict[str, list] = {}
+    by_variant_sales: dict[str, list[SaleView]] = {}
     for sale in sales:
         by_variant_qty.setdefault(sale.variant_code, [0, 0.0, sale.customer])
         bucket = by_variant_qty[sale.variant_code]
         bucket[0] += sale.quantity
         bucket[1] += sale.amount
+        by_variant_sales.setdefault(sale.variant_code, []).append(sale)
     variant_payload = []
     seen = set()
     for row in _sorted_variants(variants):
         seen.add(row.variant_code)
         qty, amount, _customer = by_variant_qty.get(row.variant_code, (0, 0.0, row.customer))
+        variant_sales = by_variant_sales.get(row.variant_code, [])
         variant_payload.append({
             "variant_code": row.variant_code, "customer": row.customer, "season": row.season,
             "needle": row.needle, "series": row.series, "category": row.category, "material": row.material,
             "colors": row.colors, "sizes": sorted(row.sizes, key=size_sort_key),
             "quantity": qty, "amount": as_number(amount),
+            "sales_by_color": _group_sales(variant_sales, lambda sale: sale.color, family=True),
+            "sales_by_size": _group_sales(variant_sales, lambda sale: sale.size_label),
         })
     for variant_code, (qty, amount, customer) in by_variant_qty.items():
         if variant_code in seen:
             continue
+        variant_sales = by_variant_sales.get(variant_code, [])
         variant_payload.append({
             "variant_code": variant_code, "customer": customer, "season": "", "needle": "", "series": "",
             "category": "", "material": "", "colors": [], "sizes": [],
             "quantity": qty, "amount": as_number(amount),
+            "sales_by_color": _group_sales(variant_sales, lambda sale: sale.color, family=True),
+            "sales_by_size": _group_sales(variant_sales, lambda sale: sale.size_label),
         })
     quantity, amount = index.sales_totals(record.style_code)
     return {
         "variants": variant_payload,
+        "sales_details": _sales_details(sales, variants),
         "sales": {
             "total_quantity": quantity,
             "total_amount": as_number(amount),
@@ -325,6 +337,39 @@ def _group_customers(sales: list[SaleView], variants: list[VariantView]) -> list
         items.append(item)
     items.sort(key=lambda item: (item["customer"] != OWN_CUSTOMER, item["variant_code"]))
     return items
+
+
+def _sales_details(sales: list[SaleView], variants: list[VariantView]) -> list[dict]:
+    variant_order = {row.variant_code: index for index, row in enumerate(_sorted_variants(variants))}
+    ordered = sorted(
+        sales,
+        key=lambda row: (
+            row.variant_code not in variant_order,
+            variant_order.get(row.variant_code, 0),
+            row.variant_code,
+            row.year,
+            row.period,
+            row.color,
+            size_sort_key({
+                "number": str(row.size_label or "").partition("/")[0].strip(),
+                "label": str(row.size_label or "").strip(),
+            }),
+        ),
+    )
+    return [
+        {
+            "variant_code": row.variant_code,
+            "customer": row.customer,
+            "year": row.year,
+            "period": row.period,
+            "color": row.color,
+            "family": classify_color(row.color),
+            "size_label": row.size_label,
+            "quantity": row.quantity,
+            "amount": as_number(row.amount),
+        }
+        for row in ordered
+    ]
 
 
 def _facets(index: FactoryIndex) -> dict[str, list[str]]:

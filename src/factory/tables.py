@@ -1,8 +1,7 @@
 """SQLite tables for 款式档案 and 销量.
 
-Sales are keyed by (大货款号, 颜色, 尺码, 年份, 周期). Year and period stay empty
-until imports grow a time dimension, so today's file overwrites the same key
-instead of double counting, and a later yearly import can coexist.
+Sales are keyed by (大货款号, 颜色, 尺码, 年份, 周期). Imports without time
+columns keep year and period empty; dated imports can coexist by period.
 """
 
 from __future__ import annotations

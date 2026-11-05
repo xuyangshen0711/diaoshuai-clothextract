@@ -37,6 +37,8 @@ const status = ref('')
 const uploading = ref(false)
 const dragging = ref(false)
 const retrying = ref('')
+const missingCategoryCount = computed(() => queued.value.filter(item => !item.category).length)
+const canRunImport = computed(() => queued.value.length > 0 && missingCategoryCount.value === 0 && !uploading.value)
 const archiveReport = ref<TableReport | null>(null)
 const salesReport = ref<TableReport | null>(null)
 const tableError = ref('')
@@ -273,7 +275,9 @@ watch(() => jobs.value.map(job => `${job.id}:${job.status}`).join(','), () => { 
             <option v-for="item in SOURCE_CATEGORIES" :key="item" :value="item">{{ item }}</option>
           </select>
         </div>
-        <button class="btn" type="button" :disabled="uploading || !queued.length" @click="applyBatchCategory">应用到全部文件</button>
+        <button class="btn" type="button" :disabled="uploading || !queued.length || !batchCategory" @click="applyBatchCategory">应用到全部文件</button>
+        <span v-if="!queued.length" class="meta import-control-hint">添加文件后可批量设置类别。</span>
+        <span v-else-if="!batchCategory" class="meta import-control-hint">先选择要套用的资料大类。</span>
       </div>
       <ul v-if="queued.length" class="import-file-list"><li v-for="(item, index) in queued" :key="item.key">
         <span>{{ item.relativePath }} <small>{{ fileSizeLabel(item.file.size) }}</small><small v-if="suffixHint(item.relativePath)" class="suffix-hint">{{ suffixHint(item.relativePath) }}</small></span>
@@ -285,7 +289,9 @@ watch(() => jobs.value.map(job => `${job.id}:${job.status}`).join(','), () => { 
       </li></ul>
       <div class="toolbar import-submit"><div class="field"><label for="tag-backend">分类方式</label>
         <select id="tag-backend" v-model="backend" :disabled="uploading"><option value="deepseek">DeepSeek</option><option value="openai" :disabled="!openaiReady">GPT-4o-mini</option><option value="mock">模拟分类（测试）</option></select></div>
-        <button class="btn primary" :disabled="uploading" @click="runImport">{{ uploading ? '正在提交…' : '上传并开始分类' }}</button>
+        <button class="btn primary" :disabled="!canRunImport" @click="runImport">{{ uploading ? '正在提交…' : '上传并开始分类' }}</button>
+        <span v-if="!queued.length" class="meta import-control-hint">先添加文件，再设置资料大类。</span>
+        <span v-else-if="missingCategoryCount" class="meta import-control-hint">还有 {{ missingCategoryCount }} 个文件未设置资料大类。</span>
       </div>
     </section>
     <section class="import-upload factory-import" aria-label="本厂款式档案与销量">
@@ -334,7 +340,20 @@ watch(() => jobs.value.map(job => `${job.id}:${job.status}`).join(','), () => { 
         <details v-if="job.errors.length"><summary>查看 {{ job.errors.length }} 项异常</summary><ul class="task-errors"><li v-for="(item, index) in job.errors" :key="index"><strong>{{ item.name }}</strong><span>{{ item.message }}</span></li></ul></details>
       </article>
     </section>
-    <details class="import-admin"><summary>分类与检索管理</summary><p class="meta">全量重打会重新提交审核，保留此前人工分类。已完成的历史任务不受影响。</p><div class="toolbar">
-      <button class="btn" :disabled="uploading" @click="runRetag(false)">补打未确认标签</button><button class="btn" :disabled="uploading" @click="runRetag(true)">全量重新分类</button><button class="btn" :disabled="uploading" @click="runRebuild">刷新检索索引</button></div></details>
+    <details class="import-admin"><summary>分类与检索管理</summary>
+      <div class="import-admin-actions">
+        <div class="import-admin-routine">
+          <p class="meta">常用操作</p>
+          <div class="toolbar">
+            <button class="btn" :disabled="uploading" @click="runRetag(false)">补打未确认标签</button>
+            <button class="btn" :disabled="uploading" @click="runRebuild">刷新检索索引</button>
+          </div>
+        </div>
+        <section class="import-admin-high-impact" aria-label="高影响操作">
+          <div><strong>全量重新分类</strong><p class="meta">会生成新的待审核建议，保留此前人工分类；已完成的历史任务不受影响。</p></div>
+          <button class="btn" :disabled="uploading" @click="runRetag(true)">全量重新分类</button>
+        </section>
+      </div>
+    </details>
   </main>
 </template>
