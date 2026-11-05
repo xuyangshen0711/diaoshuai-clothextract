@@ -1,8 +1,10 @@
-"""SQLite tables for 款式档案 and 销量.
+"""SQLite and MySQL tables for 款式档案, 销量汇总, and 订单明细.
 
-Sales are keyed by (大货款号, 颜色, 尺码, 年份, 周期). Year and period stay empty
-until imports grow a time dimension, so today's file overwrites the same key
-instead of double counting, and a later yearly import can coexist.
+Summary sales stay keyed by (大货款号, 颜色, 尺码, 年份, 周期). Duplicate keys inside
+one summary file are added together, then a re-import replaces that total.
+
+Order lines are stored one row per (订单号, 大货款号, 颜色, 尺码). Importing the
+same detail file again updates those rows and does not add the pieces a second time.
 """
 
 from __future__ import annotations
@@ -12,6 +14,20 @@ from datetime import datetime, timezone
 
 from src.db import MYSQL_FACTORY_SCHEMA, exec_script, is_mysql, json_extract
 from src.schema import UNCLASSIFIED_SOURCE, ImageRecord
+
+# Added after the first release. Existing databases gain these with ALTER, not a rebuild.
+VARIANT_COLUMNS = {
+    "design_code": "TEXT NOT NULL DEFAULT ''",
+    "designer": "TEXT NOT NULL DEFAULT ''",
+    "craftsman": "TEXT NOT NULL DEFAULT ''",
+    "subcategory": "TEXT NOT NULL DEFAULT ''",
+}
+VARIANT_COLUMNS_MYSQL = {
+    "design_code": "VARCHAR(128) NOT NULL DEFAULT ''",
+    "designer": "VARCHAR(64) NOT NULL DEFAULT ''",
+    "craftsman": "VARCHAR(64) NOT NULL DEFAULT ''",
+    "subcategory": "VARCHAR(128) NOT NULL DEFAULT ''",
+}
 
 FACTORY_SCHEMA = """
 CREATE TABLE IF NOT EXISTS style_variants (
@@ -23,6 +39,10 @@ CREATE TABLE IF NOT EXISTS style_variants (
     series TEXT NOT NULL DEFAULT '',
     category TEXT NOT NULL DEFAULT '',
     material TEXT NOT NULL DEFAULT '',
+    design_code TEXT NOT NULL DEFAULT '',
+    designer TEXT NOT NULL DEFAULT '',
+    craftsman TEXT NOT NULL DEFAULT '',
+    subcategory TEXT NOT NULL DEFAULT '',
     colors_json TEXT NOT NULL,
     sizes_json TEXT NOT NULL,
     source_file TEXT NOT NULL DEFAULT '',
@@ -45,11 +65,52 @@ CREATE TABLE IF NOT EXISTS style_sales (
     PRIMARY KEY (variant_code, color, size_label, year, period)
 );
 CREATE INDEX IF NOT EXISTS style_sales_style ON style_sales(style_code);
+CREATE TABLE IF NOT EXISTS style_order_lines (
+    order_no TEXT NOT NULL,
+    variant_code TEXT NOT NULL,
+    color TEXT NOT NULL,
+    size_label TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    amount REAL NOT NULL,
+    style_code TEXT NOT NULL,
+    customer TEXT NOT NULL DEFAULT '',
+    customer_raw TEXT NOT NULL DEFAULT '',
+    customer_style_code TEXT NOT NULL DEFAULT '',
+    order_kind TEXT NOT NULL DEFAULT '',
+    order_date TEXT NOT NULL DEFAULT '',
+    salesperson TEXT NOT NULL DEFAULT '',
+    garment_type TEXT NOT NULL DEFAULT '',
+    season TEXT NOT NULL DEFAULT '',
+    source_file TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (order_no, variant_code, color, size_label)
+);
+CREATE INDEX IF NOT EXISTS style_order_lines_style ON style_order_lines(style_code);
 """
+
+
+def _column_names(conn, table: str) -> set[str]:
+    if is_mysql(conn):
+        rows = conn.execute(
+            "SELECT COLUMN_NAME AS name FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+            (table,),
+        )
+        return {row["name"] for row in rows}
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _add_missing_columns(conn, table: str, columns: dict[str, str]) -> None:
+    present = _column_names(conn, table)
+    for name, declaration in columns.items():
+        if name in present:
+            continue
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
 
 
 def ensure_factory(conn) -> None:
     exec_script(conn, MYSQL_FACTORY_SCHEMA if is_mysql(conn) else FACTORY_SCHEMA)
+    _add_missing_columns(conn, "style_variants", VARIANT_COLUMNS_MYSQL if is_mysql(conn) else VARIANT_COLUMNS)
 
 
 def migrate_source_categories(conn) -> None:

@@ -8,21 +8,28 @@ from src import catalog
 from src.factory.codes import parse_style_code
 from src.factory.colors import split_colors
 from src.factory.excel_io import (
-    cell_at, column_index, find_header, load_sheet_rows, plain_text, sheet_headers, table_kind_from_headers,
+    cell_at, column_index, describe_headers, find_header, load_sheet_rows, plain_text, sheet_headers,
+    table_kind_from_headers,
 )
 from src.factory.sizes import split_sizes
 from src.db import on_conflict_update
 from src.factory.tables import gap_report, now
 
-KEEP_COLUMNS = ("季节", "大货款号", "颜色", "尺码", "原料名称", "针型", "系列", "一级品类")
+KEEP_COLUMNS = (
+    "季节", "大货款号", "颜色", "尺码", "原料名称", "针型", "系列", "一级品类",
+    "设计款号", "设计师", "工艺师", "二级品类",
+)
 IMPORTANT = ("季节", "大货款号", "颜色", "尺码", "原料名称")
 
 
-def parse_archive_rows(path: Path) -> tuple[list[dict], int, list[str]]:
+def parse_archive_rows(path: Path) -> tuple[list[dict], int, list[str], dict]:
     rows = load_sheet_rows(path)
     if table_kind_from_headers(sheet_headers(rows)) == "sales":
         raise ValueError("可能传错了表，这像是销量表，请用下方的销量入口。")
     header_index, headers = find_header(rows, "大货款号")
+    recognized = describe_headers(headers)
+    if recognized["kind"] != "archive":
+        raise ValueError("可能传错了表，这像是销量表，请用下方的销量入口。")
     indexes = {name: column_index(headers, name) for name in KEEP_COLUMNS}
     warnings = [f"未找到「{name}」列，该字段将留空" for name in IMPORTANT if name != "大货款号" and indexes[name] is None]
     if indexes["系列"] is None:
@@ -47,17 +54,21 @@ def parse_archive_rows(path: Path) -> tuple[list[dict], int, list[str]]:
             "series": plain_text(cell_at(row, indexes["系列"])),
             "category": plain_text(cell_at(row, indexes["一级品类"])),
             "material": plain_text(cell_at(row, indexes["原料名称"])),
+            "design_code": plain_text(cell_at(row, indexes["设计款号"])),
+            "designer": plain_text(cell_at(row, indexes["设计师"])),
+            "craftsman": plain_text(cell_at(row, indexes["工艺师"])),
+            "subcategory": plain_text(cell_at(row, indexes["二级品类"])),
             "colors": split_colors(cell_at(row, indexes["颜色"])),
             "sizes": split_sizes(cell_at(row, indexes["尺码"])),
         }
         if code.raw not in parsed:
             order.append(code.raw)
         parsed[code.raw] = item
-    return [parsed[key] for key in order], skipped, warnings
+    return [parsed[key] for key in order], skipped, warnings, recognized
 
 
 def import_archive(path: Path, source_name: str | None = None) -> dict:
-    variants, skipped, warnings = parse_archive_rows(path)
+    variants, skipped, warnings, recognized = parse_archive_rows(path)
     source_name = source_name or Path(path).name
     imported = updated = 0
     with catalog._database() as conn:
@@ -67,15 +78,18 @@ def import_archive(path: Path, source_name: str | None = None) -> dict:
                 """
                 INSERT INTO style_variants (
                     variant_code, style_code, customer, season, needle, series, category, material,
+                    design_code, designer, craftsman, subcategory,
                     colors_json, sizes_json, source_file, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """ + on_conflict_update("variant_code", [
                     "style_code", "customer", "season", "needle", "series", "category", "material",
+                    "design_code", "designer", "craftsman", "subcategory",
                     "colors_json", "sizes_json", "source_file", "updated_at",
                 ]),
                 (
                     item["variant_code"], item["style_code"], item["customer"], item["season"], item["needle"],
                     item["series"], item["category"], item["material"],
+                    item["design_code"], item["designer"], item["craftsman"], item["subcategory"],
                     _json(item["colors"]), _json(item["sizes"]), source_name, now(),
                 ),
             )
@@ -92,6 +106,10 @@ def import_archive(path: Path, source_name: str | None = None) -> dict:
         "warnings": warnings,
         "style_codes": sorted({item["style_code"] for item in variants}),
         "variant_count": len(variants),
+        "parsed_rows": len(variants),
+        "format": recognized["format"],
+        "format_label": recognized["format_label"],
+        "evidence_columns": recognized["evidence_columns"],
         **gaps,
     }
 

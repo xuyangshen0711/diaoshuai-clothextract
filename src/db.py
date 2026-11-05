@@ -347,6 +347,10 @@ CREATE TABLE IF NOT EXISTS style_variants (
     series VARCHAR(128) NOT NULL DEFAULT '',
     category VARCHAR(128) NOT NULL DEFAULT '',
     material VARCHAR(255) NOT NULL DEFAULT '',
+    design_code VARCHAR(128) NOT NULL DEFAULT '',
+    designer VARCHAR(64) NOT NULL DEFAULT '',
+    craftsman VARCHAR(64) NOT NULL DEFAULT '',
+    subcategory VARCHAR(128) NOT NULL DEFAULT '',
     colors_json LONGTEXT NOT NULL,
     sizes_json LONGTEXT NOT NULL,
     source_file VARCHAR(512) NOT NULL DEFAULT '',
@@ -370,6 +374,27 @@ CREATE TABLE IF NOT EXISTS style_sales (
     updated_at VARCHAR(40) NOT NULL,
     PRIMARY KEY (variant_code, color, size_label, `year`, period),
     KEY style_sales_style (style_code)
+) {TABLE_OPTIONS};
+CREATE TABLE IF NOT EXISTS style_order_lines (
+    order_no VARCHAR(64) NOT NULL,
+    variant_code VARCHAR(128) NOT NULL,
+    color VARCHAR(128) NOT NULL,
+    size_label VARCHAR(64) NOT NULL,
+    quantity INT NOT NULL,
+    amount DOUBLE NOT NULL,
+    style_code VARCHAR(128) NOT NULL,
+    customer VARCHAR(128) NOT NULL DEFAULT '',
+    customer_raw VARCHAR(255) NOT NULL DEFAULT '',
+    customer_style_code VARCHAR(128) NOT NULL DEFAULT '',
+    order_kind VARCHAR(16) NOT NULL DEFAULT '',
+    order_date VARCHAR(10) NOT NULL DEFAULT '',
+    salesperson VARCHAR(64) NOT NULL DEFAULT '',
+    garment_type VARCHAR(128) NOT NULL DEFAULT '',
+    season VARCHAR(32) NOT NULL DEFAULT '',
+    source_file VARCHAR(512) NOT NULL DEFAULT '',
+    updated_at VARCHAR(40) NOT NULL,
+    PRIMARY KEY (order_no, variant_code, color, size_label),
+    KEY style_order_lines_style (style_code)
 ) {TABLE_OPTIONS};
 """
 

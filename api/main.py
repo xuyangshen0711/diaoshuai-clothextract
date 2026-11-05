@@ -47,7 +47,9 @@ from src.factory.library import (  # noqa: E402
     in_group,
     load_index,
     matches_factory,
+    matches_level2,
     prime_search,
+    style_activity,
 )
 from src.factory.sales import import_sales  # noqa: E402
 from src.schema import (  # noqa: E402
@@ -162,9 +164,12 @@ def _factory_filters(
     needle: str | None = None,
     customer: str | None = None,
     archive_season: str | None = None,
+    ordered_from: str | None = None,
+    ordered_to: str | None = None,
 ) -> dict[str, str | None]:
     return dict(color_family=color_family, size=size, series=series, needle=needle,
-                customer=customer, archive_season=archive_season)
+                customer=customer, archive_season=archive_season,
+                ordered_from=ordered_from, ordered_to=ordered_to)
 
 
 def _narrow(records: list[ImageRecord], *, filters: dict, group: str | None, q: str | None,
@@ -191,7 +196,7 @@ def _narrow(records: list[ImageRecord], *, filters: dict, group: str | None, q: 
                         continue
                 elif category not in display_categories(by_id[record.id], index) and placement.level1 != category:
                     continue
-            if subcategory and subcategory != "全部" and placement.level2 != subcategory:
+            if not matches_level2(by_id[record.id], index, subcategory, placement.level2):
                 continue
             if sleeve_length and sleeve_length != "全部" and placement.sleeve != sleeve_length:
                 continue
@@ -370,6 +375,16 @@ def catalog(
         elif sort == "amount":
             records.sort(key=lambda record: (
                 -(index.sales_totals(record.style_code)[1] if record.source_category == "本厂产品" else 0),
+                record.style_code, record.id,
+            ))
+        elif sort == "ordered":
+            records.sort(key=lambda record: (
+                style_activity(index, record.style_code)["last_order_date"] if record.source_category == "本厂产品" else "",
+                record.style_code, record.id,
+            ), reverse=True)
+        elif sort == "replenishment":
+            records.sort(key=lambda record: (
+                -(style_activity(index, record.style_code)["replenishment_count"] if record.source_category == "本厂产品" else 0),
                 record.style_code, record.id,
             ))
         elif sort == "imported":
