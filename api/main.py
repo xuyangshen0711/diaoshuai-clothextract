@@ -103,6 +103,8 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="服装内部图片库 API", version="0.4.0", lifespan=lifespan)
+from api.import_workspace import router as import_workspace_router
+app.include_router(import_workspace_router)
 # Added first so CORS stays outside and can still label a 401.
 app.add_middleware(SiteGateMiddleware)
 app.add_middleware(
@@ -238,6 +240,7 @@ class TagJobRequest(BaseModel):
     backend: Literal["openai", "mock", "deepseek"] = "openai"
     overwrite: bool = False
     source_type: str | None = None
+    batch_id: str | None = None
 
 
 class LoginBody(BaseModel):
@@ -478,7 +481,7 @@ def _safe_relative(filename: str) -> str:
 @app.post("/api/import/jobs", status_code=202)
 def start_import_job(
     files: list[UploadFile] = File(...),
-    backend: Literal["openai", "mock", "deepseek"] = "openai",
+    backend: Literal["openai", "mock", "deepseek", "deferred"] = "openai",
     source_categories: list[str] | None = Form(default=None),
 ):
     if backend == "openai" and not has_openai_key():
@@ -556,7 +559,7 @@ def start_tag_job(req: TagJobRequest):
         raise HTTPException(status_code=400, detail="请先在本地配置 OPENAI_API_KEY")
     if req.backend == "deepseek" and not has_deepseek_key():
         raise HTTPException(status_code=400, detail="请先在本地配置 DEEPSEEK_API_KEY")
-    job = import_jobs.create_retag(req.backend, req.overwrite, req.source_type)
+    job = import_jobs.create_retag(req.backend, req.overwrite, req.source_type, batch_id=req.batch_id)
     import_jobs.submit_job(job["id"])
     return import_jobs.public_job(job)
 

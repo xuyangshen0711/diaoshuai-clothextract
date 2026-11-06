@@ -4,12 +4,14 @@ import { useRoute, useRouter } from 'vue-router'
 import {
   assignSourceCategory,
   getLibraryMeta,
+  getCatalog,
   getRecord,
   type CatalogItem,
   type LibraryMeta,
 } from '../api'
-import DesignNotesList from '../components/DesignNotesList.vue'
-import RecordHistory from '../components/RecordHistory.vue'
+import ReferenceRecordSummary from '../components/ReferenceRecordSummary.vue'
+import RecordExtras from '../components/RecordExtras.vue'
+import { referenceTitle } from '../utils/recordPresentation'
 import SalesAnalysis from '../components/SalesAnalysis.vue'
 import CoverEditor from '../components/CoverEditor.vue'
 import {
@@ -43,8 +45,6 @@ const categoryChoices = computed(() => [
   ...libraryMeta.value.source_categories,
   libraryMeta.value.unclassified,
 ])
-const display = (value: unknown) =>
-  Array.isArray(value) ? value.join('、') || '无' : String(value || '未提供')
 const unique = (values: (string | undefined)[]) => {
   const seen: string[] = []
   for (const value of values) if (value && !seen.includes(value)) seen.push(value)
@@ -123,6 +123,7 @@ function tabKeydown(event: KeyboardEvent, index: number) {
   document.getElementById(`record-tab-${tabs[next]!.key}`)?.focus()
 }
 const imageDialog = ref<HTMLDialogElement | null>(null)
+const extrasPanel = ref<InstanceType<typeof RecordExtras> | null>(null)
 const expandedVariant = ref('')
 const orderPage = ref(1)
 const orderPageSize = 30
@@ -135,15 +136,43 @@ const pagedOrders = computed(() =>
 watch([orderQuery, orderKind], () => {
   orderPage.value = 1
 })
-const productName = computed(
-  () => subcategories.value[0] || item.value?.library_category || tags.value?.品类 || '款式详情',
-)
+const productName = computed(() => item.value && !ownFactory.value ? referenceTitle(item.value) :
+  subcategories.value[0] || item.value?.library_category || tags.value?.品类 || '款式详情')
 const summaryColors = computed(() => {
   const result = new Map<string, string>()
   for (const variant of item.value?.variants || [])
     for (const color of variant.colors) result.set(color.name, color.family)
   return [...result].map(([name, family]) => ({ name, family }))
 })
+const neighborItems = ref<CatalogItem[]>([])
+const neighborCache = new Map<string, CatalogItem[]>()
+const neighborIds = computed(() => {
+  const current = item.value
+  if (!current) return []
+  return neighborItems.value.filter(record => current.source.batch_id
+    ? record.source.batch_id === current.source.batch_id
+    : record.source.source_file === current.source.source_file && record.source.source_type === current.source.source_type)
+    .sort((left, right) => left.source.source_file.localeCompare(right.source.source_file, 'zh-CN', { numeric: true }) ||
+      left.source.location.localeCompare(right.source.location, 'zh-CN', { numeric: true }) ||
+      left.source.extracted_at.localeCompare(right.source.extracted_at) || left.id.localeCompare(right.id))
+    .map(record => record.id)
+})
+const neighborPosition = computed(() => neighborIds.value.indexOf(item.value?.id || ''))
+function navigateNeighbor(direction: number) {
+  const id = neighborIds.value[neighborPosition.value + direction]
+  if (id) router.push({ name: 'record', params: { id }, query: { from: back.value } })
+}
+async function loadNeighbors(current: CatalogItem, sequence: number) {
+  if (current.source_category === '本厂产品') return
+  try {
+    let records = neighborCache.get(current.source_category)
+    if (!records) {
+      records = (await getCatalog({ source_category: current.source_category, sort: 'imported' })).items
+      neighborCache.set(current.source_category, records)
+    }
+    if (sequence === latest) neighborItems.value = records
+  } catch { /* The current detail remains usable if neighboring records cannot be loaded. */ }
+}
 let latest = 0
 watch(
   () => route.params.id,
@@ -157,11 +186,13 @@ watch(
     orderKind.value = '全部'
     orderPage.value = 1
     expandedVariant.value = ''
+    neighborItems.value = []
     try {
       const [result, meta] = await Promise.all([getRecord(String(id)), getLibraryMeta()])
       if (seq !== latest) return
       item.value = result
       libraryMeta.value = meta
+      void loadNeighbors(result, seq)
     } catch (e) {
       if (seq === latest) error.value = e instanceof Error ? e.message : String(e)
     } finally {
@@ -187,14 +218,18 @@ async function changeCategory(event: Event) {
 }
 </script>
 <template>
-  <main v-if="item && tags" class="record-page record-redesign">
+  <main v-if="item && tags" class="record-page record-redesign" :class="{ 'reference-record': !ownFactory }">
+    <div class="record-topline">
     <div class="record-breadcrumb">
       <RouterLink :to="back">← 返回图库</RouterLink><span>/</span
       ><span>{{ item.source_category || '未分类' }}</span
-      ><span>/</span><span>{{ item.style_code || productName }}</span>
+      ><span>/</span><span>{{ item.style_code || (ownFactory ? productName : (item.library_category || tags.品类).split('>').at(-1)) }}</span>
+    </div>
+    <nav v-if="!ownFactory && neighborIds.length > 1" class="record-neighbors" aria-label="同批资料浏览"><button type="button" aria-label="同批资料，上一款" :disabled="neighborPosition <= 0" @click="navigateNeighbor(-1)"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m12 4-6 6 6 6" /></svg></button><button type="button" aria-label="同批资料，下一款" :disabled="neighborPosition < 0 || neighborPosition >= neighborIds.length - 1" @click="navigateNeighbor(1)"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m8 4 6 6-6 6" /></svg></button></nav>
     </div>
     <p v-if="error" class="error" role="alert">{{ error }}</p>
-    <section class="product-summary" aria-label="款式概览">
+    <ReferenceRecordSummary v-if="!ownFactory" :key="item.id" :item="item" :category-choices="categoryChoices" @updated="item = $event" @image="imageDialog?.showModal()" @tags="extrasPanel?.showTags()" />
+    <section v-else class="product-summary" aria-label="款式概览">
       <div class="product-preview">
         <button
           class="product-image"
@@ -571,7 +606,7 @@ async function changeCategory(event: Event) {
       class="record-tab-panel record-archive-panel"
       :role="ownFactory ? 'tabpanel' : undefined"
       :aria-labelledby="ownFactory ? 'record-tab-archive' : undefined"
-      tabindex="0"
+      :tabindex="ownFactory ? 0 : undefined"
     >
       <details v-if="ownFactory" class="detail-fold archive-facts" open>
         <summary>款式档案</summary>
@@ -609,9 +644,10 @@ async function changeCategory(event: Event) {
           图库按固定品类显示为「{{ item.library_category }}」，原始档案品类保留，AI 分类仅作参考。
         </p>
       </details>
-      <details class="detail-fold" open>
+      <details v-if="ownFactory" class="detail-fold" open>
         <summary>来源与操作</summary>
-        <p v-if="item.review_status === 'pending'" class="meta">
+        <p v-if="item.tags_source === 'deferred' && item.review_status === 'pending'" class="meta">图片已保存，尚未自动分类。可在导入页继续本批分类，或直接人工审核。</p>
+        <p v-else-if="item.review_status === 'pending'" class="meta">
           当前分类已在主页展示，尚待人工审核确认。搜索时可选择是否包含未审核图片。
         </p>
         <p v-else-if="item.review_status === 'rejected'" class="meta">
@@ -682,71 +718,7 @@ async function changeCategory(event: Event) {
           >
         </div>
       </details>
-      <details v-if="item.image_history?.length" class="detail-fold">
-        <summary>历史原图</summary>
-        <div class="image-history">
-          <a
-            v-for="(old, index) in item.image_history"
-            :key="index"
-            :href="old.url"
-            target="_blank"
-            rel="noopener"
-          >
-            <img :src="old.url" :alt="old.note || '替换前保留的原图'" width="80" height="106" />
-          </a>
-        </div>
-      </details>
-      <details class="detail-fold">
-        <summary>分类标签对照</summary>
-        <div class="record-tag-table">
-          <table>
-            <caption class="visually-hidden">
-              分类标签对照
-            </caption>
-            <thead>
-              <tr>
-                <th scope="col">标签</th>
-                <th scope="col">AI 建议{{ item.ai_tags_source === 'mock' ? '（模拟）' : '' }}</th>
-                <th scope="col">
-                  {{ item.review_status === 'approved' ? '最终分类' : '待审核分类' }}
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr
-                v-for="(value, key) in tags"
-                :key="key"
-                :class="{ changed: item.ai_tags && display(item.ai_tags[key]) !== display(value) }"
-              >
-                <th scope="row">{{ key }}</th>
-                <td>
-                  {{
-                    key === '一句话描述'
-                      ? visibleDescription(display(item.ai_tags?.[key]), item.review_status) ||
-                        '未提供'
-                      : display(item.ai_tags?.[key])
-                  }}
-                </td>
-                <td>
-                  {{
-                    key === '一句话描述'
-                      ? visibleDescription(display(value), item.review_status) || '未提供'
-                      : display(value)
-                  }}
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </details>
-      <details class="detail-fold">
-        <summary>设计说明</summary>
-        <DesignNotesList :notes="item.notes" />
-      </details>
-      <details class="detail-fold">
-        <summary>审核记录</summary>
-        <RecordHistory :id="item.id" />
-      </details>
+      <RecordExtras ref="extrasPanel" :key="item.id" :item="item" :reference="!ownFactory" />
     </section>
     <dialog
       ref="imageDialog"
@@ -772,3 +744,4 @@ async function changeCategory(event: Event) {
   </main>
 </template>
 <style src="../record-detail.css"></style>
+<style src="../reference-record.css"></style>

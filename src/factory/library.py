@@ -105,9 +105,8 @@ def load_index() -> FactoryIndex:
                 colors=json.loads(row["colors_json"]), sizes=json.loads(row["sizes_json"]),
             )
             index.variants.setdefault(view.style_code, []).append(view)
-        for row in conn.execute(
-            "SELECT variant_code, style_code, customer, color, size_label, quantity, amount FROM style_sales"
-        ):
+        from src.factory.sales_policy import counted_summaries
+        for row in counted_summaries(conn):
             sale = SaleView(
                 variant_code=row["variant_code"], style_code=row["style_code"], customer=row["customer"],
                 color=row["color"], size_label=row["size_label"], quantity=int(row["quantity"]), amount=float(row["amount"]),

@@ -72,32 +72,7 @@ def import_archive(path: Path, source_name: str | None = None) -> dict:
     source_name = source_name or Path(path).name
     imported = updated = 0
     with catalog._database() as conn:
-        existing = {row[0] for row in conn.execute("SELECT variant_code FROM style_variants")}
-        for item in variants:
-            conn.execute(
-                """
-                INSERT INTO style_variants (
-                    variant_code, style_code, customer, season, needle, series, category, material,
-                    design_code, designer, craftsman, subcategory,
-                    colors_json, sizes_json, source_file, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """ + on_conflict_update("variant_code", [
-                    "style_code", "customer", "season", "needle", "series", "category", "material",
-                    "design_code", "designer", "craftsman", "subcategory",
-                    "colors_json", "sizes_json", "source_file", "updated_at",
-                ]),
-                (
-                    item["variant_code"], item["style_code"], item["customer"], item["season"], item["needle"],
-                    item["series"], item["category"], item["material"],
-                    item["design_code"], item["designer"], item["craftsman"], item["subcategory"],
-                    _json(item["colors"]), _json(item["sizes"]), source_name, now(),
-                ),
-            )
-            if item["variant_code"] in existing:
-                updated += 1
-            else:
-                imported += 1
-                existing.add(item["variant_code"])
+        imported, updated = write_archive(conn, variants, source_name)
         gaps = gap_report(conn)
     return {
         "imported": imported,
@@ -117,3 +92,34 @@ def import_archive(path: Path, source_name: str | None = None) -> dict:
 def _json(value) -> str:
     import json
     return json.dumps(value, ensure_ascii=False)
+
+
+def write_archive(conn, variants: list[dict], source_name: str) -> tuple[int, int]:
+    imported = updated = 0
+    existing = {row[0] for row in conn.execute("SELECT variant_code FROM style_variants")}
+    for item in variants:
+        conn.execute(
+            """
+            INSERT INTO style_variants (
+                variant_code, style_code, customer, season, needle, series, category, material,
+                design_code, designer, craftsman, subcategory,
+                colors_json, sizes_json, source_file, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """ + on_conflict_update("variant_code", [
+                "style_code", "customer", "season", "needle", "series", "category", "material",
+                "design_code", "designer", "craftsman", "subcategory",
+                "colors_json", "sizes_json", "source_file", "updated_at",
+            ]),
+            (
+                item["variant_code"], item["style_code"], item["customer"], item["season"], item["needle"],
+                item["series"], item["category"], item["material"],
+                item["design_code"], item["designer"], item["craftsman"], item["subcategory"],
+                _json(item["colors"]), _json(item["sizes"]), source_name, now(),
+            ),
+        )
+        if item["variant_code"] in existing:
+            updated += 1
+        else:
+            imported += 1
+            existing.add(item["variant_code"])
+    return imported, updated

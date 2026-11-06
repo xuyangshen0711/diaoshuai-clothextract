@@ -111,6 +111,9 @@ def _add_missing_columns(conn, table: str, columns: dict[str, str]) -> None:
 def ensure_factory(conn) -> None:
     exec_script(conn, MYSQL_FACTORY_SCHEMA if is_mysql(conn) else FACTORY_SCHEMA)
     _add_missing_columns(conn, "style_variants", VARIANT_COLUMNS_MYSQL if is_mysql(conn) else VARIANT_COLUMNS)
+    payload_type = "LONGTEXT" if is_mysql(conn) else "TEXT"
+    conn.execute(f"CREATE TABLE IF NOT EXISTS factory_import_history ("
+                 f"id VARCHAR(32) PRIMARY KEY, payload {payload_type} NOT NULL, created_at VARCHAR(40) NOT NULL)")
 
 
 def migrate_source_categories(conn) -> None:
@@ -150,11 +153,15 @@ def own_factory_images(conn) -> dict[str, ImageRecord]:
 
 
 def gap_report(conn) -> dict[str, list[str]]:
+    from src import storage
     bases = {row[0] for row in conn.execute("SELECT DISTINCT style_code FROM style_variants")}
-    images = set(own_factory_images(conn))
+    sales = {row[0] for table in ("style_sales", "style_order_lines")
+             for row in conn.execute(f"SELECT DISTINCT style_code FROM {table}")}
+    images = {code for code, record in own_factory_images(conn).items() if storage.is_file(record.image_path)}
     return {
         "archive_without_image": sorted(bases - images),
         "image_without_archive": sorted(images - bases),
+        "sales_without_image": sorted(sales - images),
     }
 
 

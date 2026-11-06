@@ -164,6 +164,7 @@ export type TableReport = {
   variant_count?: number
   archive_without_image: string[]
   image_without_archive: string[]
+  sales_without_image?: string[]
   source_file: string
   row_count?: number
   parsed_quantity?: number
@@ -339,6 +340,7 @@ export type ImportJob = {
   message: string
   errors: { name: string; message: string }[]
   skipped?: number
+  source_categories?: string[]
 }
 
 export async function importFiles(files: { file: File; relativePath: string; category: string }[], backend: string) {
@@ -438,4 +440,44 @@ export function reviewRecord(item: CatalogItem, action: 'approve' | 'reject' | '
 
 export function rebuildIndex() {
   return request<{ ok: boolean; catalog_count: number }>('/api/index/rebuild', { method: 'POST' })
+}
+
+export type WorkspaceRow = { style_code: string; has_image: boolean; has_archive: boolean; has_sales: boolean; record_id: string | null; pending_review: boolean; missing: string[] }
+export type FactoryWorkspace = {
+  counts: { styles: number; missing_images: number; missing_archives: number; no_sales: number; pending_review: number }
+  items: WorkspaceRow[]; total: number; page: number; page_size: number
+  sales_policy: { reference_rows: number; reference_quantity: number; note: string }
+}
+export type TablePreview = {
+  historical_start?: string; historical_end?: string
+  token: string; kind: 'archive' | 'sales'; requested_kind: string; source_file: string
+  format: string; format_label: string; row_count: number; style_codes: string[]
+  counts: { new: number; updated: number; unchanged: number }
+  meta: { warnings?: string[]; parsed_quantity?: number; parsed_amount?: number; sheet_quantity?: number | null; sheet_amount?: number | null; reconciled?: boolean | null; reconcile_note?: string; evidence_columns?: string[] }
+  samples: { variant_code: string; style_code: string; customer: string; color?: string; size_label?: string; quantity?: number; amount?: number; season?: string; action: string }[]
+  issues: { row: number; style_code: string; message: string }[]; issue_count: number; ignored_rows: number
+  overlap_variants: string[]; missing_images: string[]; can_confirm: boolean
+}
+export type TableImportResult = TableReport & { id: string; kind: 'archive' | 'sales'; created_at: string; unchanged: number; issue_count: number; sales_policy: FactoryWorkspace['sales_policy'] }
+export type InspectedFile = { name: string; kind: string; action: string; style_code: string; message: string; width?: number; height?: number }
+export function getFactoryWorkspace(status = 'missing', q = '', page = 1) {
+  return request<FactoryWorkspace>(`/api/import/workspace?${new URLSearchParams({ status, q, page: String(page) })}`)
+}
+export function getTableHistory() { return request<TableImportResult[]>('/api/import/table-history') }
+export function previewTable(file: File, kind: string) {
+  const body = new FormData(); body.append('file', file); body.append('kind', kind)
+  return request<TablePreview>('/api/import/table-preview', { method: 'POST', body })
+}
+export function confirmTable(token: string, acknowledge: boolean, historical_start = '', historical_end = '') {
+  return request<TableImportResult>('/api/import/table-confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, acknowledge, historical_start, historical_end }) })
+}
+export function replanTable(token: string, historical_start = '', historical_end = '') {
+  return request<TablePreview>('/api/import/table-replan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, historical_start, historical_end }) })
+}
+export function inspectImport(files: { file: File; name: string }[], category: string) {
+  const body = new FormData(); files.forEach(f => body.append('files', f.file, f.name)); body.append('category', category)
+  return request<{ items: InspectedFile[] }>('/api/import/inspect', { method: 'POST', body })
+}
+export function classifyBatch(backend: string, batch_id: string) {
+  return request<ImportJob>('/api/tag/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ backend, batch_id, overwrite: false }) })
 }

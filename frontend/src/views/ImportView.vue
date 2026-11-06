@@ -1,344 +1,99 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
-import { getCatalog, getHealth, getLibraryMeta, importFiles, importSalesSheet, importStyleArchive, rebuildIndex, retag, retryJob, type ImportJob, type TableReport } from '../api'
-import { fileSizeLabel } from '../utils/source'
-import { jobs, jobsError, isActive, refreshJobs, rememberJob } from '../composables/importJobs'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { classifyBatch, getHealth, getTableHistory, rebuildIndex, retag, retryJob, type ImportJob, type TableImportResult } from '../api'
+import { isActive, jobs, jobsError, refreshJobs, rememberJob } from '../composables/importJobs'
+import FactoryCompleteness from '../components/FactoryCompleteness.vue'
+import MediaImportPanel from '../components/MediaImportPanel.vue'
+import TableImportPanel from '../components/TableImportPanel.vue'
+import '../styles/import-workspace.css'
 
-const SOURCE_CATEGORIES = ['本厂产品', '网图趋势', '品牌资料包', '市调拍照']
-const ACCEPT = /\.(pdf|pptx|xlsx|xlsm|png|jpe?g|webp|gif|bmp|tiff?)$/i
-type Queued = { key: string; file: File; relativePath: string; category: string }
-const queued = ref<Queued[]>([])
-const batchCategory = ref('')
-const backend = ref('mock')
-const openaiReady = ref(false)
-const deepseekReady = ref(false)
-const openaiPlaceholder = ref(false)
-const deepseekPlaceholder = ref(false)
-function providerLine(name: string, ready: boolean, placeholder: boolean) {
-  if (ready) return `${name} 已配置`
-  if (placeholder) return `${name} 密钥是示例值`
-  return `${name} 未配置`
-}
-const classifierStatus = computed(() => {
-  const openai = providerLine('OpenAI', openaiReady.value, openaiPlaceholder.value)
-  const deepseek = providerLine('DeepSeek', deepseekReady.value, deepseekPlaceholder.value)
-  const fallback = !openaiReady.value && !deepseekReady.value ? '，当前可使用模拟分类' : ''
-  return `${openai}，${deepseek}${fallback}`
-})
-function backendLabel(name: string) {
-  if (name === 'mock') return '模拟分类'
-  if (name === 'deepseek') return 'DeepSeek'
-  return 'AI 分类'
-}
-const imageCodes = ref<Set<string>>(new Set())
-const knownCodes = ref<Set<string>>(new Set())
+const route = useRoute()
+const router = useRouter()
+const factory = computed(() => route.query.mode === 'factory')
+const task = computed(() => route.query.task === 'archive' ? 'archive' : route.query.task === 'sales' ? 'sales' : 'images')
+const targetCode = computed(() => typeof route.query.style === 'string' ? route.query.style : '')
+const selectedBackend = ref('auto')
+const openai = ref(false)
+const deepseek = ref(false)
+const healthReady = ref(false)
+const defaultBackend = ref('openai')
+const backend = computed(() => selectedBackend.value !== 'auto' ? selectedBackend.value :
+  defaultBackend.value === 'deepseek' && deepseek.value ? 'deepseek' : openai.value ? 'openai' : deepseek.value ? 'deepseek' : 'deferred')
+const history = ref<TableImportResult[]>([])
+const historyError = ref('')
 const error = ref('')
-const status = ref('')
-const uploading = ref(false)
-const dragging = ref(false)
-const retrying = ref('')
-const archiveReport = ref<TableReport | null>(null)
-const salesReport = ref<TableReport | null>(null)
-const tableError = ref('')
-const tableBusy = ref('')
-let queueKey = 0
-const labels: Record<ImportJob['status'], string> = {
-  queued: '等待处理', extracting: '正在抽图', tagging: '正在打标', completed: '已完成',
-  partial: '部分完成', failed: '处理失败', interrupted: '等待继续',
-}
-function duration(value: number) {
-  return value < 60 ? `${Math.max(0, Math.round(value))} 秒` : `${Math.floor(value / 60)} 分 ${Math.round(value % 60)} 秒`
-}
+const notice = ref('')
+const busy = ref('')
+const refreshNumber = ref(0)
+const tablePanel = ref<InstanceType<typeof TableImportPanel> | null>(null)
+const jobSignature = computed(() => jobs.value.map(j => `${j.id}:${j.status}`).join('|'))
+const refreshKey = computed(() => `${refreshNumber.value}|${jobSignature.value}`)
+const visibleJobs = computed(() => jobs.value.filter(j => {
+  if (!j.source_categories?.length || j.kind === 'retag') return true
+  return factory.value ? j.source_categories.includes('本厂产品') : j.source_categories.some(c => c !== '本厂产品')
+}))
+const labels: Record<ImportJob['status'], string> = { queued: '等待处理', extracting: '正在抽图', tagging: '正在分类', completed: '已完成', partial: '部分完成', failed: '处理失败', interrupted: '等待继续' }
+function backendLabel(value: string) { return value === 'deferred' ? '保存待分类' : value === 'mock' ? '模拟分类（测试）' : value === 'deepseek' ? 'DeepSeek 分类' : 'AI 分类' }
 function time(value: string) { return new Date(value).toLocaleString('zh-CN', { hour12: false }) }
-function relativePathOf(file: File) {
-  const relative = (file as File & { webkitRelativePath?: string }).webkitRelativePath
-  return (relative || file.name).replace(/\\/g, '/').replace(/^\/+/, '')
+function duration(value: number) { return value < 60 ? `${Math.round(value)} 秒` : `${Math.floor(value / 60)} 分 ${Math.round(value % 60)} 秒` }
+function setMode(value: boolean) { router.replace({ path: '/import', query: value ? { mode: 'factory' } : {} }) }
+async function startTask(kind: 'images' | 'archive' | 'sales', code = '') {
+  await router.replace({ path: '/import', query: { mode: 'factory', task: kind, ...(code ? { style: code } : {}) } })
+  await nextTick(); document.getElementById('import-work-area')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
-function addFiles(files: File[]) {
-  error.value = ''
-  status.value = ''
-  const skipped = files.filter(file => !ACCEPT.test(file.name) || file.name.startsWith('.') || relativePathOf(file).includes('__MACOSX'))
-  const allowed = files.filter(file => !skipped.includes(file))
-  if (skipped.length) error.value = `已跳过 ${skipped.length} 个不支持的文件，请使用 PDF、PPT、Excel 或图片。`
-  const existing = new Set(queued.value.map(item => item.relativePath.toLowerCase()))
-  for (const file of allowed) {
-    const relativePath = relativePathOf(file)
-    if (existing.has(relativePath.toLowerCase())) continue
-    existing.add(relativePath.toLowerCase())
-    queued.value.push({ key: `${queueKey++}`, file, relativePath, category: batchCategory.value })
-  }
+async function routeTable(kind: 'archive' | 'sales', file: File) { await startTask(kind); await nextTick(); tablePanel.value?.openFile(file) }
+async function loadHistory() {
+  try { history.value = await getTableHistory(); historyError.value = '' }
+  catch (e) { historyError.value = e instanceof Error ? e.message : String(e) }
 }
-function onFiles(event: Event) { addFiles(Array.from((event.target as HTMLInputElement).files || [])) }
-function onFolder(event: Event) {
-  const input = event.target as HTMLInputElement
-  const files = Array.from(input.files || [])
-  input.value = ''
-  status.value = ''
-  if (!files.length) {
-    error.value = '这个文件夹是空的，没有可导入的文件。'
-    return
-  }
-  const before = queued.value.length
-  addFiles(files)
-  if (queued.value.length === before) {
-    error.value = '这个文件夹里没有可导入的图片、PDF、PPT 或 Excel。'
-  }
+function tableCompleted() { refreshNumber.value++; loadHistory() }
+async function run(action: () => Promise<unknown>, key: string) {
+  busy.value = key; error.value = ''; notice.value = ''
+  try { await action() }
+  catch (e) { error.value = e instanceof Error ? e.message : String(e) }
+  finally { busy.value = '' }
 }
-function suffixHint(name: string): string {
-  const fileName = name.split(/[/\\]/).pop() || name
-  const stem = fileName.replace(/\.[^.]+$/, '').replace(/[\s\u3000]/g, '')
-  const base = stem.replace(/[\u4e00-\u9fff]+$/, '')
-  if (!base || base === stem || !/^[A-Za-z]*\d[A-Za-z0-9]*$/.test(base) || base.length < 4) return ''
-  const code = base.toUpperCase()
-  if (!knownCodes.value.has(code)) return ''
-  return `文件名疑似带客户后缀，应命名为 ${code}.jpg`
+async function retry(job: ImportJob) { await run(async () => { rememberJob(await retryJob(job.id)); await refreshJobs() }, job.id) }
+async function classify(job: ImportJob) { await run(async () => { rememberJob(await classifyBatch(backend.value, job.id)); await refreshJobs(); notice.value = '已为本批待分类图片创建任务。' }, job.id) }
+async function retagAll(overwrite: boolean) {
+  if (overwrite && !window.confirm('全量重新分类会创建新的审核建议，可能产生分类费用。确认继续？')) return
+  await run(async () => { rememberJob(await retag(backend.value, overwrite)); await refreshJobs() }, 'retag')
 }
-function jobSuffixHints(name: string): string[] {
-  const hints = new Set<string>()
-  for (const part of name.split('、')) {
-    const hint = suffixHint(part.trim())
-    if (hint) hints.add(hint)
-  }
-  return [...hints]
-}
-function salesWithoutLibrary(report: TableReport | null): string[] {
-  if (!report?.style_codes.length) return []
-  if (report.archive_without_image.length || report.image_without_archive.length) return []
-  return report.style_codes.filter(code => !imageCodes.value.has(code))
-}
-function salesGapLabel(report: TableReport, codes: string[]): string {
-  const quantity = (report.stored_quantity ?? 0).toLocaleString('zh-CN')
-  if (codes.length === 1) return `${codes[0]}（${quantity} 件）`
-  return `${codes.join('、')}（合计 ${quantity} 件）`
-}
-async function refreshKnownCodes() {
-  try {
-    const [meta, catalog] = await Promise.all([
-      getLibraryMeta(),
-      getCatalog({ source_category: '本厂产品' }),
-    ])
-    const images = new Set(catalog.items.map(item => item.style_code).filter(Boolean))
-    const codes = new Set<string>([...(meta.style_codes || []), ...images])
-    for (const report of [archiveReport.value, salesReport.value]) {
-      report?.style_codes.forEach(code => codes.add(code))
-    }
-    imageCodes.value = images
-    knownCodes.value = codes
-  } catch { /* 提醒仍可使用本次导入结果里的款号 */ }
-}
-function readEntry(entry: FileSystemEntry): Promise<File[]> {
-  return new Promise(resolve => {
-    if (entry.isFile) {
-      (entry as FileSystemFileEntry).file(file => {
-        const path = entry.fullPath.replace(/^\//, '') || file.name
-        Object.defineProperty(file, 'webkitRelativePath', { value: path })
-        resolve([file])
-      }, () => resolve([]))
-      return
-    }
-    if (!entry.isDirectory) { resolve([]); return }
-    const reader = (entry as FileSystemDirectoryEntry).createReader()
-    const children: FileSystemEntry[] = []
-    const readBatch = () => reader.readEntries(async batch => {
-      if (!batch.length) {
-        const nested: File[] = []
-        for (const child of children) nested.push(...await readEntry(child))
-        resolve(nested)
-        return
-      }
-      children.push(...batch)
-      readBatch()
-    }, () => resolve([]))
-    readBatch()
-  })
-}
-async function onDrop(event: DragEvent) {
-  dragging.value = false
-  if (uploading.value) return
-  const items = Array.from(event.dataTransfer?.items || [])
-  const entries = items.map(item => item.webkitGetAsEntry?.()).filter((entry): entry is FileSystemEntry => Boolean(entry))
-  status.value = ''
-  if (entries.length) {
-    const files: File[] = []
-    for (const entry of entries) files.push(...await readEntry(entry))
-    if (!files.length) {
-      error.value = '这个文件夹是空的，没有可导入的文件。'
-      return
-    }
-    const before = queued.value.length
-    addFiles(files)
-    if (queued.value.length === before) error.value = '这个文件夹里没有可导入的图片、PDF、PPT 或 Excel。'
-    return
-  }
-  const dropped = Array.from(event.dataTransfer?.files || [])
-  if (!dropped.length) {
-    error.value = '没有可导入的文件。'
-    return
-  }
-  addFiles(dropped)
-}
-function applyBatchCategory() {
-  if (!batchCategory.value) { error.value = '请先选择要套用的资料大类'; return }
-  error.value = ''
-  queued.value.forEach(item => { item.category = batchCategory.value })
-}
-async function runImport() {
-  error.value = ''; status.value = ''
-  if (!queued.value.length) { error.value = '请先选择文件'; return }
-  if (queued.value.some(item => !item.category)) { error.value = '请为每个文件选择资料大类，或使用「全部设为」。'; return }
-  uploading.value = true
-  try {
-    const job = await importFiles(queued.value.map(item => ({ file: item.file, relativePath: item.relativePath, category: item.category })), backend.value)
-    rememberJob(job)
-    queued.value = []
-    for (const id of ['import-files', 'import-folder']) {
-      const picker = document.getElementById(id) as HTMLInputElement | null
-      if (picker) picker.value = ''
-    }
-    status.value = '任务已提交，可以切换页面。完成后会提示，进度会保存在任务记录中。'
-    await refreshJobs()
-  } catch (reason) { error.value = reason instanceof Error ? reason.message : String(reason) }
-  finally { uploading.value = false }
-}
-async function uploadTable(kind: 'archive' | 'sales', event: Event) {
-  const file = (event.target as HTMLInputElement).files?.[0]
-  ;(event.target as HTMLInputElement).value = ''
-  if (!file) return
-  tableError.value = ''; tableBusy.value = kind
-  try {
-    const report = kind === 'archive' ? await importStyleArchive(file) : await importSalesSheet(file)
-    if (kind === 'archive') archiveReport.value = report
-    else salesReport.value = report
-    await refreshKnownCodes()
-  } catch (reason) { tableError.value = reason instanceof Error ? reason.message : String(reason) }
-  finally { tableBusy.value = '' }
-}
-async function runRetag(overwrite: boolean) {
-  if (overwrite && !window.confirm('全量重新分类会产生新的待审核建议，原人工结果会保留。确定继续吗？')) return
-  uploading.value = true; error.value = ''
-  try { rememberJob(await retag(backend.value, overwrite)); await refreshJobs() }
-  catch (reason) { error.value = reason instanceof Error ? reason.message : String(reason) }
-  finally { uploading.value = false }
-}
-async function retry(job: ImportJob) {
-  retrying.value = job.id; error.value = ''
-  try { rememberJob(await retryJob(job.id)); await refreshJobs() }
-  catch (reason) { error.value = reason instanceof Error ? reason.message : String(reason) }
-  finally { retrying.value = '' }
-}
-async function runRebuild() {
-  uploading.value = true; error.value = ''
-  try { await rebuildIndex(); status.value = '已刷新已审核与包含未审核的两种搜索索引' }
-  catch (reason) { error.value = reason instanceof Error ? reason.message : String(reason) }
-  finally { uploading.value = false }
-}
-function preview(values?: string[]) {
-  if (!values?.length) return '无'
-  return values.length > 12 ? `${values.slice(0, 12).join('、')} 等 ${values.length} 个` : values.join('、')
-}
+watch(factory, value => { if (value) loadHistory() })
 onMounted(async () => {
   try {
-    const health = await getHealth()
-    openaiReady.value = health.openai_ready
-    deepseekReady.value = Boolean(health.deepseek_ready)
-    openaiPlaceholder.value = Boolean(health.openai_placeholder)
-    deepseekPlaceholder.value = Boolean(health.deepseek_placeholder)
-    backend.value = health.default_backend || 'mock'
-    await refreshJobs()
-    await refreshKnownCodes()
-  } catch { error.value = '无法连接服务，请稍后刷新重试' }
+    const health = await getHealth(); openai.value = health.openai_ready; deepseek.value = Boolean(health.deepseek_ready); defaultBackend.value = health.default_backend || 'openai'; healthReady.value = true
+  } catch { error.value = '无法读取分类服务状态，请刷新重试。' }
+  refreshJobs(); if (factory.value) loadHistory()
 })
-watch(() => jobs.value.map(job => `${job.id}:${job.status}`).join(','), () => { refreshKnownCodes() })
 </script>
 
 <template>
-  <main class="import-page">
-    <div class="page-head"><div><h2>导入与处理任务</h2><p class="meta">分类完成后先在主页展示并标记未审核，再由人工确认。每个文件单独选择资料大类，抽出来的图片会继承该文件的大类。</p></div>
-      <span id="classifier-status" class="meta classifier-status">{{ classifierStatus }}</span></div>
-    <section class="import-upload" aria-label="上传资料">
-      <div class="dropzone" :class="{ dragging }" @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false" @drop.prevent="onDrop">
-        <strong>拖入 PDF / PPT / Excel，或图片、整个文件夹</strong>
-        <p class="meta">支持子文件夹。本厂产品的图片请直接用款号命名，例如 516083.jpg，一个款号只保留一张图。文件名里的空格会去掉。</p>
-        <div class="toolbar import-pickers">
-          <label for="import-files" class="btn">选择文件</label>
-          <label for="import-folder" class="btn">选择文件夹</label>
-        </div>
-        <input id="import-files" type="file" multiple accept=".pdf,.pptx,.xlsx,.xlsm,.jpg,.jpeg,.png,.webp,.gif,.bmp,.tif,.tiff" :disabled="uploading" @change="onFiles" />
-        <input id="import-folder" type="file" multiple webkitdirectory :disabled="uploading" @change="onFolder" />
-      </div>
-      <div class="toolbar import-batch">
-        <div class="field"><label for="batch-category">全部设为</label>
-          <select id="batch-category" v-model="batchCategory" :disabled="uploading">
-            <option value="">请选择资料大类</option>
-            <option v-for="item in SOURCE_CATEGORIES" :key="item" :value="item">{{ item }}</option>
-          </select>
-        </div>
-        <button class="btn" type="button" :disabled="uploading || !queued.length" @click="applyBatchCategory">应用到全部文件</button>
-      </div>
-      <ul v-if="queued.length" class="import-file-list"><li v-for="(item, index) in queued" :key="item.key">
-        <span>{{ item.relativePath }} <small>{{ fileSizeLabel(item.file.size) }}</small><small v-if="suffixHint(item.relativePath)" class="suffix-hint">{{ suffixHint(item.relativePath) }}</small></span>
-        <select :aria-label="`${item.relativePath} 的资料大类`" v-model="item.category" :disabled="uploading">
-          <option value="">选择大类</option>
-          <option v-for="category in SOURCE_CATEGORIES" :key="category" :value="category">{{ category }}</option>
-        </select>
-        <button class="btn" :disabled="uploading" :aria-label="`移除 ${item.relativePath}`" @click="queued.splice(index, 1)">移除</button>
-      </li></ul>
-      <div class="toolbar import-submit"><div class="field"><label for="tag-backend">分类方式</label>
-        <select id="tag-backend" v-model="backend" :disabled="uploading"><option value="deepseek">DeepSeek</option><option value="openai" :disabled="!openaiReady">GPT-4o-mini</option><option value="mock">模拟分类（测试）</option></select></div>
-        <button class="btn primary" :disabled="uploading" @click="runImport">{{ uploading ? '正在提交…' : '上传并开始分类' }}</button>
-      </div>
+  <main class="import-workspace">
+    <div class="workspace-heading"><div><h2>导入资料</h2><p class="meta">按资料用途开始，系统会帮你核对关联和待补内容。</p></div><RouterLink class="text-button" :to="{ path: '/', query: factory ? { source_category: '本厂产品' } : {} }">返回图库</RouterLink></div>
+    <div class="import-purpose" role="group" aria-label="资料用途"><button :aria-pressed="!factory" @click="setMode(false)"><span class="purpose-icon" aria-hidden="true">▧</span><span><strong>外部参考资料</strong><small>淘宝 / 网图、品牌资料、市调照片</small></span></button><button :aria-pressed="factory" @click="setMode(true)"><span class="purpose-icon" aria-hidden="true">▤</span><span><strong>本厂产品</strong><small>款式图片、款式档案与销量</small></span></button></div>
+    <template v-if="factory"><FactoryCompleteness :refresh-key="refreshKey" @task="startTask" /></template>
+    <div id="import-work-area" class="import-work-area">
+      <div v-if="factory" class="factory-task-nav" role="group" aria-label="本厂导入类型"><button :aria-pressed="task === 'images'" @click="startTask('images')"><strong>款式图片</strong><small>补图片、关联款号</small></button><button :aria-pressed="task === 'archive'" @click="startTask('archive')"><strong>款式档案</strong><small>款号、颜色、尺码等资料</small></button><button :aria-pressed="task === 'sales'" @click="startTask('sales')"><strong>销量数据</strong><small>订单明细、历史汇总</small></button></div>
+      <MediaImportPanel v-show="!factory" :factory="false" :backend="backend" target-code="" @table="routeTable" @submitted="refreshNumber++" />
+      <MediaImportPanel v-show="factory && task === 'images'" :factory="true" :backend="backend" :target-code="targetCode" @table="routeTable" @submitted="refreshNumber++" />
+      <TableImportPanel ref="tablePanel" v-show="factory && task !== 'images'" :kind="task === 'sales' ? 'sales' : 'archive'" :target-code="targetCode" @completed="tableCompleted" @task="startTask" />
+    </div>
+    <p v-if="healthReady && backend === 'deferred' && (!factory || task === 'images')" class="workspace-notice">当前未启用自动分类。图片可先保存为“待分类”，配置服务后可按批次继续，或直接人工审核。</p>
+    <p v-if="notice" class="workspace-notice" role="status">{{ notice }}</p><p v-if="error" class="error" role="alert">{{ error }}</p>
+    <section v-if="factory" class="table-history-section" aria-label="表格导入记录"><div class="section-heading"><h3>表格导入记录 <span class="meta">最近 {{ history.length }} 批</span></h3><button class="text-button" @click="loadHistory">刷新记录</button></div>
+      <p v-if="historyError" class="error" role="alert">{{ historyError }}</p><p v-else-if="!history.length" class="workspace-empty">确认导入后，结果会保存在这里。</p>
+      <details v-for="report in history" :key="report.id" class="table-history-row"><summary><span><strong>{{ report.source_file }}</strong><small>{{ time(report.created_at) }} · {{ report.kind === 'archive' ? '款式档案' : '销量' }}</small></span><span>新增 {{ report.imported }} / 更新 {{ report.updated }} / 无变化 {{ report.unchanged }}</span></summary><div><p>关联款号：{{ report.style_codes.slice(0, 20).join('、') }}{{ report.style_codes.length > 20 ? ` 等 ${report.style_codes.length} 款` : '' }}</p><p v-if="report.kind === 'sales'">该次导入完成时，这些款号计入 {{ report.stored_quantity?.toLocaleString() }} 件，¥{{ report.stored_amount?.toLocaleString() }}。</p><p v-if="report.issue_count" class="meta">跳过 {{ report.issue_count }} 行异常。</p><p class="meta">待补资料请以上方实时清单为准。</p></div></details>
     </section>
-    <section class="import-upload factory-import" aria-label="本厂款式档案与销量">
-      <h3>本厂款式档案与销量</h3>
-      <p class="meta">这两类 Excel 不抽图、不打标。款式档案按大货款号更新，新旧表都能导入。销量按订单明细入库，重复导入不会重复计数；旧的汇总表仍可导入，相同款号、颜色、尺码会相加。请不要把它们和图片放在上面的抽图任务里。</p>
-      <div class="toolbar">
-        <label class="btn" for="archive-file">{{ tableBusy === 'archive' ? '正在导入档案…' : '导入款式档案' }}</label>
-        <input id="archive-file" type="file" accept=".xlsx,.xlsm" :disabled="tableBusy !== ''" @change="uploadTable('archive', $event)" />
-        <label class="btn" for="sales-file">{{ tableBusy === 'sales' ? '正在导入销量…' : '导入销量' }}</label>
-        <input id="sales-file" type="file" accept=".xlsx,.xlsm" :disabled="tableBusy !== ''" @change="uploadTable('sales', $event)" />
-      </div>
-      <p v-if="tableError" class="error" role="alert">{{ tableError }}</p>
-      <div v-if="archiveReport" class="import-report" role="status">
-        <strong>款式档案 {{ archiveReport.source_file }}</strong>
-        <p v-if="archiveReport.format_label">识别为「{{ archiveReport.format_label }}」<template v-if="archiveReport.evidence_columns?.length">，依据列：{{ archiveReport.evidence_columns.join('、') }}</template>。</p>
-        <p>解析 {{ archiveReport.parsed_rows ?? archiveReport.variant_count }} 行，入库 {{ archiveReport.variant_count }} 行（新增 {{ archiveReport.imported }}，更新 {{ archiveReport.updated }}），跳过 {{ archiveReport.skipped_rows }} 行，涉及款号 {{ archiveReport.style_codes.length }} 个。</p>
-        <p v-if="archiveReport.warnings?.length" class="meta">{{ archiveReport.warnings.join('；') }}</p>
-        <p>有档案、还没有图片的款号：{{ preview(archiveReport.archive_without_image) }}</p>
-        <p>已有本厂图片、还没有档案的款号：{{ preview(archiveReport.image_without_archive) }}</p>
-      </div>
-      <div v-if="salesReport" class="import-report" role="status">
-        <strong>销量 {{ salesReport.source_file }}</strong>
-        <p v-if="salesReport.format_label">识别为「{{ salesReport.format_label }}」<template v-if="salesReport.evidence_columns?.length">，依据列：{{ salesReport.evidence_columns.join('、') }}</template>。</p>
-        <p>解析 {{ salesReport.parsed_rows ?? salesReport.row_count }} 行，入库 {{ salesReport.row_count }} 行（新增 {{ salesReport.imported }}，更新 {{ salesReport.updated }}），跳过 {{ salesReport.skipped_rows }} 行。</p>
-        <p>解析合计 {{ salesReport.parsed_quantity?.toLocaleString('zh-CN') }} 件 / {{ salesReport.parsed_amount?.toLocaleString('zh-CN') }} 元。库内该款合计 {{ salesReport.stored_quantity?.toLocaleString('zh-CN') }} 件 / {{ salesReport.stored_amount?.toLocaleString('zh-CN') }} 元。</p>
-        <p v-if="salesReport.reconcile_note" :class="{ error: salesReport.reconciled === false }">{{ salesReport.reconcile_note }}<template v-if="salesReport.sheet_quantity != null">（表底 {{ salesReport.sheet_quantity.toLocaleString('zh-CN') }} 件 / {{ salesReport.sheet_amount?.toLocaleString('zh-CN') }} 元）</template></p>
-        <p v-if="salesReport.order_count">订单 {{ salesReport.order_count }} 张，客户 {{ salesReport.customer_count }} 家。</p>
-        <p>有档案、还没有图片的款号：{{ preview(salesReport.archive_without_image) }}</p>
-        <p>已有本厂图片、还没有档案的款号：{{ preview(salesReport.image_without_archive) }}</p>
-        <p v-if="salesWithoutLibrary(salesReport).length">有销量、还没有图片或档案的款号：{{ salesGapLabel(salesReport, salesWithoutLibrary(salesReport)) }}。补上图片后就会在图库显示。</p>
-      </div>
-    </section>
-    <p v-if="status" class="review-notice" role="status">{{ status }}</p>
-    <p v-if="error" class="error" role="alert">{{ error }}</p>
-    <section class="import-tasks" aria-label="处理任务">
-      <div class="page-head"><h3>任务记录 <span class="meta">{{ jobs.length }} 批</span></h3><button class="btn" @click="refreshJobs">刷新进度</button></div>
-      <p v-if="jobsError" class="error" role="alert">{{ jobsError }}</p>
-      <p v-if="!jobs.length && !jobsError" class="empty">暂无任务记录。上方上传资料后，可在这里查看抽图和打标进度。更新前的资料保留在图库和审核队列中。</p>
-      <article v-for="job in jobs" :id="`job-${job.id}`" :key="job.id" class="import-task" :class="{ 'task-active': isActive(job) }">
-        <div class="task-heading"><strong>{{ job.name }}</strong><span class="task-state" :class="job.status">{{ labels[job.status] }}</span></div>
-        <p class="meta">{{ time(job.created_at) }} · {{ backendLabel(job.backend) }} · 已用 {{ duration(job.elapsed_seconds) }}<span v-if="job.eta_seconds !== null && job.eta_seconds > 0"> · 预计剩余约 {{ duration(job.eta_seconds) }}</span></p>
-        <template v-if="job.status === 'queued'"><p class="meta">前序任务完成后自动开始，无需重复提交。</p></template>
-        <template v-else-if="job.status === 'extracting'"><progress :value="job.files_processed" :max="job.files_total || 1" aria-label="文件抽图进度" /><p class="meta">抽图 {{ job.files_processed }} / {{ job.files_total }} 份资料 · {{ job.current_file }}</p></template>
-        <template v-else-if="job.total"><progress :value="job.processed" :max="job.total || 1" :aria-label="`${job.name}分类进度`" /><p class="meta">已处理 {{ job.processed }} / {{ job.total }} 张，成功 {{ job.succeeded }} 张，<template v-if="job.filtered">过滤非款式图 {{ job.filtered }} 张，</template><template v-if="job.skipped">跳过相同图片 {{ job.skipped }} 张，</template>失败 {{ job.failed }} 张<span v-if="job.status === 'tagging'"> · {{ job.current_file }}</span></p></template>
-        <p v-if="!job.total && !isActive(job) && !job.message.includes('请用下方对应入口')" class="meta">未生成可分类的图片。</p>
-        <p v-if="!isActive(job)" class="task-message" role="status">{{ job.message }}</p>
-        <p v-for="hint in jobSuffixHints(job.name)" :key="hint" class="meta">{{ hint }}</p>
-        <div class="toolbar"><RouterLink v-if="job.succeeded" class="btn" :to="{ path: '/review', query: job.kind === 'import' ? { batch: job.id } : {} }">审核本批图片</RouterLink>
-          <button v-if="['partial', 'failed', 'interrupted'].includes(job.status)" class="btn" :disabled="retrying === job.id" @click="retry(job)">{{ retrying === job.id ? '提交中…' : '继续处理未完成项' }}</button></div>
-        <details v-if="job.errors.length"><summary>查看 {{ job.errors.length }} 项异常</summary><ul class="task-errors"><li v-for="(item, index) in job.errors" :key="index"><strong>{{ item.name }}</strong><span>{{ item.message }}</span></li></ul></details>
+    <section class="workspace-jobs" aria-label="图片处理任务"><div class="section-heading"><h3>图片处理任务 <span class="meta">{{ visibleJobs.length }} 批</span></h3><button class="text-button" @click="refreshJobs">刷新进度</button></div>
+      <p v-if="jobsError" class="error" role="alert">{{ jobsError }}</p><p v-if="!visibleJobs.length" class="workspace-empty">上传后的处理进度会显示在这里，切换页面也会继续。</p>
+      <article v-for="job in visibleJobs" :id="`job-${job.id}`" :key="job.id" class="workspace-job"><div class="task-heading"><strong>{{ job.name }}</strong><span class="task-state" :class="job.status">{{ labels[job.status] }}</span></div><p class="meta">{{ time(job.created_at) }} · {{ backendLabel(job.backend) }} · 已用 {{ duration(job.elapsed_seconds) }}<span v-if="job.eta_seconds"> · 预计剩余 {{ duration(job.eta_seconds) }}</span></p>
+        <progress v-if="isActive(job)" :value="job.status === 'extracting' ? job.files_processed : job.processed" :max="job.status === 'extracting' ? job.files_total || 1 : job.total || 1" aria-label="图片处理进度" />
+        <p v-if="isActive(job)" class="meta">{{ job.status === 'queued' ? '已排队，无需重复提交。' : job.current_file }}</p><p v-else>{{ job.message }}</p><p v-if="job.total" class="meta">处理 {{ job.processed }} / {{ job.total }} 张，保留 {{ job.succeeded }} 张<span v-if="job.skipped">，跳过相同图 {{ job.skipped }} 张</span><span v-if="job.filtered">，过滤 {{ job.filtered }} 张</span><span v-if="job.failed">，失败 {{ job.failed }} 张</span></p>
+        <div class="toolbar"><RouterLink v-if="job.succeeded && !isActive(job)" class="btn small" :to="{ path: '/review', query: job.kind === 'import' ? { batch: job.id } : {} }">审核本批图片</RouterLink><button v-if="job.backend === 'deferred' && job.succeeded && !isActive(job) && backend !== 'deferred' && backend !== 'mock'" class="btn small" :disabled="!!busy" @click="classify(job)">继续分类本批</button><button v-if="['partial', 'failed', 'interrupted'].includes(job.status)" class="btn small" :disabled="!!busy" @click="retry(job)">重试未完成项</button></div><details v-if="job.errors.length"><summary>查看 {{ job.errors.length }} 项异常</summary><ul><li v-for="(item, index) in job.errors" :key="index">{{ item.name }}：{{ item.message }}</li></ul></details>
       </article>
     </section>
-    <details class="import-admin"><summary>分类与检索管理</summary><p class="meta">全量重打会重新提交审核，保留此前人工分类。已完成的历史任务不受影响。</p><div class="toolbar">
-      <button class="btn" :disabled="uploading" @click="runRetag(false)">补打未确认标签</button><button class="btn" :disabled="uploading" @click="runRetag(true)">全量重新分类</button><button class="btn" :disabled="uploading" @click="runRebuild">刷新检索索引</button></div></details>
+    <details class="workspace-advanced"><summary>高级设置与维护</summary><p class="meta">正常导入使用自动分类。模拟分类仅用于测试，不会生成真实识别结果。</p><label>分类方式 <select v-model="selectedBackend"><option value="auto">自动选择可用服务</option><option value="deferred">仅保存，稍后分类</option><option value="openai" :disabled="!openai">OpenAI{{ openai ? '' : '（未配置）' }}</option><option value="deepseek" :disabled="!deepseek">DeepSeek{{ deepseek ? '' : '（未配置）' }}</option><option value="mock">模拟分类（测试）</option></select></label><div class="toolbar"><button class="btn" :disabled="!!busy || backend === 'deferred'" @click="retagAll(false)">补充待分类图片</button><button class="btn" :disabled="!!busy || backend === 'deferred'" @click="retagAll(true)">全量重新分类</button><button class="btn" :disabled="!!busy" @click="run(async () => { await rebuildIndex(); notice = '检索索引已更新。' }, 'index')">刷新检索索引</button></div></details>
   </main>
 </template>

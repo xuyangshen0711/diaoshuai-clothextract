@@ -136,7 +136,7 @@ def apply_suggestion(record: ImageRecord, suggestion: FashionTags, backend_name:
 def needs_tagging(record: ImageRecord, overwrite: bool = False) -> bool:
     # Without overwrite, only fill untagged / mock placeholders still awaiting review.
     return overwrite or (not record.manually_edited and record.review_status == "pending"
-                         and record.tags_source in {"untagged", "mock"})
+                         and record.tags_source in {"untagged", "mock", "deferred"})
 
 
 def tag_records(records: list[ImageRecord], backend: str | None = None, overwrite: bool = False) -> list[ImageRecord]:

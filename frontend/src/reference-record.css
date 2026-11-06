@@ -1,0 +1,115 @@
+/* Reference records prioritize the garment, readable attributes, and its source. */
+.record-page.reference-record { max-width: 1440px; padding: 24px 40px 48px; }
+.record-redesign .record-topline { display: flex; justify-content: space-between; align-items: center; gap: 18px; margin-bottom: 18px; }
+.record-redesign .record-topline .record-breadcrumb { margin: 0; min-width: 0; }
+.record-neighbors { display: flex; gap: 8px; flex-shrink: 0; }
+.record-neighbors button { display: grid; place-items: center; width: 38px; height: 38px; border: 1px solid #d5c8b5; border-radius: 5px; background: var(--panel); color: var(--ink); cursor: pointer; }
+.record-neighbors svg { width: 18px; height: 18px; }
+.record-neighbors button:disabled { opacity: .35; cursor: default; }
+.record-neighbors button:not(:disabled):hover { border-color: #8d7551; background: var(--header); }
+.reference-record .reference-summary { grid-template-columns: minmax(0, 1fr) minmax(0, 1.06fr); gap: 44px; padding: 16px; align-items: start; border: 0; background: var(--panel); border-radius: 9px; }
+.reference-summary .product-image { height: auto; aspect-ratio: 1; max-height: 680px; background: #eeeae4; border-radius: 6px; }
+.reference-summary .product-image img { width: 100%; height: 100%; object-fit: contain; }
+.reference-summary .image-expand { width: 35px; height: 35px; top: 12px; right: 12px; border: 1px solid #ded5c7; border-radius: 5px; box-shadow: none; }
+.reference-summary .image-expand svg { width: 21px; height: 21px; }
+.reference-summary .preview-caption { justify-content: flex-start; flex-wrap: wrap; gap: 7px 15px; font-size: 12px; line-height: 1.6; padding: 16px 8px 9px; color: var(--muted); }
+.reference-summary .preview-caption button { font: inherit; color: #856238; white-space: nowrap; }
+.reference-summary .preview-caption > span { padding-left: 15px; border-left: 1px solid var(--line); }
+.reference-summary .preview-caption .image-quality-note { font-size: 11px; }
+.reference-summary .preview-notice { margin: 3px 8px 8px; }
+.reference-information { min-width: 0; padding: 0 5px 4px 0; }
+.reference-status { display: flex; gap: 15px; align-items: center; margin: 0 0 13px; color: var(--muted); font-size: 13px; }
+.reference-status .review-badge { font-size: 12px; padding: 2px 9px; }
+.reference-information h1 { font-family: var(--font); font-size: clamp(24px, 2.3vw, 33px); line-height: 1.5; letter-spacing: .01em; font-weight: 600; margin: 0; overflow-wrap: anywhere; }
+.reference-information .reference-description { margin: 8px 0 24px; color: var(--muted); font-size: 15px; line-height: 1.7; }
+.reference-attributes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 26px; margin: 24px 0 12px; font-size: 14px; }
+.reference-attributes > div { display: grid; grid-template-columns: 78px minmax(0, 1fr); gap: 10px; align-items: baseline; border-bottom: 1px solid var(--divider); padding: 9px 0; }
+.reference-attributes dt { color: var(--muted); }
+.reference-attributes dd { display: flex; align-items: center; gap: 8px; margin: 0; color: var(--ink); overflow-wrap: anywhere; }
+.reference-attributes .attribute-missing { color: #7a7063; }
+.reference-color { width: 15px; height: 15px; display: inline-block; flex-shrink: 0; border-radius: 3px; box-shadow: inset 0 0 0 1px #00000019; }
+.reference-tags-link { display: inline-flex; align-items: center; gap: 5px; border: 0; background: none; padding: 2px 0; font: inherit; font-size: 12px; color: var(--muted); cursor: pointer; }
+.reference-tags-link svg { height: 15px; width: 15px; }
+.reference-tags-link:hover { color: #856238; text-decoration: underline; text-underline-offset: 4px; }
+.reference-actions { display: flex; gap: 12px; align-items: stretch; margin: 24px 0 25px; }
+.reference-primary, .reference-secondary, .record-more > summary { min-height: 43px; display: flex; align-items: center; justify-content: center; border: 1px solid #bca98d; border-radius: 5px; padding: 10px 20px; font-size: 14px; line-height: 1.5; cursor: pointer; text-decoration: none; }
+.reference-actions .reference-primary { background: var(--ink); border-color: var(--ink); color: var(--panel); gap: 10px; min-width: 162px; }
+.reference-actions .reference-primary:hover { background: #44413b; }
+.reference-actions .reference-secondary { color: var(--ink); min-width: 142px; background: var(--panel); }
+.reference-actions .reference-secondary:hover { border-color: #80643d; background: var(--header); }
+.reference-primary svg { height: 20px; width: 20px; flex-shrink: 0; }
+.record-more { position: relative; flex-shrink: 0; }
+.record-more > summary { display: flex; list-style: none; font-size: 24px; line-height: 1; letter-spacing: 2px; padding: 6px 12px 12px; height: 100%; min-width: 44px; }
+.record-more > summary::-webkit-details-marker { display: none; }
+.record-more[open] > summary { background: var(--header); border-color: #80643d; }
+.record-more-popup { position: absolute; right: 0; top: calc(100% + 8px); z-index: 5; padding: 6px; min-width: 166px; border: 1px solid #d5c8b5; border-radius: 6px; background: var(--panel); box-shadow: 0 5px 14px #2b292613; }
+.record-more-popup > .cover-open, .record-more-popup > a { display: block; width: 100%; padding: 10px 13px; border: 0; background: transparent; color: var(--ink); text-align: left; font: inherit; font-size: 13px; text-decoration: none; cursor: pointer; border-radius: 3px; }
+.record-more-popup > .cover-open:hover, .record-more-popup > a:hover { background: var(--placeholder); }
+.reference-source { display: grid; grid-template-columns: 78px minmax(0, 1fr); gap: 15px; border-top: 1px solid var(--line); padding-top: 21px; }
+.reference-source h2 { font-family: var(--font); font-size: 14px; font-weight: 500; margin: 0; line-height: 1.8; }
+.reference-source-content { min-width: 0; }
+.reference-source-file { display: flex; align-items: flex-start; gap: 10px; font-size: 14px; line-height: 1.8; color: var(--ink); overflow-wrap: anywhere; }
+.reference-source-file svg { width: 21px; height: 23px; flex-shrink: 0; margin-top: 1px; }
+.reference-source-content p { margin: 8px 0 0; font-size: 12px; color: var(--muted); line-height: 1.7; }
+.reference-source-meta { display: flex; flex-wrap: wrap; gap: 4px 13px; }
+.reference-source-time { display: flex; flex-wrap: wrap; gap: 4px 12px; }
+.reference-source-category { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-top: 14px; color: var(--muted); font-size: 12px; }
+.reference-source-category .category-unset { color: #92581e; }
+.reference-source-category button { border: 1px solid #bca98d; border-radius: 4px; padding: 4px 9px; background: var(--panel); font: inherit; color: #806039; cursor: pointer; }
+.reference-category-editor { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 12px; font-size: 12px; }
+.reference-category-editor label { color: var(--muted); }
+.reference-category-editor select { max-width: 100%; border: 1px solid #bca98d; padding: 5px 8px; background: var(--panel); border-radius: 4px; font: inherit; min-height: 36px; }
+.reference-category-editor button { padding: 5px; background: none; border: 0; color: var(--muted); font: inherit; cursor: pointer; }
+.reference-source-content .category-message { color: var(--approved); }
+.reference-source-content .reference-review-note { margin-top: 15px; font-size: 12px; color: #766d60; }
+.reference-record .record-archive-panel { margin-top: 22px; padding: 0; border: 0; background: transparent; }
+.reference-extras { border: 1px solid var(--line); border-radius: 6px; background: var(--panel); padding: 0 22px; }
+.reference-extras > summary { cursor: pointer; font-size: 14px; padding: 16px 0; color: var(--ink); }
+.reference-extras > .record-extras-content { border-top: 1px solid var(--divider); padding: 3px 0 10px; }
+.reference-record .record-archive-panel .reference-extras .detail-fold { margin: 0; padding: 16px 0; }
+.reference-extras .record-tag-table { max-width: 100%; }
+.reference-extras .detail-fold { scroll-margin-top: 20px; }
+.reference-extras .image-history { margin-top: 15px; }
+.reference-record :focus-visible { outline: 2px solid #9d7a46; outline-offset: 3px; }
+@media (min-width: 1600px) { .reference-record .reference-summary { gap: 48px; } }
+@media (max-width: 1100px) {
+  .record-page.reference-record { padding: 22px 24px 40px; }
+  .reference-record .reference-summary { gap: 28px; grid-template-columns: minmax(0, 1fr) minmax(0, 1.12fr); }
+  .reference-attributes { gap: 0 17px; font-size: 13px; }
+  .reference-attributes > div { grid-template-columns: 63px minmax(0, 1fr); gap: 7px; }
+  .reference-actions { gap: 9px; }
+  .reference-actions .reference-primary, .reference-actions .reference-secondary { min-width: 0; padding-left: 16px; padding-right: 16px; }
+  .reference-source { grid-template-columns: 1fr; gap: 10px; }
+  .reference-summary .preview-caption > .image-quality-note { width: 100%; border: 0; padding-left: 0; }
+}
+@media (max-width: 800px) {
+  .record-page.reference-record { padding: 20px 16px 40px; }
+  .reference-record .reference-summary { grid-template-columns: 1fr; gap: 24px; padding: 18px; }
+  .reference-summary .product-preview { max-width: 570px; width: 100%; margin: 0 auto; }
+  .reference-summary .product-image { max-height: 550px; }
+  .reference-information { padding: 0; }
+  .reference-information h1 { font-size: 26px; }
+  .reference-source { grid-template-columns: 78px minmax(0, 1fr); gap: 15px; }
+  .reference-attributes { gap: 0 24px; font-size: 14px; }
+  .reference-attributes > div { grid-template-columns: 78px minmax(0, 1fr); }
+}
+@media (max-width: 480px) {
+  .record-redesign .record-topline { gap: 8px; margin-bottom: 15px; }
+  .record-neighbors { gap: 5px; }
+  .record-neighbors button { width: 30px; height: 32px; }
+  .reference-record .reference-summary { padding: 13px; gap: 20px; }
+  .reference-summary .preview-caption { padding: 12px 0 0; }
+  .reference-status { margin-bottom: 9px; font-size: 12px; }
+  .reference-information h1 { font-size: 24px; }
+  .reference-information .reference-description { font-size: 14px; margin: 8px 0 18px; }
+  .reference-attributes { gap: 0 15px; margin: 18px 0 10px; font-size: 13px; }
+  .reference-attributes > div { grid-template-columns: 57px minmax(0, 1fr); gap: 6px; }
+  .reference-actions { margin: 22px 0; gap: 8px; }
+  .reference-actions .reference-primary, .reference-actions .reference-secondary { flex: 1; padding: 9px 10px; font-size: 13px; }
+  .reference-source { grid-template-columns: 1fr; gap: 12px; }
+  .reference-source-file { font-size: 13px; }
+  .reference-extras { padding: 0 16px; }
+  .reference-extras > summary { font-size: 13px; }
+}
+@media (max-width: 360px) { .reference-attributes { grid-template-columns: 1fr; } }
+@media (prefers-reduced-motion: reduce) { .reference-record * { scroll-behavior: auto !important; } }

@@ -96,6 +96,7 @@ def public_job(job):
         "files_total": len(job["files"]), "files_processed": sum(f["state"] != "pending" for f in job["files"]),
         "elapsed_seconds": round(elapsed), "eta_seconds": eta, "current_file": job.get("current_file", ""),
         "message": job.get("message", ""),
+        "source_categories": sorted({f.get("source_category", UNCLASSIFIED_SOURCE) for f in job["files"]}),
         "errors": [{"name": i.get("name", "图片"), "message": i["error"]}
                    for i in [*job["files"], *job["items"]] if i.get("error")],
     }
@@ -126,10 +127,11 @@ def create_import(files: list[Path], backend: str, job_id=None, source_categorie
     return job
 
 
-def create_retag(backend: str, overwrite: bool, source_type: str | None = None, limit: int = 0):
+def create_retag(backend: str, overwrite: bool, source_type: str | None = None, limit: int = 0, batch_id: str | None = None):
     job = _base("retag", backend, "全量重新分类" if overwrite else "补充未确认分类")
     targets = [r for r in catalog.load_catalog()
-               if (not source_type or r.source.source_type == source_type) and needs_tagging(r, overwrite)]
+               if (not source_type or r.source.source_type == source_type)
+               and (not batch_id or r.source.batch_id == batch_id) and needs_tagging(r, overwrite)]
     job["items"] = [{"record": r.model_dump(), "name": r.source.source_file + " / " + r.source.location,
                      "state": "pending", "error": ""} for r in targets[:limit or None]]
     with catalog._database() as conn:
@@ -223,7 +225,7 @@ def _tag_replacement(item, tagger, job) -> str:
         with catalog._database() as conn:
             _put(conn, job)
         return "done"
-    suggestion = tagger.tag(new_path, target.notes.text())
+    suggestion = tagger.tag(new_path, target.notes.text()) if tagger else None
     with catalog._database() as conn:
         current_row = conn.execute("SELECT payload FROM records WHERE id=?", (target_id,)).fetchone()
         if not current_row:
@@ -317,7 +319,7 @@ def run_job(job_id):
         job["attempt_baseline"] = sum(i["state"] == "done" for i in job["items"])
         with catalog._database() as conn:
             _put(conn, job)
-        tagger = get_tagger(job["backend"]) if any(i["state"] == "pending" for i in job["items"]) else None
+        tagger = get_tagger(job["backend"]) if job["backend"] != "deferred" and any(i["state"] == "pending" for i in job["items"]) else None
         blocked = ""
         for item in job["items"]:
             if item["state"] != "pending":
@@ -336,15 +338,18 @@ def run_job(job_id):
                     current = conn.execute("SELECT revision FROM records WHERE id=?", (record.id,)).fetchone()
                     if current and current[0] != record.revision:
                         raise CatalogConflict("这张图片已更新，请检查后重试")
-                suggestion = tagger.tag(record.image_path, record.notes.text())
+                suggestion = tagger.tag(record.image_path, record.notes.text()) if tagger else None
                 # Commit the image and its task checkpoint together: retries never re-bill completed items.
                 with catalog._database() as conn:
-                    if suggestion is None:
+                    if job["backend"] == "deferred":
+                        record.tags_source = "deferred"
+                        record.revision = catalog._save(conn, record)
+                    elif suggestion is None:
                         _drop_non_garment(conn, record, existing=current is not None)
                     else:
                         apply_suggestion(record, suggestion, tagger.name)
                         record.revision = catalog._save(conn, record)
-                    item.update(state="done", error="", filtered=suggestion is None, record=record.model_dump())
+                    item.update(state="done", error="", filtered=suggestion is None and job["backend"] != "deferred", record=record.model_dump())
                     _put(conn, job)
             except Exception as exc:
                 item["state"], item["error"] = "failed", friendly_error(exc)
@@ -364,6 +369,8 @@ def run_job(job_id):
                    "图片均不是服装款式图，已全部过滤" if filtered else
                    "未找到需要处理的图片，请检查资料内容" if not successes else
                    "图片与已有款号相同，未重复导入")
+        if job["backend"] == "deferred" and kept and not has_errors:
+            message = "图片已保存，等待分类；可先核对款号并人工审核。"
         if filtered and not blocked:
             message += f"（已自动过滤 {filtered} 张非款式图）"
         replacements = sum(bool(item.get("replacement")) for item in job["items"])

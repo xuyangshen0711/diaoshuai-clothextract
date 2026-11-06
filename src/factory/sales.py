@@ -46,6 +46,16 @@ def _blank(row) -> bool:
     return not row or all(cell is None or str(cell).strip() == "" for cell in row)
 
 
+def is_total_row(row, indexes) -> bool:
+    if any(word in " ".join(str(cell or "") for cell in row) for word in ("合计", "总计")):
+        return True
+    # Older ERP exports have a numeric-only footer with no 合计 label.
+    return (not any(plain_text(cell_at(row, indexes.get(name))) for name in
+                    ("款号", "颜色", "尺码", "订单号", "订单", "客户"))
+            and any(parse_number(cell_at(row, indexes.get(name))) is not None
+                    for name in ("订单数量", "订单金额")))
+
+
 def parse_sales_rows(path: Path) -> tuple[list[dict], dict]:
     rows = load_sheet_rows(path)
     if table_kind_from_headers(sheet_headers(rows)) == "archive":
@@ -87,7 +97,7 @@ def _parse_summary(rows, indexes) -> tuple[list[dict], dict]:
         color = plain_text(cell_at(row, indexes.get("颜色")))
         size_label = plain_text(cell_at(row, indexes.get("尺码")))
         if code is None:
-            if quantity is not None or amount is not None:
+            if is_total_row(row, indexes):
                 if quantity is not None:
                     sheet_quantity = int(round(quantity))
                 if amount is not None:
@@ -152,7 +162,7 @@ def _parse_lines(rows, indexes) -> tuple[list[dict], dict]:
         size_label = plain_text(cell_at(row, indexes.get("尺码")))
         order_no = plain_text(cell_at(row, order_index))
         if code is None:
-            if quantity is not None or amount is not None:
+            if is_total_row(row, indexes):
                 if quantity is not None:
                     sheet_quantity = int(round(quantity))
                 if amount is not None:
@@ -224,16 +234,13 @@ def _reconcile(parsed_quantity, parsed_amount, sheet_quantity, sheet_amount) -> 
 def _stored_totals(conn, style_codes: list[str]) -> tuple[int, float]:
     if not style_codes:
         return 0, 0.0
-    placeholders = ",".join("?" for _ in style_codes)
-    sales = conn.execute(
-        f"SELECT COALESCE(SUM(quantity), 0), COALESCE(SUM(amount), 0) FROM style_sales WHERE style_code IN ({placeholders})",
-        style_codes,
-    ).fetchone()
-    lines = conn.execute(
-        f"SELECT COALESCE(SUM(quantity), 0), COALESCE(SUM(amount), 0) FROM style_order_lines WHERE style_code IN ({placeholders})",
-        style_codes,
-    ).fetchone()
-    return int(sales[0]) + int(lines[0]), float(sales[1]) + float(lines[1])
+    from src.factory.sales_policy import counted_summaries
+    selected = set(style_codes)
+    sales = [row for row in counted_summaries(conn) if row["style_code"] in selected]
+    lines = [row for row in conn.execute("SELECT style_code, quantity, amount FROM style_order_lines")
+             if row["style_code"] in selected]
+    return (sum(int(row["quantity"]) for row in [*sales, *lines]),
+            sum(float(row["amount"]) for row in [*sales, *lines]))
 
 
 def import_sales(path: Path, source_name: str | None = None) -> dict:

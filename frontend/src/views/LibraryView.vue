@@ -6,6 +6,7 @@ import {
   getCatalog,
   getFilters,
   getLibraryMeta,
+  getFactoryWorkspace,
   getTaxonomy,
   type CatalogItem,
   type FilterMeta,
@@ -94,6 +95,12 @@ const sort = computed(() =>
 )
 const periodOptions = computed(() => libraryMeta.value.factory['下单'] || [])
 const ownFactory = computed(() => sourceCategory.value === '本厂产品')
+const pendingFactory = ref(0)
+watch(ownFactory, async value => {
+  if (!value) return
+  try { const data = await getFactoryWorkspace(); pendingFactory.value = data.counts.missing_images }
+  catch { /* Import workspace has a visible retry state if the service is unavailable. */ }
+}, { immediate: true })
 const statusOptions = [
   { value: '', label: '全部' },
   { value: 'pending', label: '未审核' },
@@ -360,6 +367,10 @@ watch(() => route.query, load, { deep: true })
           {{ item }}
         </button>
       </div>
+    </div>
+    <div v-if="ownFactory" class="factory-library-tools">
+      <RouterLink :to="{ path: '/import', query: { mode: 'factory' } }">管理本厂资料与导入</RouterLink>
+      <span v-if="pendingFactory">{{ pendingFactory }} 个款号已导入数据，待补图片</span>
     </div>
     <div class="library-filters">
       <div class="filter-row">
@@ -647,7 +658,7 @@ watch(() => route.query, load, { deep: true })
               height="640"
             />
             <span class="gallery-review-badge" :class="item.review_status">{{
-              item.review_status === 'approved' ? '已审核' : '未审核'
+              item.review_status === 'approved' ? '已审核' : item.tags_source === 'deferred' ? '待分类' : '未审核'
             }}</span>
             <span v-if="item.source_category === '本厂产品'" class="gallery-factory-badge"
               >本厂产品</span
