@@ -46,17 +46,9 @@ def cover_path(record: ImageRecord) -> Path:
     return thumbnail_path(record.id, record.image_path, record.cover_crop)
 
 
-def thumbnail_path(record_id: str, source: str | Path, crop: CoverCrop | None = None) -> Path:
-    folder = catalog.PROCESSED_DIR / "thumbnails"
+def _render_thumbnail_file(local: Path, target: Path, crop: CoverCrop | None = None) -> Path:
+    folder = target.parent
     folder.mkdir(parents=True, exist_ok=True)
-    # IDs can come from legacy JSON; hash them rather than treating them as paths.
-    key = hashlib.sha256(record_id.encode()).hexdigest()[:24]
-    ver = image_version(source)
-    crop_key = f"-crop-{hashlib.sha256(crop.model_dump_json().encode()).hexdigest()[:12]}" if crop else ""
-    target = folder / f"{key}-{ver}{crop_key}.jpg"
-    if target.exists():
-        return target
-    local = storage.local_file(source)
     with Image.open(local) as original:
         image = ImageOps.exif_transpose(original)
         if crop is not None:
@@ -83,3 +75,40 @@ def thumbnail_path(record_id: str, source: str | Path, crop: CoverCrop | None = 
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
     return target
+
+
+def thumbnail_path(record_id: str, source: str | Path, crop: CoverCrop | None = None) -> Path:
+    folder = catalog.PROCESSED_DIR / "thumbnails"
+    folder.mkdir(parents=True, exist_ok=True)
+    # IDs can come from legacy JSON; hash them rather than treating them as paths.
+    key = hashlib.sha256(record_id.encode()).hexdigest()[:24]
+    ver = image_version(source)
+    crop_key = f"-crop-{hashlib.sha256(crop.model_dump_json().encode()).hexdigest()[:12]}" if crop else ""
+    target = folder / f"{key}-{ver}{crop_key}.jpg"
+    if target.exists():
+        return target
+    local = storage.local_file(source)
+    return _render_thumbnail_file(local, target, crop)
+
+
+def warm_thumbnail_from_local(record: ImageRecord, local_source: str | Path | None) -> None:
+    """Pre-build gallery thumbnail directly from local extracted/uploaded bytes before OSS cleanup."""
+    if not local_source or not record.image_path:
+        return
+    local = Path(local_source)
+    if not local.is_file():
+        return
+    try:
+        folder = catalog.PROCESSED_DIR / "thumbnails"
+        key = hashlib.sha256(record.id.encode()).hexdigest()[:24]
+        ver = image_version(record.image_path)
+        plain = folder / f"{key}-{ver}.jpg"
+        if not plain.exists():
+            _render_thumbnail_file(local, plain, None)
+        if record.cover_crop is not None:
+            crop_key = f"-crop-{hashlib.sha256(record.cover_crop.model_dump_json().encode()).hexdigest()[:12]}"
+            cropped = folder / f"{key}-{ver}{crop_key}.jpg"
+            if not cropped.exists():
+                _render_thumbnail_file(local, cropped, record.cover_crop)
+    except Exception:
+        pass

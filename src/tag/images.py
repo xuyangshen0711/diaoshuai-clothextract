@@ -9,7 +9,8 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from src.storage import local_file
 from src.tag.errors import TaggingError
 
-MAX_SIDE = 2048
+MAX_SIDE = 1280
+JPEG_QUALITY = 85
 MAX_PIXELS = 40_000_000
 MAX_SOURCE_BYTES = 100 * 1024 * 1024
 
@@ -28,14 +29,19 @@ def image_data_url(path, max_encoded_bytes=32 * 1024 * 1024) -> str:
                 source.seek(0)
                 picture = ImageOps.exif_transpose(source)
                 picture.thumbnail((MAX_SIDE, MAX_SIDE), Image.Resampling.LANCZOS)
-                use_png = source.format == "PNG" or "A" in picture.getbands() or "transparency" in picture.info
-                picture = picture.convert("RGBA" if use_png else "RGB")
+                has_alpha = picture.mode in {"RGBA", "LA"} or "A" in picture.getbands() or "transparency" in picture.info
+                if has_alpha:
+                    rgba = picture.convert("RGBA")
+                    flat = Image.new("RGB", rgba.size, (255, 255, 255))
+                    flat.paste(rgba, mask=rgba.getchannel("A"))
+                    picture = flat
+                else:
+                    picture = picture.convert("RGB")
                 output = io.BytesIO()
-                picture.save(output, format="PNG" if use_png else "JPEG", quality=92)
+                picture.save(output, format="JPEG", quality=JPEG_QUALITY, optimize=True)
     except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
         raise TaggingError("图片无法解码，请检查 JPEG、PNG、WebP、GIF、BMP 或 TIFF 原图是否完整。") from exc
     raw = output.getvalue()
     if 4 * ((len(raw) + 2) // 3) > max_encoded_bytes:
         raise TaggingError("图片编码后超过 32 MiB，请压缩图片后重试；原图已保留。")
-    mime = "image/png" if use_png else "image/jpeg"
-    return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+    return f"data:image/jpeg;base64,{base64.b64encode(raw).decode('ascii')}"

@@ -359,3 +359,86 @@ def test_mysql_zero_sql_warm_snapshots_and_read_endpoints_preserve_epoch(store, 
     assert catalog._fresh_mysql_catalog_snapshot(None) is None
     assert library._fresh_mysql_factory_snapshot(None) is None
 
+
+def test_fast_vision_derivative_6way_parallel_import_and_thumbnail_prewarm(store, monkeypatch):
+    import base64
+    import io
+    import threading
+    import time
+    from src import import_jobs as tasks
+    from src.tag import images as tag_images
+    from src.tag.tagger import MockTagger
+
+    # 1. Verify large RGBA PNG is shrunk to <=1280px white-composited JPEG in memory while preserving original PNG on disk!
+    big_png = store / "raw" / "lookbook_hd.png"
+    big_png.parent.mkdir(parents=True, exist_ok=True)
+    rgba = Image.new("RGBA", (2400, 3200), (255, 0, 0, 0))
+    rgba.paste((30, 60, 120, 255), (400, 400, 2000, 2800))
+    rgba.save(big_png, format="PNG")
+    orig_bytes = big_png.read_bytes()
+
+    data_url = tag_images.image_data_url(big_png)
+    assert data_url.startswith("data:image/jpeg;base64,")
+    decoded = base64.b64decode(data_url.split(",", 1)[1])
+    assert len(decoded) < 200 * 1024  # compact upload payload (<200 KB)
+    with Image.open(io.BytesIO(decoded)) as sent_img:
+        assert sent_img.format == "JPEG"
+        assert max(sent_img.size) == 1280
+        assert sent_img.getpixel((10, 10))[0] > 245  # transparent border composited onto white
+    assert big_png.read_bytes() == orig_bytes  # original file untouched!
+
+    # 2. Verify 6-way parallel AI tagging + local thumbnail pre-warming (0 OSS GETs on gallery browse!)
+    bucket = CountingOSSBucket()
+    storage.set_bucket_override(bucket)
+    tasks.shutdown_worker()
+    assert tasks.AI_CONCURRENCY == 6
+
+    active_lock = threading.Lock()
+    state = {"active": 0, "peak": 0}
+
+    class ParallelSlowTagger(MockTagger):
+        name = "deepseek"
+
+        def tag(self, image_path, context=""):
+            with active_lock:
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+            try:
+                time.sleep(0.18)
+                return super().tag(image_path, context)
+            finally:
+                with active_lock:
+                    state["active"] -= 1
+
+    monkeypatch.setattr(tasks, "get_tagger", lambda _b: ParallelSlowTagger())
+
+    upload_paths = []
+    for i in range(6):
+        p = store / "raw" / f"69000{i}.png"
+        Image.new("RGB", (900, 1200), (20 * i, 40, 90)).save(p, format="PNG")
+        upload_paths.append(p)
+
+    t0 = time.monotonic()
+    job = tasks.create_import(upload_paths, "deepseek", source_categories=["本厂产品"] * 6)
+    try:
+        tasks.run_job(job["id"])
+    finally:
+        tasks.shutdown_worker()
+    elapsed = time.monotonic() - t0
+
+    pub = tasks.public_job(tasks.get_job(job["id"]))
+    assert pub["status"] == "completed" and pub["succeeded"] == 6
+    assert state["peak"] >= 4  # ran concurrently across 6 workers rather than 2-by-2!
+    assert elapsed < 0.9
+
+    # Serving all 6 gallery thumbnails must make 0 OSS get_object_to_file calls because thumbnails were pre-warmed from local!
+    bucket.get_calls = 0
+    client = TestClient(api.app)
+    items = client.get("/api/catalog", params={"source_category": "本厂产品"}).json()["items"]
+    assert len(items) == 6
+    for item in items:
+        res = client.get(item["thumbnail_url"])
+        assert res.status_code == 200
+    assert bucket.get_calls == 0
+
+

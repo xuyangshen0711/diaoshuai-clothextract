@@ -36,14 +36,15 @@ REQUEST_TIMEOUT = httpx.Timeout(180.0, connect=30.0)
 MAX_ATTEMPTS = 3
 BACKOFF_SECONDS = (1.0, 2.0, 4.0)
 _FALSE = {"0", "false", "no", "off", "disabled"}
+_TRUE = {"1", "true", "yes", "on", "enabled"}
 
 
 def thinking_enabled(value: str | None = None) -> bool:
-    """Thinking stays on unless DEEPSEEK_THINKING is an explicit false value."""
-    raw = os.getenv("DEEPSEEK_THINKING") if value is None else value
+    """Vision tagging disables chain-of-thought by default for speed unless DEEPSEEK_VISION_THINKING opts in."""
+    raw = os.getenv("DEEPSEEK_VISION_THINKING") if value is None else value
     if raw is None or not str(raw).strip():
-        return True
-    return str(raw).strip().strip('"').strip("'").lower() not in _FALSE
+        return False
+    return str(raw).strip().strip('"').strip("'").lower() in _TRUE
 
 
 def _image_data_url(path: Path) -> str:
@@ -125,6 +126,11 @@ class DeepSeekTagger:
         }
         if http_client is not None:
             kwargs["http_client"] = http_client
+        else:
+            kwargs["http_client"] = httpx.Client(
+                timeout=REQUEST_TIMEOUT,
+                limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+            )
         self.client = OpenAI(**kwargs)
         self.model = (model or os.getenv("DEEPSEEK_MODEL") or DEFAULT_MODEL).strip()
         self.thinking = thinking_enabled() if thinking is None else thinking

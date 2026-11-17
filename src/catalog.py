@@ -180,7 +180,7 @@ def _bootstrap_schema_and_migrations(conn) -> None:
 
 
 @contextmanager
-def _database(*, read_only: bool = False):
+def _database(*, read_only: bool = False, bump_catalog: bool = True):
     ensure_data_dirs()
     conn = connect(DATABASE_PATH)
     cleanups: list[Path] = []
@@ -211,7 +211,8 @@ def _database(*, read_only: bool = False):
             conn.rollback()
         else:
             conn.commit()
-            bump_mutation_epoch()
+            if bump_catalog:
+                bump_mutation_epoch()
             for path in cleanups:
                 path.unlink(missing_ok=True)
     except Exception:

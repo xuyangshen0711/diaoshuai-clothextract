@@ -1,23 +1,23 @@
 {
-  "release": "20261117-speed-optimization-v2",
-  "base_commit": "7e363fcd4c65467e5a3295741c0a7873c969b007",
-  "base_code_sha256": "00bf829ec7a1e72b0a1dae023b4854174295b242008abac7f3e333d1364a7723",
-  "previous_release": "20261117-speed-optimization",
+  "release": "20261117-vision-speed",
+  "base_commit": "e3c1b6fdb8904776a887baddf3c18bbf85199893",
+  "base_code_sha256": "1b170a7a6cbe15539ca4ae4f03f1e6c9a5e9c73b927ce5c6bd580f5bde1acd7e",
+  "previous_release": "20261117-speed-optimization-v2",
   "includes_local_changes": true,
   "prebuilt_frontend": true,
   "business_data_included": false,
   "local_configuration_included": false,
   "database_schema_changes": false,
   "preserved_features": [
+    "whole-site browsing speed v2",
     "yarn-and-color-report",
     "order-season multiselect",
     "order preview and batch import optimizations",
     "archive 500-row batch import"
   ],
   "validation": {
-    "regressions": "All factory, analytics, yarn-table, response-speed, image-quality, storage, taxonomy, and site-gate suites passed (47 passed, 0 failed)",
-    "backend_speed": "Zero-SQL MySQL RDS warm snapshot TTL with instant 0ms mutation-epoch invalidation, eliminated LONGTEXT/FLOAT full-table stamp scans on RDS, switched pure-read endpoints to read_database(), single-record detail defers uncached OSS original downloads, pooled MySQL RDS connections, and single-HEAD thumbnail fast-path",
-    "frontend_speed": "Progressive 72-card rendering with IntersectionObserver on large galleries, instant client-side read-cache with automatic write invalidation, and non-blocking workspace banner",
-    "live_rds_and_oss": "Pre-edit online /opt/diaoshuai and local main project verified identical (213 files, 00bf829ec7a1e72b0a1dae023b4854174295b242008abac7f3e333d1364a7723)"
+    "regressions": "All vision tagging, response-speed, factory, analytics, yarn-table, image-quality, storage, taxonomy, and site-gate suites passed (62 passed, 0 failed)",
+    "vision_speed": "Disabled redundant chain-of-thought reasoning by default for DeepSeek vision tagging (1.15s single image vs 4.27s+ previously), shrank in-memory vision derivative to 1280px white-composited JPEG while preserving 100% original image bytes in OSS, raised AI_CONCURRENCY from 2 to 6 with pooled Keep-Alive HTTP connections (6 real garment images recognized in 1.39s total), pre-warmed gallery thumbnails directly from local files before OSS cleanup, and eliminated N+1 DB scans/transactions during batch import",
+    "live_rds_and_oss": "Pre-edit online /opt/diaoshuai and local main project verified identical (213 files, 1b170a7a6cbe15539ca4ae4f03f1e6c9a5e9c73b927ce5c6bd580f5bde1acd7e)"
   }
 }

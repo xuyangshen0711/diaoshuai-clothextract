@@ -65,14 +65,15 @@ def _tagger(handler, monkeypatch, **kwargs) -> tuple[DeepSeekTagger, list]:
         seen.append(json.loads(request.content.decode()))
         return handler(request, seen)
 
-    monkeypatch.delenv("DEEPSEEK_THINKING", raising=False)
+    monkeypatch.delenv("DEEPSEEK_VISION_THINKING", raising=False)
+    monkeypatch.setenv("DEEPSEEK_THINKING", "true")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-deepseek-key-0123456789")
     client = httpx.Client(transport=httpx.MockTransport(transport))
     tagger = DeepSeekTagger(http_client=client, **kwargs)
     return tagger, seen
 
 
-def test_thinking_defaults_on_and_json_object_stays_in_the_user_message(tmp_path, monkeypatch):
+def test_thinking_defaults_off_for_fast_vision_and_json_stays_in_user_message(tmp_path, monkeypatch):
     image = _png(tmp_path / "look.png")
 
     def handler(request, seen):
@@ -84,9 +85,9 @@ def test_thinking_defaults_on_and_json_object_stays_in_the_user_message(tmp_path
     body = seen[0]
     assert body["model"] == "deepseek-flash"
     assert body["response_format"] == {"type": "json_object"}
-    assert body["thinking"] == {"type": "enabled"}
-    assert "temperature" not in body
-    assert body["max_tokens"] == 8192
+    assert body["thinking"] == {"type": "disabled"}
+    assert body["temperature"] == 0.1
+    assert body["max_tokens"] == 1024
     assert tagger.client.timeout.read == 180
     assert isinstance(body["messages"][0]["content"], str)
     assert "image_url" not in json.dumps(body["messages"][0], ensure_ascii=False)
@@ -94,21 +95,21 @@ def test_thinking_defaults_on_and_json_object_stays_in_the_user_message(tmp_path
     assert user[0]["type"] == "text" and "json" in user[0]["text"].lower()
     assert user[1]["type"] == "image_url"
     assert user[1]["image_url"]["detail"] == "high"
-    assert user[1]["image_url"]["url"].startswith("data:image/png;base64,")
-    assert thinking_enabled() is True
+    assert user[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert thinking_enabled() is False
 
 
-def test_thinking_can_be_disabled(tmp_path, monkeypatch):
+def test_thinking_can_be_enabled(tmp_path, monkeypatch):
     image = _png(tmp_path / "look.png")
 
     def handler(request, seen):
         return _completion(json.dumps(SAMPLE, ensure_ascii=False))
 
-    tagger, seen = _tagger(handler, monkeypatch, thinking=False)
+    tagger, seen = _tagger(handler, monkeypatch, thinking=True)
     assert tagger.tag(image).品类 == "上衣>套衫"
-    assert seen[0]["thinking"] == {"type": "disabled"}
-    assert seen[0]["temperature"] == 0.1
-    assert seen[0]["max_tokens"] == 1024
+    assert seen[0]["thinking"] == {"type": "enabled"}
+    assert "temperature" not in seen[0]
+    assert seen[0]["max_tokens"] == 8192
     assert seen[0]["response_format"] == {"type": "json_object"}
 
 
@@ -274,15 +275,20 @@ def test_reasoning_content_is_ignored(tmp_path, monkeypatch):
 
 
 def test_env_thinking_flag(monkeypatch):
-    monkeypatch.delenv("DEEPSEEK_THINKING", raising=False)
-    assert thinking_enabled() is True
-    monkeypatch.setenv("DEEPSEEK_THINKING", "")
-    assert thinking_enabled() is True
-    monkeypatch.setenv("DEEPSEEK_THINKING", "false")
+    monkeypatch.setenv("DEEPSEEK_THINKING", "true")  # legacy .env template value must not slow vision tagging
+    monkeypatch.delenv("DEEPSEEK_VISION_THINKING", raising=False)
     assert thinking_enabled() is False
-    monkeypatch.setenv("DEEPSEEK_THINKING", "off")
+    monkeypatch.setenv("DEEPSEEK_VISION_THINKING", "")
     assert thinking_enabled() is False
-    monkeypatch.setenv("DEEPSEEK_THINKING", "true")
+    monkeypatch.setenv("DEEPSEEK_VISION_THINKING", "false")
+    assert thinking_enabled() is False
+    monkeypatch.setenv("DEEPSEEK_VISION_THINKING", "off")
+    assert thinking_enabled() is False
+    monkeypatch.setenv("DEEPSEEK_VISION_THINKING", "true")
+    assert thinking_enabled() is True
+    monkeypatch.setenv("DEEPSEEK_VISION_THINKING", "1")
+    assert thinking_enabled() is True
+    monkeypatch.setenv("DEEPSEEK_VISION_THINKING", "enabled")
     assert thinking_enabled() is True
 
 

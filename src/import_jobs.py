@@ -3,15 +3,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Lock, RLock
+import time
 from uuid import uuid4
 
 from src import catalog
 from src.catalog import CatalogConflict
 from src.db import MYSQL_IMPORT_JOBS, insert_order, is_mysql, json_extract, on_conflict_update
+from src.images import warm_thumbnail_from_local
 from src.import_scheduler import ImageQueue
 from src import storage
 from src.extract.office import extract_from_file
@@ -23,10 +26,18 @@ from src.tag.tagger import apply_suggestion, get_tagger, needs_tagging
 from src.tag.openai_tagger import validate_suggestion
 from src.tag.errors import provider_error
 
+
+def _ai_concurrency() -> int:
+    try:
+        return max(1, min(16, int(os.getenv("AI_CONCURRENCY", "6") or "6")))
+    except ValueError:
+        return 6
+
+
 ACTIVE = {"queued", "extracting", "tagging"}
 RETRYABLE = {"failed", "partial", "interrupted", "awaiting_ai"}
 _executor: ThreadPoolExecutor | None = None
-AI_CONCURRENCY = 2
+AI_CONCURRENCY = _ai_concurrency()
 _image_queue: ImageQueue | None = None
 _submissions: dict[str, Future] = {}
 _lock = Lock()
@@ -223,7 +234,7 @@ def _finish(job, status, message, end=None):
     if skipped and status in {"completed", "partial"} and "已跳过" not in message:
         message += f"（{skipped} 张与现有图片相同，已跳过）"
     job["status"], job["message"] = status, message
-    with catalog._database() as conn:
+    with catalog._database(bump_catalog=False) as conn:
         _put(conn, job)
 
 
@@ -246,17 +257,15 @@ def _tag_replacement(item, tagger, job, state_lock) -> str:
     """Attach a re-uploaded 本厂产品 photo to the existing 款号. Returns insert when the target is gone."""
     target_id = item["replacement_of"]
     new_path = item["new_image_path"]
-    with catalog._database() as conn:
-        row = conn.execute("SELECT payload FROM records WHERE id=?", (target_id,)).fetchone()
-    if not row:
+    target = catalog.get_record(target_id)
+    if target is None:
         return "insert"
-    target = ImageRecord.model_validate_json(row[0])
     if target.has_ai_suggestion and (_same_file(new_path, target.image_path) or (
             target.pending_image_path and _same_file(new_path, target.pending_image_path))):
         Path(new_path).unlink(missing_ok=True)
         with state_lock:
             item.update(state="done", error="", skipped=True, filtered=False, record=target.model_dump())
-            with catalog._database() as conn:
+            with catalog._database(bump_catalog=False) as conn:
                 _put(conn, job)
         return "done"
     suggestion = tagger.tag(new_path, target.notes.text()) if tagger else None
@@ -271,12 +280,14 @@ def _tag_replacement(item, tagger, job, state_lock) -> str:
                 raise CatalogConflict("这张图片已更新，请检查后重试")
             apply_suggestion(current, suggestion, tagger.name)
             previous_pending = current.pending_image_path
-            current.pending_image_path = str(Path(new_path).resolve())
+            resolved_new_path = str(Path(new_path).resolve())
+            current.pending_image_path = resolved_new_path
             catalog._adopt_pending_image(current)
             current.style_code = current.style_code or target.style_code
             current.revision = catalog._save(
                 conn, current, "image_replaced", note="新图片识别成功后生效，原图和人工标签已保留",
             )
+            warm_thumbnail_from_local(current, resolved_new_path)
             item.update(state="done", error="", filtered=False, skipped=False, replacement=True, record=current.model_dump())
             _put(conn, job)
     if previous_pending and previous_pending != current.pending_image_path:
@@ -295,17 +306,24 @@ def _prepare_job(job_id, completion):
                 return
         job["run_started_at"] = now()
         job["status"] = "extracting" if any(f["state"] == "pending" for f in job["files"]) else "tagging"
-        with catalog._database() as conn:
+        with catalog._database(bump_catalog=False) as conn:
             _put(conn, job)
         batch_styles: dict[str, str] = {
             item["record"]["style_code"]: item.get("replacement_of") or item["record"]["id"]
             for item in job["items"] if item.get("record", {}).get("style_code")
         }
+        existing_factory_styles: dict[str, str] | None = None
+        if any(f.get("state") == "pending" and f.get("source_category") == "本厂产品" for f in job["files"]):
+            existing_factory_styles = {
+                rec.style_code: rec.id
+                for rec in catalog.load_catalog()
+                if rec.source_category == "本厂产品" and rec.style_code and rec.review_status != "rejected"
+            }
         for source_index, source in enumerate(job["files"]):
             if source["state"] != "pending":
                 continue
             job["current_file"] = source["name"]
-            with catalog._database() as conn:
+            with catalog._database(bump_catalog=False) as conn:
                 _put(conn, job)
             try:
                 folder = catalog.EXTRACTED_DIR / job_id / str(source_index)
@@ -330,9 +348,12 @@ def _prepare_job(job_id, completion):
                         item["record"] = record.model_dump()
                         target_id = batch_styles.get(record.style_code)
                         if target_id is None and record.style_code:
-                            with catalog._database() as conn:
-                                existing = find_own_factory(conn, record.style_code)
-                            target_id = existing.id if existing else None
+                            if existing_factory_styles is not None:
+                                target_id = existing_factory_styles.get(record.style_code)
+                            else:
+                                with catalog.read_database() as conn:
+                                    existing = find_own_factory(conn, record.style_code)
+                                target_id = existing.id if existing else None
                         if target_id:
                             item.update(replacement_of=target_id, new_image_path=record.image_path)
                         elif record.style_code:
@@ -342,7 +363,7 @@ def _prepare_job(job_id, completion):
                 source["state"], source["error"] = "done", ""
             except Exception as exc:
                 source["state"], source["error"] = "failed", friendly_error(exc)
-            with catalog._database() as conn:
+            with catalog._database(bump_catalog=False) as conn:
                 _put(conn, job)
         if job["backend"] == "deferred":
             pending = any(i["state"] == "pending" for i in job["items"])
@@ -354,15 +375,16 @@ def _prepare_job(job_id, completion):
             return
         job["status"], job["tag_started_at"] = "tagging", now()
         job["attempt_baseline"] = sum(i["state"] == "done" for i in job["items"])
-        with catalog._database() as conn:
+        with catalog._database(bump_catalog=False) as conn:
             _put(conn, job)
         tagger = get_tagger(job["backend"]) if job["backend"] != "deferred" and any(i["state"] == "pending" for i in job["items"]) else None
         state_lock = RLock()
         stop_event = Event()
+        flush_state = {"last_processing_ts": 0.0}
         job.pop('blocked_error', None)
         pending = [item for item in job['items'] if item['state'] == 'pending']
         def process(item):
-            return _process_item(job, item, tagger, state_lock, stop_event)
+            return _process_item(job, item, tagger, state_lock, stop_event, flush_state)
         def finish(failure=None):
             try:
                 _release_submission(job_id, completion)
@@ -392,19 +414,24 @@ def _prepare_job(job_id, completion):
             completion.set_exception(final_error)
 
 
-def _process_item(job, item, tagger, state_lock, stop_event):
+def _process_item(job, item, tagger, state_lock, stop_event, flush_state=None):
     with state_lock:
         if stop_event.is_set():
             return True
         item['state'] = 'processing'
         job['current_file'] = item['name']
-        with catalog._database() as conn:
-            _put(conn, job)
+        now_mono = time.monotonic()
+        should_flush = flush_state is None or (now_mono - flush_state["last_processing_ts"]) >= 1.5
+        if should_flush:
+            if flush_state is not None:
+                flush_state["last_processing_ts"] = now_mono
+            with catalog._database(bump_catalog=False) as conn:
+                _put(conn, job)
     try:
         # Same style/record is serialized globally by ImageQueue, across all batches.
         pending_record = ImageRecord.model_validate(item['record'])
-        if job['kind'] == 'import' and pending_record.source_category == '本厂产品' and pending_record.style_code:
-            with catalog._database() as conn:
+        if job['kind'] == 'import' and pending_record.source_category == '本厂产品' and pending_record.style_code and not item.get('replacement_of'):
+            with catalog.read_database() as conn:
                 existing = find_own_factory(conn, pending_record.style_code)
             if existing and existing.id != pending_record.id:
                 with state_lock:
@@ -416,10 +443,10 @@ def _process_item(job, item, tagger, state_lock, stop_event):
             with state_lock:
                 item.pop('replacement_of', None)
         record = ImageRecord.model_validate(item['record'])
-        with catalog._database() as conn:
-            current = conn.execute('SELECT revision FROM records WHERE id=?', (record.id,)).fetchone()
-            if current and current[0] != record.revision:
-                raise CatalogConflict('这张图片已更新，请检查后重试')
+        current_rec = catalog.get_record(record.id)
+        if current_rec is not None and current_rec.revision != record.revision:
+            raise CatalogConflict('这张图片已更新，请检查后重试')
+        local_before_save = record.image_path if record.image_path and not storage.is_remote(record.image_path) else None
         suggestion = tagger.tag(record.image_path, record.notes.text()) if tagger else None
         validate_suggestion(suggestion)
         # Commit the result and checkpoint together. Sibling completions cannot overwrite it.
@@ -428,6 +455,7 @@ def _process_item(job, item, tagger, state_lock, stop_event):
             try:
                 apply_suggestion(record, suggestion, tagger.name)
                 record.revision = catalog._save(conn, record)
+                warm_thumbnail_from_local(record, local_before_save)
                 item.update(state='done', error='', filtered=False, record=record.model_dump())
                 _put(conn, job)
             except Exception:
@@ -443,7 +471,7 @@ def _process_item(job, item, tagger, state_lock, stop_event):
             item['state'], item['error'] = 'failed', friendly_error(exc)
             if blocked:
                 job['blocked_error'] = item['error']
-            with catalog._database() as conn:
+            with catalog._database(bump_catalog=False) as conn:
                 _put(conn, job)
         return blocked
     return False
