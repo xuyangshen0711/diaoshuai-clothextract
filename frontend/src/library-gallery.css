@@ -585,3 +585,5 @@
 .gallery-redesign .season-filter-label { flex-basis: 6em; }
 .gallery-order-note { color: var(--muted); font-size: 12px; line-height: 1.65; margin: 8px 0 14px; }
 .gallery-order-note p { margin: 3px 0; }
+.gallery-redesign .gallery-card { content-visibility: auto; contain-intrinsic-size: auto 420px; }
+.gallery-load-more { display: flex; justify-content: center; padding: 28px 0 12px; }

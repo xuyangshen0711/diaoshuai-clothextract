@@ -7,11 +7,15 @@ call sites ask the helpers below for the few constructs that differ
 
 from __future__ import annotations
 
+from collections import defaultdict
 import os
 import sqlite3
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
+import threading
+import time
+from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -210,55 +214,159 @@ class Result:
         return iter(self.fetchall())
 
 
+_MYSQL_POOL: dict[tuple, list[tuple[float, Any]]] = defaultdict(list)
+_MYSQL_POOL_LOCK = threading.Lock()
+_MAX_POOL_PER_KEY = 10
+_PING_AFTER_IDLE_SECONDS = 15.0
+
+
+def _pool_key(settings: dict) -> tuple:
+    return (
+        settings["host"],
+        int(settings["port"]),
+        settings["user"],
+        settings["password"],
+        settings["database"],
+        settings.get("charset") or "utf8mb4",
+        bool(settings.get("ssl")),
+    )
+
+
+def _open_raw_mysql(settings: dict):
+    import pymysql
+    from pymysql.cursors import DictCursor
+
+    kwargs = dict(
+        host=settings["host"],
+        port=int(settings["port"]),
+        user=settings["user"],
+        password=settings["password"],
+        database=settings["database"],
+        charset=settings.get("charset") or "utf8mb4",
+        cursorclass=DictCursor,
+        autocommit=False,
+        connect_timeout=15,
+        read_timeout=60,
+        write_timeout=60,
+    )
+    if settings.get("ssl"):
+        kwargs["ssl"] = {"check_hostname": False}
+    return pymysql.connect(**kwargs)
+
+
+def _borrow_mysql(settings: dict) -> tuple[Any, bool]:
+    key = _pool_key(settings)
+    while True:
+        item = None
+        with _MYSQL_POOL_LOCK:
+            bucket = _MYSQL_POOL.get(key)
+            if bucket:
+                item = bucket.pop()
+        if item is None:
+            return _open_raw_mysql(settings), False
+        returned_at, raw = item
+        if time.monotonic() - returned_at <= _PING_AFTER_IDLE_SECONDS:
+            return raw, True
+        try:
+            raw.ping(reconnect=True)
+            return raw, True
+        except Exception:
+            try:
+                raw.close()
+            except Exception:
+                pass
+
+
 class MySQLConnection:
     dialect = "mysql"
 
     def __init__(self, settings: dict):
-        import pymysql
-        from pymysql.cursors import DictCursor
-
-        kwargs = dict(
-            host=settings["host"],
-            port=int(settings["port"]),
-            user=settings["user"],
-            password=settings["password"],
-            database=settings["database"],
-            charset=settings.get("charset") or "utf8mb4",
-            cursorclass=DictCursor,
-            autocommit=False,
-            connect_timeout=15,
-            read_timeout=60,
-            write_timeout=60,
-        )
-        if settings.get("ssl"):
-            kwargs["ssl"] = {"check_hostname": False}
-        self._conn = pymysql.connect(**kwargs)
+        self._key = _pool_key(settings)
+        self._conn, self._from_pool = _borrow_mysql(settings)
         self._in_txn = False
+        self._broken = False
+        self._closed = False
         self.settings = settings
 
     @property
     def in_transaction(self) -> bool:
         return self._in_txn
 
+    def _reconnect_fresh(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+        self._conn = _open_raw_mysql(self.settings)
+        self._from_pool = False
+        self._in_txn = False
+        self._broken = False
+
     def begin(self, *, read_only: bool = False) -> None:
-        if read_only:
-            with self._conn.cursor() as cursor:
-                cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-                cursor.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
-        else:
-            self._conn.begin()
-        self._in_txn = True
+        for attempt in range(2):
+            try:
+                if read_only:
+                    with self._conn.cursor() as cursor:
+                        cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                        cursor.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
+                else:
+                    self._conn.begin()
+                self._in_txn = True
+                return
+            except Exception:
+                if attempt == 0 and self._from_pool and not self._in_txn:
+                    self._reconnect_fresh()
+                    continue
+                self._broken = True
+                raise
 
     def commit(self) -> None:
-        self._conn.commit()
-        self._in_txn = False
+        try:
+            self._conn.commit()
+            self._in_txn = False
+        except Exception:
+            self._broken = True
+            raise
 
     def rollback(self) -> None:
-        self._conn.rollback()
-        self._in_txn = False
+        try:
+            self._conn.rollback()
+            self._in_txn = False
+        except Exception:
+            self._broken = True
+            raise
 
     def close(self) -> None:
-        self._conn.close()
+        if self._closed:
+            return
+        self._closed = True
+        if self._broken:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            return
+        try:
+            if self._in_txn:
+                self._conn.rollback()
+                self._in_txn = False
+        except Exception:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            return
+        placed = False
+        with _MYSQL_POOL_LOCK:
+            bucket = _MYSQL_POOL[self._key]
+            if len(bucket) < _MAX_POOL_PER_KEY:
+                bucket.append((time.monotonic(), self._conn))
+                placed = True
+        if not placed:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
 
     def _mark(self, sql: str) -> None:
         head = sql.lstrip()[:12].upper()
@@ -281,21 +389,47 @@ class MySQLConnection:
             self.rollback()
             return Result([])
         translated = _qmark_to_percent(stripped)
-        with self._conn.cursor() as cursor:
-            if params:
-                cursor.execute(translated, params)
-            else:
-                cursor.execute(translated)
-            rows = [Row(item) for item in cursor.fetchall()] if cursor.description else []
-        self._mark(stripped)
-        return Result(rows)
+        for attempt in range(2):
+            try:
+                with self._conn.cursor() as cursor:
+                    if params:
+                        cursor.execute(translated, params)
+                    else:
+                        cursor.execute(translated)
+                    rows = [Row(item) for item in cursor.fetchall()] if cursor.description else []
+                self._from_pool = False
+                self._mark(stripped)
+                return Result(rows)
+            except Exception as exc:
+                import pymysql
+
+                if (
+                    attempt == 0
+                    and self._from_pool
+                    and not self._in_txn
+                    and isinstance(exc, (pymysql.OperationalError, pymysql.InterfaceError))
+                ):
+                    self._reconnect_fresh()
+                    continue
+                if isinstance(exc, (pymysql.OperationalError, pymysql.InterfaceError)):
+                    self._broken = True
+                raise
 
     def executemany(self, sql: str, seq) -> Result:
         translated = _qmark_to_percent(sql.strip().rstrip(";"))
-        with self._conn.cursor() as cursor:
-            cursor.executemany(translated, list(seq))
-        self._mark(sql)
-        return Result([])
+        items = list(seq)
+        try:
+            with self._conn.cursor() as cursor:
+                cursor.executemany(translated, items)
+            self._from_pool = False
+            self._mark(sql)
+            return Result([])
+        except Exception as exc:
+            import pymysql
+
+            if isinstance(exc, (pymysql.OperationalError, pymysql.InterfaceError)):
+                self._broken = True
+            raise
 
     def executescript(self, script: str) -> None:
         if self._in_txn:

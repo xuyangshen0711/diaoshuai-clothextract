@@ -44,6 +44,8 @@ def seconds(start, end=None):
 
 
 def _table(conn):
+    if catalog._db_identity(conn) in catalog._BOOTSTRAPPED:
+        return
     # Created with the rest of the schema before the write transaction starts.
     # Running CREATE on MySQL would implicitly commit that transaction.
     if is_mysql(conn):
@@ -71,12 +73,12 @@ def _put(conn, job):
 
 
 def get_job(job_id):
-    with catalog._database() as conn:
+    with catalog.read_database() as conn:
         return _get(conn, job_id)
 
 
 def list_jobs(limit=50, *, include_active=False):
-    with catalog._database() as conn:
+    with catalog.read_database() as conn:
         _table(conn)
         jobs = [json.loads(row[0]) for row in conn.execute(
             f"SELECT payload FROM import_jobs ORDER BY {insert_order('DESC')}" + (" LIMIT ?" if limit else ""),

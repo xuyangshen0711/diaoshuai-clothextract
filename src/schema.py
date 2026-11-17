@@ -256,6 +256,8 @@ class ImageRecord(BaseModel):
     @property
     def display_tags(self) -> FashionTags:
         base = self.ai_tags or self.proposed_tags or self.tags
+        if not self.human_overrides:
+            return base
         return FashionTags.model_validate({**base.model_dump(), **self.human_overrides})
 
     @property

@@ -147,7 +147,7 @@ def _file_plan(job, file_index, records, jobs):
 
 
 def preview_source(job_id, file_index):
-    with catalog._database() as conn:
+    with catalog.read_database() as conn:
         jobs = _jobs(conn)
         source, path, ids, _ = _file_plan(jobs[job_id], file_index, _records(conn), jobs)
     return {"name": source["name"], "image_count": len(ids), "delete_source": path is not None,
@@ -193,7 +193,7 @@ def delete_images(ids):
 
 def retry_cleanup():
     with import_jobs.mutation_lock:
-        with catalog._database() as conn:
+        with catalog.read_database() as conn:
             pending = [(row[0], row[1]) for row in conn.execute("SELECT id, payload FROM media_cleanup")]
             if not pending:
                 return 0

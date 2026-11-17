@@ -170,10 +170,15 @@ function navigateNeighbor(direction: number) {
 async function loadNeighbors(current: CatalogItem, sequence: number) {
   if (current.source_category === '本厂产品') return
   try {
-    let records = neighborCache.get(current.source_category)
+    const cacheKey = current.source.batch_id
+      ? `${current.source_category}:batch:${current.source.batch_id}`
+      : `${current.source_category}:all`
+    let records = neighborCache.get(cacheKey)
     if (!records) {
-      records = (await getCatalog({ source_category: current.source_category, sort: 'imported' })).items
-      neighborCache.set(current.source_category, records)
+      const params: Record<string, string> = { source_category: current.source_category, sort: 'imported' }
+      if (current.source.batch_id) params.batch = current.source.batch_id
+      records = (await getCatalog(params)).items
+      neighborCache.set(cacheKey, records)
     }
     if (sequence === latest) neighborItems.value = records
   } catch { /* The current detail remains usable if neighboring records cannot be loaded. */ }
@@ -193,11 +198,13 @@ watch(
     orderPage.value = 1
     expandedVariant.value = ''
     neighborItems.value = []
+    void getLibraryMeta().then(meta => {
+      if (seq === latest) libraryMeta.value = meta
+    }).catch(() => {})
     try {
-      const [result, meta] = await Promise.all([getRecord(String(id)), getLibraryMeta()])
+      const result = await getRecord(String(id))
       if (seq !== latest) return
       item.value = result
-      libraryMeta.value = meta
       void loadNeighbors(result, seq)
     } catch (e) {
       if (seq === latest) error.value = e instanceof Error ? e.message : String(e)

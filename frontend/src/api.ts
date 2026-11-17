@@ -198,6 +198,46 @@ export type FilterMeta = {
 export type SiteSession = { required: boolean; authenticated: boolean }
 
 let sessionCache: SiteSession | null = null
+const READ_CACHE_TTL_MS = 60_000
+type TimedEntry<T> = { at: number; value?: T; inflight?: Promise<T> }
+let filtersMemo: TimedEntry<FilterMeta> | null = null
+let taxonomyMemo: TimedEntry<Taxonomy> | null = null
+let libraryMetaMemo: TimedEntry<LibraryMeta> | null = null
+export type CatalogResponse = { count: number; items: CatalogItem[]; color_counts?: Record<string, number> }
+const catalogViewCache = new Map<string, { at: number; data: CatalogResponse }>()
+
+export function invalidateReadCaches() {
+  filtersMemo = null
+  taxonomyMemo = null
+  libraryMetaMemo = null
+  catalogViewCache.clear()
+}
+
+function memoizedGet<T>(
+  slot: () => TimedEntry<T> | null,
+  assign: (next: TimedEntry<T> | null) => void,
+  fetcher: () => Promise<T>,
+): Promise<T> {
+  const now = Date.now()
+  const current = slot()
+  if (current?.value !== undefined && now - current.at < READ_CACHE_TTL_MS) {
+    return Promise.resolve(current.value)
+  }
+  if (current?.inflight) return current.inflight
+  const entry: TimedEntry<T> = { at: now }
+  const p = fetcher()
+    .then(val => {
+      assign({ at: Date.now(), value: val })
+      return val
+    })
+    .catch(err => {
+      if (slot() === entry) assign(null)
+      throw err
+    })
+  entry.inflight = p
+  assign(entry)
+  return p
+}
 
 export function rememberSession(session: SiteSession) {
   sessionCache = session
@@ -210,7 +250,11 @@ function redirectToLogin() {
 }
 
 export async function requestResponse(url: string, init?: RequestInit): Promise<Response> {
+  const method = (init?.method || 'GET').toUpperCase()
   const res = await fetch(url, init)
+  if (method !== 'GET' && res.ok) {
+    invalidateReadCaches()
+  }
   if (res.status === 401 && !url.startsWith('/api/login')) {
     rememberSession({ required: true, authenticated: false })
     redirectToLogin()
@@ -317,11 +361,11 @@ export type Taxonomy = {
 }
 
 export function getFilters() {
-  return request<FilterMeta>('/api/meta/filters')
+  return memoizedGet(() => filtersMemo, v => { filtersMemo = v }, () => request<FilterMeta>('/api/meta/filters'))
 }
 
 export function getTaxonomy() {
-  return request<Taxonomy>('/api/taxonomy')
+  return memoizedGet(() => taxonomyMemo, v => { taxonomyMemo = v }, () => request<Taxonomy>('/api/taxonomy'))
 }
 
 export function assignRecordCategory(item: CatalogItem, level1: string, level2 = '') {
@@ -332,10 +376,10 @@ export function assignRecordCategory(item: CatalogItem, level1: string, level2 =
 }
 
 export function getLibraryMeta() {
-  return request<LibraryMeta>('/api/meta/library')
+  return memoizedGet(() => libraryMetaMemo, v => { libraryMetaMemo = v }, () => request<LibraryMeta>('/api/meta/library'))
 }
 
-export function getCatalog(params: Record<string, string | string[] | boolean>) {
+function catalogQuerySuffix(params: Record<string, string | string[] | boolean>) {
   const qs = new URLSearchParams()
   Object.entries(params).forEach(([k, v]) => {
     if (v === undefined || v === null || v === '' || v === '全部') return
@@ -344,8 +388,29 @@ export function getCatalog(params: Record<string, string | string[] | boolean>) 
     }
   })
   if (!('exclude_samples' in params)) qs.set('exclude_samples', 'true')
-  const suffix = qs.toString() ? `?${qs}` : ''
-  return request<{ count: number; items: CatalogItem[]; color_counts?: Record<string, number> }>(`/api/catalog${suffix}`)
+  return qs.toString() ? `?${qs}` : ''
+}
+
+export function peekCatalogCache(params: Record<string, string | string[] | boolean>): CatalogResponse | null {
+  const key = catalogQuerySuffix(params)
+  const hit = catalogViewCache.get(key)
+  if (!hit) return null
+  if (Date.now() - hit.at > READ_CACHE_TTL_MS) {
+    catalogViewCache.delete(key)
+    return null
+  }
+  return hit.data
+}
+
+export async function getCatalog(params: Record<string, string | string[] | boolean>) {
+  const suffix = catalogQuerySuffix(params)
+  const data = await request<CatalogResponse>(`/api/catalog${suffix}`)
+  if (catalogViewCache.size >= 12) {
+    const oldest = catalogViewCache.keys().next().value
+    if (oldest !== undefined) catalogViewCache.delete(oldest)
+  }
+  catalogViewCache.set(suffix, { at: Date.now(), data })
+  return data
 }
 
 export type SearchInfo = { engine: string; local_only: boolean; include_pending: boolean; concepts: string[] }
@@ -610,8 +675,10 @@ export type SalesImportImpact = {
   orders: ImportMetricChange; counted: ImportMetricChange
 }
 export type InspectedFile = { name: string; kind: string; action: string; style_code: string; message: string; width?: number; height?: number }
-export function getFactoryWorkspace(status = 'missing', q = '', page = 1) {
-  return request<FactoryWorkspace>(`/api/import/workspace?${new URLSearchParams({ status, q, page: String(page) })}`)
+export function getFactoryWorkspace(status = 'missing', q = '', page = 1, verifyRemote = true) {
+  const qs = new URLSearchParams({ status, q, page: String(page) })
+  if (!verifyRemote) qs.set('verify_remote', 'false')
+  return request<FactoryWorkspace>(`/api/import/workspace?${qs}`)
 }
 export function getTableHistory() { return request<TableImportResult[]>('/api/import/table-history') }
 export function previewTable(file: File, kind: string) {

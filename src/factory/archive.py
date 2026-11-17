@@ -129,4 +129,7 @@ def write_archive(conn, variants: list[dict], source_name: str) -> tuple[int, in
                 imported += 1
                 existing.add(item["variant_code"])
         conn.executemany(sql, values)
+    from src.factory.library import invalidate_factory_snapshot
+
+    invalidate_factory_snapshot()
     return imported, updated

@@ -8,9 +8,12 @@ from __future__ import annotations
 import json
 import os
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+import threading
+import time
+from typing import Any, Iterable
 
 from src.db import (
     MYSQL_CORE_SCHEMA,
@@ -20,6 +23,7 @@ from src.db import (
     insert_order,
     is_mysql,
     json_extract,
+    mysql_config,
     on_conflict_update,
 )
 from src.schema import CoverCrop, DesignNotes, FashionTags, ImageRecord, coerce_source_category
@@ -94,8 +98,89 @@ def _ensure_core(conn) -> None:
         exec_script(conn, _SQLITE_CORE)
 
 
+_BOOTSTRAPPED: set[tuple] = set()
+_CACHE_LOCK = threading.Lock()
+_MUTATION_EPOCH = 0
+_MYSQL_SNAPSHOT_TTL = 20.0
+_CATALOG_SNAPSHOT: tuple[tuple, float, tuple[ImageRecord, ...], frozenset[str], dict[str, ImageRecord]] | None = None
+_IN_READONLY_DB: ContextVar[bool] = ContextVar("diaoshuai_in_readonly_db", default=False)
+
+
+def bump_mutation_epoch() -> None:
+    global _MUTATION_EPOCH, _CATALOG_SNAPSHOT
+    with _CACHE_LOCK:
+        _MUTATION_EPOCH += 1
+        _CATALOG_SNAPSHOT = None
+
+
+def active_mysql_identity() -> tuple | None:
+    try:
+        s = mysql_config()
+    except RuntimeError:
+        return None
+    if not s:
+        return None
+    return ("mysql", s["host"], int(s["port"]), s["database"])
+
+
+def _db_identity(conn) -> tuple:
+    if is_mysql(conn):
+        s = conn.settings
+        return ("mysql", s["host"], int(s["port"]), s["database"])
+    resolved = DATABASE_PATH.resolve()
+    try:
+        st = resolved.stat()
+        db_stat = (st.st_ino, getattr(st, "st_birthtime_ns", 0), st.st_size > 0)
+    except OSError:
+        db_stat = (0, 0, False)
+    try:
+        cat_mtime = CATALOG_PATH.stat().st_mtime_ns if CATALOG_PATH.exists() else None
+    except OSError:
+        cat_mtime = None
+    return ("sqlite", str(resolved), db_stat, cat_mtime)
+
+
+def _bootstrap_schema_and_migrations(conn) -> None:
+    _ensure_core(conn)
+    from src.factory.tables import ensure_factory, migrate_source_categories, migrate_starred_styles
+    from src.taxonomy import ensure_taxonomy, migrate_record_labels
+
+    ensure_factory(conn)
+    ensure_taxonomy(conn)
+    if is_mysql(conn):
+        conn.begin()
+    else:
+        conn.execute("BEGIN IMMEDIATE")
+    if not conn.execute("SELECT 1 FROM migrations WHERE name='legacy_json'").fetchone():
+        if CATALOG_PATH.exists():
+            for item in json.loads(CATALOG_PATH.read_text(encoding="utf-8")):
+                record = ImageRecord.model_validate(item)
+                record.tag_overrides = dict(record.human_overrides)
+                if record.ai_tags is None and record.tags_source in {"openai", "deepseek", "mock"}:
+                    record.ai_tags = record.tags.model_copy(deep=True)
+                    record.ai_tags_source = record.tags_source
+                if record.review_status != "rejected" and (
+                    record.has_ai_suggestion or record.tags_source == "manual"
+                ):
+                    record.review_status = "approved"
+                    record.proposed_tags = None
+                record.revision = 1
+                publish_record(record)
+                conn.execute(
+                    "INSERT INTO records (id, image_path, review_status, revision, payload) VALUES (?, ?, ?, ?, ?)",
+                    (record.id, record.image_path, record.review_status, 1, record.model_dump_json()),
+                )
+                _event(conn, record, "legacy_imported", note="导入历史资料，保留 AI 建议与人工修改")
+        conn.execute("INSERT INTO migrations VALUES ('legacy_json')")
+    migrate_source_categories(conn)
+    migrate_starred_styles(conn)
+    migrate_record_labels(conn)
+    _migrate_automatic_entry(conn)
+    conn.commit()
+
+
 @contextmanager
-def _database():
+def _database(*, read_only: bool = False):
     ensure_data_dirs()
     conn = connect(DATABASE_PATH)
     cleanups: list[Path] = []
@@ -103,45 +188,32 @@ def _database():
     try:
         if not is_mysql(conn):
             conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("PRAGMA journal_mode=WAL")
-        _ensure_core(conn)
-        from src.factory.tables import ensure_factory, migrate_source_categories, migrate_starred_styles
-        from src.taxonomy import ensure_taxonomy, migrate_record_labels
-        ensure_factory(conn)
-        ensure_taxonomy(conn)
+        ident = _db_identity(conn)
+        if ident not in _BOOTSTRAPPED:
+            if not is_mysql(conn):
+                conn.execute("PRAGMA journal_mode=WAL")
+            _bootstrap_schema_and_migrations(conn)
+            ident = _db_identity(conn)
+            with _CACHE_LOCK:
+                _BOOTSTRAPPED.add(ident)
         if is_mysql(conn):
             conn.begin()
+        elif read_only:
+            conn.execute("BEGIN")
         else:
             conn.execute("BEGIN IMMEDIATE")
-        if not conn.execute("SELECT 1 FROM migrations WHERE name='legacy_json'").fetchone():
-            if CATALOG_PATH.exists():
-                for item in json.loads(CATALOG_PATH.read_text(encoding="utf-8")):
-                    record = ImageRecord.model_validate(item)
-                    record.tag_overrides = dict(record.human_overrides)
-                    if record.ai_tags is None and record.tags_source in {"openai", "deepseek", "mock"}:
-                        record.ai_tags = record.tags.model_copy(deep=True)
-                        record.ai_tags_source = record.tags_source
-                    if record.review_status != "rejected" and (
-                        record.has_ai_suggestion or record.tags_source == "manual"
-                    ):
-                        record.review_status = "approved"
-                        record.proposed_tags = None
-                    record.revision = 1
-                    publish_record(record)
-                    conn.execute(
-                        "INSERT INTO records (id, image_path, review_status, revision, payload) VALUES (?, ?, ?, ?, ?)",
-                        (record.id, record.image_path, record.review_status, 1, record.model_dump_json()),
-                    )
-                    _event(conn, record, "legacy_imported", note="导入历史资料，保留 AI 建议与人工修改")
-            conn.execute("INSERT INTO migrations VALUES ('legacy_json')")
-        migrate_source_categories(conn)
-        migrate_starred_styles(conn)
-        migrate_record_labels(conn)
-        _migrate_automatic_entry(conn)
-        yield conn
-        conn.commit()
-        for path in cleanups:
-            path.unlink(missing_ok=True)
+        ro_tok = _IN_READONLY_DB.set(read_only)
+        try:
+            yield conn
+        finally:
+            _IN_READONLY_DB.reset(ro_tok)
+        if read_only:
+            conn.rollback()
+        else:
+            conn.commit()
+            bump_mutation_epoch()
+            for path in cleanups:
+                path.unlink(missing_ok=True)
     except Exception:
         conn.rollback()
         raise
@@ -150,11 +222,101 @@ def _database():
         conn.close()
 
 
+def read_database():
+    return _database(read_only=True)
+
+
+def _records_stamp(conn) -> tuple:
+    if is_mysql(conn):
+        row = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(revision), 0), COALESCE(MAX(seq), 0), "
+            "(SELECT COUNT(*) FROM migrations) FROM records"
+        ).fetchone()
+        return (_db_identity(conn), _MUTATION_EPOCH, int(row[0] or 0), int(row[1] or 0), int(row[2] or 0), int(row[3] or 0))
+    row = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(revision), 0), COALESCE(SUM(LENGTH(payload)), 0), "
+        "COALESCE(MAX(id), ''), COALESCE(MAX(image_path), ''), "
+        "(SELECT COUNT(*) FROM migrations) "
+        "FROM records"
+    ).fetchone()
+    return (_db_identity(conn), _MUTATION_EPOCH, *(row[i] for i in range(6)))
+
+
+def _fresh_mysql_catalog_snapshot(conn):
+    if conn is not None and not _IN_READONLY_DB.get():
+        return None
+    mysql_id = active_mysql_identity()
+    if mysql_id is None:
+        return None
+    with _CACHE_LOCK:
+        cached = _CATALOG_SNAPSHOT
+    if cached is not None and cached[0][:2] == (mysql_id, _MUTATION_EPOCH) and (time.monotonic() - cached[1]) <= _MYSQL_SNAPSHOT_TTL:
+        return cached
+    return None
+
+
+def _ensure_catalog_snapshot(*, conn=None):
+    global _CATALOG_SNAPSHOT
+    fast = _fresh_mysql_catalog_snapshot(conn)
+    if fast is not None:
+        return fast
+    can_cache = conn is None or _IN_READONLY_DB.get()
+    with (nullcontext(conn) if conn is not None else read_database()) as rconn:
+        stamp = _records_stamp(rconn)
+        with _CACHE_LOCK:
+            cached = _CATALOG_SNAPSHOT
+            if cached is not None and cached[0] == stamp:
+                refreshed = (stamp, time.monotonic(), cached[2], cached[3], cached[4])
+                if can_cache:
+                    _CATALOG_SNAPSHOT = refreshed
+                return refreshed
+        loaded = tuple(
+            ImageRecord.model_validate_json(row[0])
+            for row in rconn.execute(f"SELECT payload FROM records ORDER BY {insert_order(dialect='mysql' if is_mysql(rconn) else 'sqlite')}")
+        )
+        ready_ids = frozenset(r.id for r in loaded if r.ready)
+        by_id = {r.id: r for r in loaded}
+        snap = (stamp, time.monotonic(), loaded, ready_ids, by_id)
+        if can_cache:
+            new_stamp = _records_stamp(rconn)
+            with _CACHE_LOCK:
+                if new_stamp == stamp:
+                    _CATALOG_SNAPSHOT = snap
+        return snap
+
+
 def load_catalog(*, conn=None) -> list[ImageRecord]:
-    with (nullcontext(conn) if conn is not None else _database()) as conn:
-        return [ImageRecord.model_validate_json(row[0]) for row in conn.execute(
-            f"SELECT payload FROM records ORDER BY {insert_order()}"
-        )]
+    snap = _ensure_catalog_snapshot(conn=conn)
+    return [r.model_copy(deep=False) for r in snap[2]]
+
+
+def load_library_catalog(*, conn=None) -> list[ImageRecord]:
+    """Fast path for gallery endpoints: uses pre-validated ready_ids when snapshot is warm."""
+    snap = _ensure_catalog_snapshot(conn=conn)
+    ready_ids = snap[3]
+    return [r.model_copy(deep=False) for r in snap[2] if r.id in ready_ids]
+
+
+def get_record(record_id: str, *, conn=None) -> ImageRecord | None:
+    fast = _fresh_mysql_catalog_snapshot(conn)
+    if fast is not None:
+        hit = fast[4].get(record_id)
+        return hit.model_copy(deep=False) if hit is not None else None
+    with (nullcontext(conn) if conn is not None else read_database()) as rconn:
+        row = rconn.execute("SELECT payload FROM records WHERE id=?", (record_id,)).fetchone()
+        return ImageRecord.model_validate_json(row[0]) if row else None
+
+
+def catalog_counts(*, conn=None) -> tuple[int, int]:
+    fast = _fresh_mysql_catalog_snapshot(conn)
+    if fast is not None:
+        loaded = fast[2]
+        return len(loaded), sum(1 for r in loaded if r.review_status == "pending")
+    with (nullcontext(conn) if conn is not None else read_database()) as rconn:
+        row = rconn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN review_status='pending' THEN 1 ELSE 0 END), 0) FROM records"
+        ).fetchone()
+        return int(row[0] or 0), int(row[1] or 0)
 
 
 def approved_records(records: Iterable[ImageRecord]) -> list[ImageRecord]:
@@ -543,7 +705,7 @@ def assign_source_category(ids: list[str], category: str) -> list[ImageRecord]:
 
 
 def review_history(record_id: str) -> list[dict]:
-    with _database() as conn:
+    with read_database() as conn:
         rows = conn.execute("SELECT * FROM review_events WHERE record_id=? ORDER BY id DESC", (record_id,))
         return [dict(id=row["id"], action=row["action"], actor=row["actor"], note=row["note"],
                      created_at=row["created_at"], before=json.loads(row["before_json"]) if row["before_json"] else None,

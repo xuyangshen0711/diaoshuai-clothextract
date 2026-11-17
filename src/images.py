@@ -51,11 +51,12 @@ def thumbnail_path(record_id: str, source: str | Path, crop: CoverCrop | None = 
     folder.mkdir(parents=True, exist_ok=True)
     # IDs can come from legacy JSON; hash them rather than treating them as paths.
     key = hashlib.sha256(record_id.encode()).hexdigest()[:24]
-    local = storage.local_file(source)
+    ver = image_version(source)
     crop_key = f"-crop-{hashlib.sha256(crop.model_dump_json().encode()).hexdigest()[:12]}" if crop else ""
-    target = folder / f"{key}-{image_version(source)}{crop_key}.jpg"
+    target = folder / f"{key}-{ver}{crop_key}.jpg"
     if target.exists():
         return target
+    local = storage.local_file(source)
     with Image.open(local) as original:
         image = ImageOps.exif_transpose(original)
         if crop is not None:

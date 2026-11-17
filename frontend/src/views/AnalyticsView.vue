@@ -7,10 +7,13 @@ import {
 } from '../analyticsApi'
 import AnalyticsChat from '../components/AnalyticsChat.vue'
 import AnalyticsReport from '../components/AnalyticsReport.vue'
+import AnalyticsYarnTable from '../components/AnalyticsYarnTable.vue'
 import '../styles/analytics.css'
 
 const route = useRoute()
-const tab = ref(route.query.tab === 'questions' ? 'questions' : 'report')
+const tab = ref(
+  route.query.tab === 'questions' ? 'questions' : route.query.tab === 'yarn' ? 'yarn' : 'report',
+)
 const session = ref<AnalysisSession | null>(null)
 const options = ref<AnalysisOptions | null>(null)
 const loading = ref(true)
@@ -22,6 +25,8 @@ const preparing = ref(false)
 const downloading = ref(false)
 const useDeepseek = ref(false)
 const asking = ref(false)
+const yarnBusy = ref(false)
+const yarnRef = ref<InstanceType<typeof AnalyticsYarnTable> | null>(null)
 const returnToLibrary = computed(() => typeof route.query.source === 'string' && route.query.source !== '全部'
   ? { name: 'library', query: { source_category: route.query.source } } : '/')
 
@@ -97,12 +102,13 @@ async function unlock() {
 }
 
 async function lock() {
-  if (preparing.value || downloading.value || asking.value) return
+  if (preparing.value || downloading.value || asking.value || yarnBusy.value) return
   try {
     await analysisLogout()
     session.value = { ...session.value, configured: true, authenticated: false, deepseek_configured: false }
     report.value = null
     options.value = null
+    yarnRef.value?.reset()
     error.value = ''
   } catch (reason) {
     error.value = message(reason)
@@ -153,14 +159,14 @@ async function download() {
 
 <template>
   <main class="analytics-page">
-    <RouterLink :to="tab === 'report' ? { name: 'library', query: { source_category: '本厂产品' } } : returnToLibrary" class="analytics-back">← 返回图库</RouterLink>
+    <RouterLink :to="tab === 'questions' ? returnToLibrary : { name: 'library', query: { source_category: '本厂产品' } }" class="analytics-back">← 返回图库</RouterLink>
     <header class="analytics-hero">
       <div>
         <p>貂帅服装 / 业务资料</p>
         <h1>数据分析</h1>
-        <p>从本厂订单生成报告，也可以直接查询款式与图库数据。</p>
+        <p>从本厂订单生成订货报告、纱线与色卡统计表，也可以直接查询款式与图库数据。</p>
       </div>
-      <button v-if="session?.authenticated" type="button" class="analytics-quiet" :disabled="preparing || downloading || asking" @click="lock">锁定分析</button>
+      <button v-if="session?.authenticated" type="button" class="analytics-quiet" :disabled="preparing || downloading || asking || yarnBusy" @click="lock">锁定分析</button>
     </header>
 
     <p v-if="session?.unencrypted_connection" class="analytics-note" role="note">当前使用 HTTP 兼容访问，密码和数据传输未加密。请在可信网络使用；配置 HTTPS 后可关闭此模式。</p>
@@ -180,6 +186,7 @@ async function download() {
     <template v-else>
       <nav class="analytics-tabs" aria-label="分析方式">
         <button type="button" :aria-pressed="tab === 'report'" @click="switchTab('report')">生成报告</button>
+        <button type="button" :aria-pressed="tab === 'yarn'" @click="switchTab('yarn')">纱线与色卡表</button>
         <button type="button" :aria-pressed="tab === 'questions'" @click="switchTab('questions')">问数据</button>
       </nav>
 
@@ -235,6 +242,8 @@ async function download() {
         </div>
 
       </div>
+
+      <AnalyticsYarnTable v-show="tab === 'yarn'" ref="yarnRef" v-model:busy="yarnBusy" :active="tab === 'yarn'" />
 
       <AnalyticsChat v-show="tab === 'questions'" v-model:busy="asking" :deepseek-configured="session.deepseek_configured" />
     </template>

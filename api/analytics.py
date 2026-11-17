@@ -18,12 +18,13 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.analytics import (
-    AnalyticsUnavailable, ReportFilters, filter_options, read_business_data, report_data, report_observations,
+    AnalyticsUnavailable, FilterLabel, ReportFilters, filter_options, read_business_data, report_data, report_observations,
 )
 from src.analytics_chat import ChatRequest, answer_chat
 from src.analytics_access import allow_http_analytics
 from src.analytics_pdf import render_report
 from src.analytics_questions import QuestionRequest, answer_question, choose_with_deepseek
+from src.analytics_yarn import YarnReportFilters, build_yarn_preview, render_yarn_workbook, yarn_filter_options
 from src.db import _load_env, mysql_config
 from src.site_gate import site_password
 from src.tag.tagger import provider_ready
@@ -144,6 +145,22 @@ class ExportRequest(BaseModel):
     emphasis: Observation | None = None
 
 
+class YarnPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    filters: YarnReportFilters
+    acknowledge_missing: bool = False
+
+
+class YarnExportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    filters: YarnReportFilters
+    snapshot: str = Field(pattern=r"^[a-f0-9]{64}$")
+    acknowledge_missing: bool = False
+    selected_materials: list[FilterLabel] | None = Field(default=None, max_length=200)
+
+
 @router.get("/session")
 def session(request: Request):
     password = _password()
@@ -239,3 +256,40 @@ def question(body: QuestionRequest, request: Request):
 def chat(body: ChatRequest, request: Request):
     _throttle(request, "question", 15)
     return answer_chat(body)
+
+
+@router.get("/yarn-table/options", dependencies=[Depends(_require_access)])
+def yarn_options():
+    with read_business_data() as conn:
+        return yarn_filter_options(conn)
+
+
+@router.post("/yarn-table/preview", dependencies=[Depends(_require_access)])
+def yarn_preview(body: YarnPreviewRequest, request: Request):
+    _throttle(request, "yarn-report", 40)
+    with read_business_data() as conn:
+        return build_yarn_preview(conn, body.filters, acknowledge_missing=body.acknowledge_missing)
+
+
+@router.post("/yarn-table/xlsx", dependencies=[Depends(_require_access)])
+def yarn_xlsx(body: YarnExportRequest, request: Request):
+    _throttle(request, "yarn-xlsx", 20)
+    with read_business_data() as conn:
+        result = build_yarn_preview(conn, body.filters, acknowledge_missing=body.acknowledge_missing)
+    if result["requires_confirmation"] or result["report"] is None:
+        raise HTTPException(409, "存在缺失数据提醒，请先在页面确认后再导出。", headers=NO_STORE)
+    report = result["report"]
+    if not hmac.compare_digest(report["snapshot"], body.snapshot):
+        raise HTTPException(409, "订单数据已变化，请重新预览再导出。", headers=NO_STORE)
+    end_date = report["scope"]["effective_end_date"]
+    filename = f"factory-yarn-color-report-{end_date}.xlsx"
+    payload = render_yarn_workbook(
+        report,
+        selected_materials=body.selected_materials,
+        missing=result["missing"],
+    )
+    return Response(
+        payload,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

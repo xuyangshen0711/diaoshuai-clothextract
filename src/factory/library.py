@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+import threading
+import time
 
 from src import catalog
-from src.db import insert_order
+from src.db import insert_order, is_mysql
 from src.factory.codes import OWN_CUSTOMER, parse_style_code
 from src.factory.colors import COLOR_FAMILIES, classify_color
 from src.factory.context import set_search_blobs
@@ -71,6 +73,7 @@ class FactoryIndex:
     sales: dict[str, list[SaleView]] = field(default_factory=dict)
     orders: dict[str, list[OrderView]] = field(default_factory=dict)
     facets: dict[str, list[str]] = field(default_factory=dict)
+    _search_blobs: dict[str, dict[str, str]] | None = field(default=None, repr=False, compare=False)
 
     def categories(self, style_code: str) -> list[str]:
         rows = self.variants.get(style_code) or []
@@ -152,74 +155,68 @@ def _load_summaries(conn, index: FactoryIndex, order_rows=None) -> None:
         index.sales.setdefault(sale.style_code, []).append(sale)
 
 
-def load_index(*, conn=None, include_facets: bool = True) -> FactoryIndex:
-    index = FactoryIndex()
-    with (nullcontext(conn) if conn is not None else catalog._database()) as conn:
-        _load_variants(conn, index)
-        # Use the same current rows for summary overlap and card/detail statistics.
-        # All caches below are request-local transformations of strings, not cached business data.
-        rows = list(conn.execute(
-            "SELECT order_no, variant_code, style_code, customer, customer_style_code, color, size_label, "
-            "quantity, amount, order_kind, order_date, salesperson, season FROM style_order_lines"
-        ))
-        _load_summaries(conn, index, rows)
-        codes, periods = {}, {}
-        for row in rows:
-            code, day = row["variant_code"], row["order_date"] or ""
-            if code not in codes:
-                codes[code] = parse_style_code(code)
-            if day not in periods:
-                periods[day] = _period_key(day)
-            parsed = codes[code]
-            order = OrderView(
-                order_no=row["order_no"], variant_code=code, style_code=row["style_code"],
-                customer=parsed.customer if parsed else (row["customer"] or ""),
-                buyer=row["customer"] or "",
-                customer_style_code=row["customer_style_code"] or "",
-                color=row["color"], size_label=row["size_label"],
-                quantity=int(row["quantity"]), amount=float(row["amount"]),
-                order_kind=row["order_kind"] or "", order_date=day,
-                salesperson=row["salesperson"] or "", season=row["season"] or "",
-                period=periods[day],
-            )
-            index.orders.setdefault(order.style_code, []).append(order)
-    if include_facets:
-        index.facets = _facets(index)
-    return index
+_FACTORY_LOCK = threading.Lock()
+_FACTORY_SNAPSHOT: tuple[tuple, int, float, FactoryIndex] | None = None
 
 
-def load_metadata_index(*, conn=None) -> FactoryIndex:
-    """Read dropdown options without transferring/materializing every order line.
-
-    The returned index intentionally contains no order lines and is only for /meta/library.
-    HEX keeps distinct values distinct under MySQL's case/accent/space-insensitive collations.
-    """
-    index = FactoryIndex()
-    values = {key: set() for key in ("customer", "buyer", "season", "period", "color", "size_label")}
-    with (nullcontext(conn) if conn is not None else catalog._database()) as conn:
-        _load_variants(conn, index)
-        _load_summaries(conn, index)
-        columns = {"variant": "variant_code", "buyer": "customer", "season": "season",
-                   "date": "order_date", "color": "color", "size_label": "size_label"}
-        sql = " UNION ALL ".join(
-            f"SELECT DISTINCT '{key}' AS facet_name, {column} AS facet_value, HEX({column}) AS facet_exact FROM style_order_lines"
-            for key, column in columns.items()
-        )
-        for row in conn.execute(sql):
-            key, value = row["facet_name"], row["facet_value"] or ""
-            if key == "variant":
-                parsed = parse_style_code(value)
-                if parsed:
-                    values["customer"].add(parsed.customer)
-            elif key == "date":
-                values["period"].add(_period_key(value))
-            else:
-                values[key].add(value)
-    index.facets = _facets(index, order_values=values)
-    return index
+def invalidate_factory_snapshot() -> None:
+    global _FACTORY_SNAPSHOT
+    with _FACTORY_LOCK:
+        _FACTORY_SNAPSHOT = None
 
 
-def prime_search(index: FactoryIndex):
+def _factory_stamp(conn) -> tuple:
+    if is_mysql(conn):
+        row = conn.execute(
+            "SELECT "
+            "(SELECT COUNT(*) FROM style_variants), "
+            "(SELECT COALESCE(MAX(updated_at), '') FROM style_variants), "
+            "(SELECT COUNT(*) FROM style_sales), "
+            "(SELECT COALESCE(MAX(updated_at), '') FROM style_sales), "
+            "(SELECT COALESCE(SUM(quantity), 0) FROM style_sales), "
+            "(SELECT COALESCE(SUM(LENGTH(extra_json)), 0) FROM style_sales), "
+            "(SELECT COUNT(*) FROM style_order_lines), "
+            "(SELECT COALESCE(MAX(updated_at), '') FROM style_order_lines), "
+            "(SELECT COALESCE(SUM(quantity), 0) FROM style_order_lines)"
+        ).fetchone()
+        return (catalog._db_identity(conn), *(row[i] for i in range(9)))
+    row = conn.execute(
+        "SELECT "
+        "(SELECT COUNT(*) FROM style_variants), "
+        "(SELECT COALESCE(MAX(updated_at), '') FROM style_variants), "
+        "(SELECT COALESCE(SUM(LENGTH(series) + LENGTH(season) + LENGTH(material) + LENGTH(category) + LENGTH(subcategory)), 0) FROM style_variants), "
+        "(SELECT COUNT(*) FROM style_sales), "
+        "(SELECT COALESCE(SUM(quantity), 0) FROM style_sales), "
+        "(SELECT COALESCE(ROUND(SUM(amount), 2), 0) FROM style_sales), "
+        "(SELECT COALESCE(MAX(updated_at), '') FROM style_sales), "
+        "(SELECT COALESCE(SUM(LENGTH(extra_json)), 0) FROM style_sales), "
+        "(SELECT COUNT(*) FROM style_order_lines), "
+        "(SELECT COALESCE(SUM(quantity), 0) FROM style_order_lines), "
+        "(SELECT COALESCE(ROUND(SUM(amount), 2), 0) FROM style_order_lines), "
+        "(SELECT COALESCE(MAX(updated_at), '') FROM style_order_lines)"
+    ).fetchone()
+    return (catalog._db_identity(conn), *(row[i] for i in range(12)))
+
+
+def _fresh_mysql_factory_snapshot(conn) -> FactoryIndex | None:
+    if conn is not None and not catalog._IN_READONLY_DB.get():
+        return None
+    mysql_id = catalog.active_mysql_identity()
+    if mysql_id is None:
+        return None
+    with _FACTORY_LOCK:
+        cached = _FACTORY_SNAPSHOT
+    if (
+        cached is not None
+        and cached[0][0] == mysql_id
+        and cached[1] == catalog._MUTATION_EPOCH
+        and (time.monotonic() - cached[2]) <= catalog._MYSQL_SNAPSHOT_TTL
+    ):
+        return cached[3]
+    return None
+
+
+def _build_search_blobs(index: FactoryIndex) -> dict[str, dict[str, str]]:
     blobs = {}
     for code, rows in index.variants.items():
         parts = [code]
@@ -252,6 +249,195 @@ def prime_search(index: FactoryIndex):
         blobs.setdefault(code, {"source": code})
     for code in index.orders:
         blobs.setdefault(code, {"source": code})
+    return blobs
+
+
+def _materialize_full_index(conn) -> FactoryIndex:
+    index = FactoryIndex()
+    _load_variants(conn, index)
+    rows = list(conn.execute(
+        "SELECT order_no, variant_code, style_code, customer, customer_style_code, color, size_label, "
+        "quantity, amount, order_kind, order_date, salesperson, season FROM style_order_lines"
+    ))
+    _load_summaries(conn, index, rows)
+    codes, periods = {}, {}
+    for row in rows:
+        code, day = row["variant_code"], row["order_date"] or ""
+        if code not in codes:
+            codes[code] = parse_style_code(code)
+        if day not in periods:
+            periods[day] = _period_key(day)
+        parsed = codes[code]
+        order = OrderView(
+            order_no=row["order_no"], variant_code=code, style_code=row["style_code"],
+            customer=parsed.customer if parsed else (row["customer"] or ""),
+            buyer=row["customer"] or "",
+            customer_style_code=row["customer_style_code"] or "",
+            color=row["color"], size_label=row["size_label"],
+            quantity=int(row["quantity"]), amount=float(row["amount"]),
+            order_kind=row["order_kind"] or "", order_date=day,
+            salesperson=row["salesperson"] or "", season=row["season"] or "",
+            period=periods[day],
+        )
+        index.orders.setdefault(order.style_code, []).append(order)
+    index.facets = _facets(index)
+    index._search_blobs = _build_search_blobs(index)
+    return index
+
+
+def load_index(*, conn=None, include_facets: bool = True) -> FactoryIndex:
+    global _FACTORY_SNAPSHOT
+    fast = _fresh_mysql_factory_snapshot(conn)
+    if fast is not None:
+        return fast
+    can_cache = conn is None or catalog._IN_READONLY_DB.get()
+    with (nullcontext(conn) if conn is not None else catalog.read_database()) as rconn:
+        stamp = _factory_stamp(rconn)
+        epoch = catalog._MUTATION_EPOCH
+        with _FACTORY_LOCK:
+            cached = _FACTORY_SNAPSHOT
+            if cached is not None and cached[0] == stamp:
+                if can_cache:
+                    _FACTORY_SNAPSHOT = (stamp, epoch, time.monotonic(), cached[3])
+                return cached[3]
+        built = _materialize_full_index(rconn)
+        if can_cache:
+            new_stamp = _factory_stamp(rconn)
+            new_epoch = catalog._MUTATION_EPOCH
+            with _FACTORY_LOCK:
+                if new_stamp == stamp and new_epoch == epoch:
+                    _FACTORY_SNAPSHOT = (stamp, epoch, time.monotonic(), built)
+        return built
+
+
+def load_style_index(style_code: str, *, conn=None) -> FactoryIndex:
+    """Load factory archive, summaries, and orders for a single style_code."""
+    code = (style_code or "").strip()
+    if not code:
+        return FactoryIndex()
+    fast = _fresh_mysql_factory_snapshot(conn)
+    if fast is not None:
+        return FactoryIndex(
+            variants={code: list(fast.variants.get(code, ()))},
+            sales={code: list(fast.sales.get(code, ()))},
+            orders={code: list(fast.orders.get(code, ()))},
+        )
+    with (nullcontext(conn) if conn is not None else catalog.read_database()) as rconn:
+        stamp = _factory_stamp(rconn)
+        with _FACTORY_LOCK:
+            cached = _FACTORY_SNAPSHOT
+        if cached is not None and cached[0] == stamp:
+            full = cached[3]
+            return FactoryIndex(
+                variants={code: list(full.variants.get(code, ()))},
+                sales={code: list(full.sales.get(code, ()))},
+                orders={code: list(full.orders.get(code, ()))},
+            )
+        from src.factory.sales_policy import counted_from_rows
+
+        dialect = "mysql" if is_mysql(rconn) else "sqlite"
+        index = FactoryIndex()
+        for row in rconn.execute(
+            "SELECT style_code, variant_code, customer, season, needle, series, category, material, "
+            "design_code, designer, craftsman, subcategory, colors_json, sizes_json "
+            f"FROM style_variants WHERE style_code=? ORDER BY {insert_order(dialect=dialect)}",
+            (code,),
+        ):
+            view = VariantView(
+                style_code=row["style_code"], variant_code=row["variant_code"], customer=row["customer"],
+                season=row["season"], needle=row["needle"], series=row["series"], category=row["category"],
+                material=row["material"], design_code=row["design_code"] or "", designer=row["designer"] or "",
+                craftsman=row["craftsman"] or "", subcategory=row["subcategory"] or "",
+                colors=json.loads(row["colors_json"]), sizes=json.loads(row["sizes_json"]),
+            )
+            index.variants.setdefault(view.style_code, []).append(view)
+
+        order_rows = list(rconn.execute(
+            "SELECT order_no, variant_code, style_code, customer, customer_style_code, color, size_label, "
+            "quantity, amount, order_kind, order_date, salesperson, season "
+            "FROM style_order_lines WHERE style_code=?",
+            (code,),
+        ))
+        summaries = list(rconn.execute("SELECT * FROM style_sales WHERE style_code=?", (code,)))
+        if summaries:
+            for row in counted_from_rows(summaries, order_rows):
+                sale = SaleView(
+                    variant_code=row["variant_code"], style_code=row["style_code"], customer=row["customer"],
+                    color=row["color"], size_label=row["size_label"],
+                    quantity=int(row["quantity"]), amount=float(row["amount"]),
+                )
+                index.sales.setdefault(sale.style_code, []).append(sale)
+
+        codes_cache, periods_cache = {}, {}
+        for row in order_rows:
+            vcode, day = row["variant_code"], row["order_date"] or ""
+            if vcode not in codes_cache:
+                codes_cache[vcode] = parse_style_code(vcode)
+            if day not in periods_cache:
+                periods_cache[day] = _period_key(day)
+            parsed = codes_cache[vcode]
+            order = OrderView(
+                order_no=row["order_no"], variant_code=vcode, style_code=row["style_code"],
+                customer=parsed.customer if parsed else (row["customer"] or ""),
+                buyer=row["customer"] or "",
+                customer_style_code=row["customer_style_code"] or "",
+                color=row["color"], size_label=row["size_label"],
+                quantity=int(row["quantity"]), amount=float(row["amount"]),
+                order_kind=row["order_kind"] or "", order_date=day,
+                salesperson=row["salesperson"] or "", season=row["season"] or "",
+                period=periods_cache[day],
+            )
+            index.orders.setdefault(order.style_code, []).append(order)
+        return index
+
+
+def load_metadata_index(*, conn=None) -> FactoryIndex:
+    """Read dropdown options without transferring/materializing every order line when cold,
+    and reuse the validated FactoryIndex snapshot when warm.
+    """
+    global _FACTORY_SNAPSHOT
+    fast = _fresh_mysql_factory_snapshot(conn)
+    if fast is not None:
+        return fast
+    with (nullcontext(conn) if conn is not None else catalog.read_database()) as rconn:
+        stamp = _factory_stamp(rconn)
+        epoch = catalog._MUTATION_EPOCH
+        with _FACTORY_LOCK:
+            cached = _FACTORY_SNAPSHOT
+            if cached is not None and cached[0] == stamp:
+                if conn is None or catalog._IN_READONLY_DB.get():
+                    _FACTORY_SNAPSHOT = (stamp, epoch, time.monotonic(), cached[3])
+                return cached[3]
+
+        index = FactoryIndex()
+        values = {key: set() for key in ("customer", "buyer", "season", "period", "color", "size_label")}
+        _load_variants(rconn, index)
+        _load_summaries(rconn, index)
+        columns = {"variant": "variant_code", "buyer": "customer", "season": "season",
+                   "date": "order_date", "color": "color", "size_label": "size_label"}
+        sql = " UNION ALL ".join(
+            f"SELECT DISTINCT '{key}' AS facet_name, {column} AS facet_value, HEX({column}) AS facet_exact FROM style_order_lines"
+            for key, column in columns.items()
+        )
+        for row in rconn.execute(sql):
+            key, value = row["facet_name"], row["facet_value"] or ""
+            if key == "variant":
+                parsed = parse_style_code(value)
+                if parsed:
+                    values["customer"].add(parsed.customer)
+            elif key == "date":
+                values["period"].add(_period_key(value))
+            else:
+                values[key].add(value)
+        index.facets = _facets(index, order_values=values)
+        return index
+
+
+def prime_search(index: FactoryIndex):
+    if index._search_blobs is not None:
+        return set_search_blobs(index._search_blobs)
+    blobs = _build_search_blobs(index)
+    index._search_blobs = blobs
     return set_search_blobs(blobs)
 
 

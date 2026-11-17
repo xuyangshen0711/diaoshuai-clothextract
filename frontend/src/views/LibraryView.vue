@@ -9,6 +9,7 @@ import {
   getLibraryMeta,
   getFactoryWorkspace,
   getTaxonomy,
+  peekCatalogCache,
   type CatalogItem,
   type FilterMeta,
   type LibraryMeta,
@@ -118,7 +119,7 @@ let factoryRequest: ReturnType<typeof getFactoryWorkspace> | undefined
 watch(ownFactory, () => { factoryRequest = undefined })
 function loadPendingFactory() {
   if (!ownFactory.value || factoryRequest) return
-  const request = getFactoryWorkspace()
+  const request = getFactoryWorkspace('missing', '', 1, false)
   factoryRequest = request
   void request.then(data => {
     if (factoryRequest === request) pendingFactory.value = data.counts.missing_images
@@ -309,42 +310,80 @@ function onSearchInput(event: Event) {
   searchTimer = window.setTimeout(() => applySearch(value), 250)
 }
 
+const INITIAL_RENDER_LIMIT = 72
+const RENDER_STEP = 72
+const visibleLimit = ref(INITIAL_RENDER_LIMIT)
+const visibleItems = computed(() => items.value.slice(0, visibleLimit.value))
+const sentinelRef = ref<HTMLElement | null>(null)
+let sentinelObserver: IntersectionObserver | null = null
+
+function showMore() {
+  if (visibleLimit.value < items.value.length) {
+    visibleLimit.value = Math.min(items.value.length, visibleLimit.value + RENDER_STEP)
+  }
+}
+
+watch(sentinelRef, el => {
+  sentinelObserver?.disconnect()
+  sentinelObserver = null
+  if (!el || typeof IntersectionObserver === 'undefined') return
+  sentinelObserver = new IntersectionObserver(
+    entries => {
+      if (entries.some(entry => entry.isIntersecting)) showMore()
+    },
+    { rootMargin: '900px 0px' },
+  )
+  sentinelObserver.observe(el)
+})
+
 let latest = 0
 async function load() {
   const sequence = ++latest
-  loading.value = true
   error.value = ''
+  const params = {
+    q: q.value,
+    category: filters.value.category,
+    subcategory: filters.value.subcategory,
+    sleeve_length: ownFactory.value ? filters.value.sleeve_length : '',
+    fabric: ownFactory.value ? filters.value.fabric : '',
+    color: ownFactory.value ? '' : filters.value.color,
+    style: ownFactory.value ? '' : filters.value.style,
+    season: ownFactory.value ? '' : filters.value.season,
+    fit: ownFactory.value ? '' : filters.value.fit,
+    neckline: ownFactory.value ? '' : filters.value.neckline,
+    sleeve: ownFactory.value ? '' : filters.value.sleeve,
+    pattern: filters.value.pattern,
+    order_season: ownFactory.value ? orderSeasons.value : '',
+    color_family: ownFactory.value ? filters.value.color_family : '',
+    ordered_from: ownFactory.value ? filters.value.ordered_from : '',
+    ordered_to: ownFactory.value ? filters.value.ordered_to : '',
+    source_category: sourceCategory.value,
+    sort: sort.value,
+    exclude_samples: true,
+    tag_origin: tagOrigin.value,
+    batch: typeof route.query.batch === 'string' ? route.query.batch : '',
+  }
+  const cached = peekCatalogCache(params)
+  if (cached) {
+    items.value = cached.items
+    count.value = cached.count
+    colorCounts.value = cached.color_counts || {}
+    visibleLimit.value = INITIAL_RENDER_LIMIT
+    loading.value = false
+  } else {
+    loading.value = true
+  }
   try {
-    const data = await getCatalog({
-      q: q.value,
-      category: filters.value.category,
-      subcategory: filters.value.subcategory,
-      sleeve_length: ownFactory.value ? filters.value.sleeve_length : '',
-      fabric: ownFactory.value ? filters.value.fabric : '',
-      color: ownFactory.value ? '' : filters.value.color,
-      style: ownFactory.value ? '' : filters.value.style,
-      season: ownFactory.value ? '' : filters.value.season,
-      fit: ownFactory.value ? '' : filters.value.fit,
-      neckline: ownFactory.value ? '' : filters.value.neckline,
-      sleeve: ownFactory.value ? '' : filters.value.sleeve,
-      pattern: filters.value.pattern,
-      order_season: ownFactory.value ? orderSeasons.value : '',
-      color_family: ownFactory.value ? filters.value.color_family : '',
-      ordered_from: ownFactory.value ? filters.value.ordered_from : '',
-      ordered_to: ownFactory.value ? filters.value.ordered_to : '',
-      source_category: sourceCategory.value,
-      sort: sort.value,
-      exclude_samples: true,
-      tag_origin: tagOrigin.value,
-      batch: typeof route.query.batch === 'string' ? route.query.batch : '',
-    })
+    const data = await getCatalog(params)
     if (sequence !== latest) return
+    const firstChanged = items.value[0]?.id !== data.items[0]?.id || items.value.length !== data.items.length
     items.value = data.items
     count.value = data.count
     colorCounts.value = data.color_counts || {}
+    if (!cached || firstChanged) visibleLimit.value = INITIAL_RENDER_LIMIT
     loadPendingFactory()
   } catch (reason) {
-    if (sequence === latest) error.value = reason instanceof Error ? reason.message : String(reason)
+    if (sequence === latest && !cached) error.value = reason instanceof Error ? reason.message : String(reason)
   } finally {
     if (sequence === latest) loading.value = false
   }
@@ -410,6 +449,8 @@ async function deleteSelected() {
 
 onUnmounted(() => {
   window.clearTimeout(searchTimer)
+  sentinelObserver?.disconnect()
+  sentinelObserver = null
   latest++
   factoryRequest = undefined
 })
@@ -772,87 +813,95 @@ watch(() => route.query, () => {
         >导入新资料</RouterLink
       >。
     </div>
-    <div v-else class="gallery-grid" :aria-busy="loading">
-      <article v-for="item in items" :key="item.id" class="gallery-card" :class="{ 'is-selected': selected.has(item.id) }">
-        <label v-if="selectionMode" class="gallery-card-select">
-          <input type="checkbox" :aria-label="`选择 ${cardTitle(item)} · ${item.source.source_file} ${item.source.location}`" :checked="selected.has(item.id)" :disabled="deleting || loading" @change="toggleImage(item.id)" />
-        </label>
-        <RouterLink
-          class="gallery-card-link"
-          :to="{ name: 'record', params: { id: item.id }, query: { from: route.fullPath } }"
-          :tabindex="selectionMode ? -1 : undefined"
-          @click.capture="onCardClick($event, item.id)"
-        >
-          <div class="gallery-card-image" :class="{ 'has-cover-crop': item.cover_crop }">
-            <img
-              :src="item.cover_url || item.thumbnail_url || item.image_url"
-              :alt="item.style_code || item.library_category || item.display_tags.品类"
-              loading="lazy"
-              width="480"
-              height="640"
-            />
-            <span class="gallery-review-badge" :class="item.review_status">{{
-              tagStatus(item)
-            }}</span>
-            <span v-if="item.source_category === '本厂产品'" class="gallery-factory-badge"
-              >本厂产品</span
-            >
-          </div>
-          <div class="gallery-card-body">
-            <div class="gallery-card-heading">
-              <h2 :title="cardTitle(item)" :translate="item.style_code ? 'no' : undefined">
-                {{ cardTitle(item) }}
-              </h2>
-              <span :title="cardSeason(item)">{{
-                cardSeason(item)
+    <template v-else>
+      <div class="gallery-grid" :aria-busy="loading">
+        <article v-for="(item, idx) in visibleItems" :key="item.id" class="gallery-card" :class="{ 'is-selected': selected.has(item.id) }">
+          <label v-if="selectionMode" class="gallery-card-select">
+            <input type="checkbox" :aria-label="`选择 ${cardTitle(item)} · ${item.source.source_file} ${item.source.location}`" :checked="selected.has(item.id)" :disabled="deleting || loading" @change="toggleImage(item.id)" />
+          </label>
+          <RouterLink
+            class="gallery-card-link"
+            :to="{ name: 'record', params: { id: item.id }, query: { from: route.fullPath } }"
+            :tabindex="selectionMode ? -1 : undefined"
+            @click.capture="onCardClick($event, item.id)"
+          >
+            <div class="gallery-card-image" :class="{ 'has-cover-crop': item.cover_crop }">
+              <img
+                :src="item.cover_url || item.thumbnail_url || item.image_url"
+                :alt="item.style_code || item.library_category || item.display_tags.品类"
+                :loading="idx < 12 ? 'eager' : 'lazy'"
+                decoding="async"
+                width="480"
+                height="640"
+              />
+              <span class="gallery-review-badge" :class="item.review_status">{{
+                tagStatus(item)
               }}</span>
-            </div>
-            <p class="gallery-card-subtitle" :title="cardSubtitle(item)">
-              {{ cardSubtitle(item) || '待补充分类' }}
-            </p>
-            <div class="gallery-card-options">
-              <div
-                class="gallery-color-dots"
-                :aria-label="
-                  item.color_families?.length
-                    ? `色系：${item.color_families.join('、')}`
-                    : '暂无色系信息'
-                "
+              <span v-if="item.source_category === '本厂产品'" class="gallery-factory-badge"
+                >本厂产品</span
               >
+            </div>
+            <div class="gallery-card-body">
+              <div class="gallery-card-heading">
+                <h2 :title="cardTitle(item)" :translate="item.style_code ? 'no' : undefined">
+                  {{ cardTitle(item) }}
+                </h2>
+                <span :title="cardSeason(item)">{{
+                  cardSeason(item)
+                }}</span>
+              </div>
+              <p class="gallery-card-subtitle" :title="cardSubtitle(item)">
+                {{ cardSubtitle(item) || '待补充分类' }}
+              </p>
+              <div class="gallery-card-options">
+                <div
+                  class="gallery-color-dots"
+                  :aria-label="
+                    item.color_families?.length
+                      ? `色系：${item.color_families.join('、')}`
+                      : '暂无色系信息'
+                  "
+                >
+                  <span
+                    v-for="name in (item.color_families || []).slice(0, 7)"
+                    :key="name"
+                    class="gallery-color-dot"
+                    :class="{ light: swatchLight(name) }"
+                    :style="{ background: swatchColor(name) }"
+                    :title="name"
+                  ></span
+                  ><span v-if="(item.color_families?.length || 0) > 7" class="gallery-more-colors"
+                    >+{{ item.color_families!.length - 7 }}</span
+                  >
+                </div>
                 <span
-                  v-for="name in (item.color_families || []).slice(0, 7)"
-                  :key="name"
-                  class="gallery-color-dot"
-                  :class="{ light: swatchLight(name) }"
-                  :style="{ background: swatchColor(name) }"
-                  :title="name"
-                ></span
-                ><span v-if="(item.color_families?.length || 0) > 7" class="gallery-more-colors"
-                  >+{{ item.color_families!.length - 7 }}</span
+                  v-if="item.source_category === '本厂产品' && item.variant_count"
+                  class="gallery-variant-count"
+                  >{{ item.variant_count }} 个版本</span
                 >
               </div>
-              <span
-                v-if="item.source_category === '本厂产品' && item.variant_count"
-                class="gallery-variant-count"
-                >{{ item.variant_count }} 个版本</span
-              >
+              <div class="gallery-card-footer" :title="item.source_category === '本厂产品' ? `订单件数与订单金额 · ${ownFactory ? orderScopeText : '全部季节、全部下单时间累计'}` : undefined">
+                <template v-if="item.source_category === '本厂产品'"
+                  ><strong><small>订单 </small>{{ item.sales_quantity.toLocaleString('zh-CN') }}<small> 件</small></strong
+                  ><span v-if="item.sales_amount" class="gallery-sales-amount">{{
+                    formatWan(item.sales_amount)
+                  }}</span
+                  ><span v-else class="gallery-source-name">暂无金额</span></template
+                ><span v-else class="gallery-source-name">{{
+                  item.source_category || '未分类'
+                }}</span>
+              </div>
             </div>
-            <div class="gallery-card-footer" :title="item.source_category === '本厂产品' ? `订单件数与订单金额 · ${ownFactory ? orderScopeText : '全部季节、全部下单时间累计'}` : undefined">
-              <template v-if="item.source_category === '本厂产品'"
-                ><strong><small>订单 </small>{{ item.sales_quantity.toLocaleString('zh-CN') }}<small> 件</small></strong
-                ><span v-if="item.sales_amount" class="gallery-sales-amount">{{
-                  formatWan(item.sales_amount)
-                }}</span
-                ><span v-else class="gallery-source-name">暂无金额</span></template
-              ><span v-else class="gallery-source-name">{{
-                item.source_category || '未分类'
-              }}</span>
-            </div>
-          </div>
-        </RouterLink>
-        <button v-if="!selectionMode" type="button" class="gallery-edit-tags" :aria-label="`修改标签：${cardTitle(item)}`" @click="editing = item">修改标签</button>
-      </article>
-    </div>
+          </RouterLink>
+          <button v-if="!selectionMode" type="button" class="gallery-edit-tags" :aria-label="`修改标签：${cardTitle(item)}`" @click="editing = item">修改标签</button>
+        </article>
+      </div>
+      <div v-if="visibleItems.length < items.length" ref="sentinelRef" class="gallery-load-more">
+        <button type="button" class="btn small" @click="showMore">
+          继续显示更多（当前 {{ visibleItems.length }} / {{ items.length }} 款）
+        </button>
+      </div>
+    </template>
     <TagEditor v-if="editing" :key="editing.id" :item="editing" @close="editing = null" @saved="tagsSaved" />
   </main>
 </template>

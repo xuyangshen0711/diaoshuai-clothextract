@@ -26,8 +26,9 @@ router = APIRouter(prefix="/api/import")
 
 @router.get("/workspace")
 def get_workspace(status: str = Query("missing", pattern="^(all|missing|image|archive|no_sales)$"),
-                  q: str = "", page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)):
-    return workspace(status, q, page, page_size)
+                  q: str = "", page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
+                  verify_remote: bool = True):
+    return workspace(status, q, page, page_size, verify_remote=verify_remote)
 
 
 @router.get("/table-history")
@@ -159,7 +160,7 @@ def inspect_files(files: list[UploadFile] = File(...), category: str = Form(...)
 
 
 def inspect_paths(entries, category):
-    with catalog._database() as conn:
+    with catalog.read_database() as conn:
         images = own_factory_images(conn)
         known = {r[0] for table in ("style_variants", "style_sales", "style_order_lines")
                  for r in conn.execute(f"SELECT DISTINCT style_code FROM {table}")}

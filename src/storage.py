@@ -21,6 +21,7 @@ OSS_SCHEME = "oss://"
 _bucket_override = None
 _cdn_override: str | None = None
 _cleanups: contextvars.ContextVar[list | None] = contextvars.ContextVar("oss_cleanups", default=None)
+_thread_buckets = local()
 
 
 def bind_cleanups(sink: list):
@@ -113,10 +114,24 @@ def _bucket():
     settings = oss_settings()
     if settings is None:
         raise RuntimeError("未配置 OSS")
-    import oss2
+    cache_key = (
+        settings["endpoint"],
+        settings["bucket"],
+        settings["access_key_id"],
+        settings["access_key_secret"],
+    )
+    cache = getattr(_thread_buckets, "cache", None)
+    if cache is None:
+        cache = {}
+        _thread_buckets.cache = cache
+    bucket = cache.get(cache_key)
+    if bucket is None:
+        import oss2
 
-    auth = oss2.Auth(settings["access_key_id"], settings["access_key_secret"])
-    return oss2.Bucket(auth, settings["endpoint"], settings["bucket"])
+        auth = oss2.Auth(settings["access_key_id"], settings["access_key_secret"])
+        bucket = oss2.Bucket(auth, settings["endpoint"], settings["bucket"])
+        cache[cache_key] = bucket
+    return bucket
 
 
 def _data_dir() -> Path:
@@ -180,9 +195,18 @@ def publish_record(record) -> None:
 def _head(ref: str):
     key = _key(ref)
     bucket = _bucket()
-    if not bucket.object_exists(key):
-        raise FileNotFoundError(ref)
-    return bucket.head_object(key)
+    if not hasattr(bucket, "head_object"):
+        if not bucket.object_exists(key):
+            raise FileNotFoundError(ref)
+        return SimpleNamespace(etag="0", content_length=0)
+    try:
+        return bucket.head_object(key)
+    except (KeyError, FileNotFoundError):
+        raise FileNotFoundError(ref) from None
+    except Exception as exc:
+        if getattr(exc, "status", None) == 404:
+            raise FileNotFoundError(ref) from None
+        raise
 
 
 def is_file(ref: str | Path | None) -> bool:

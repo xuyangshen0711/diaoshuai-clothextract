@@ -166,9 +166,10 @@ def now() -> str:
 
 
 def own_factory_images(conn) -> dict[str, ImageRecord]:
+    from src import catalog
+
     found: dict[str, ImageRecord] = {}
-    for row in conn.execute("SELECT payload FROM records"):
-        record = ImageRecord.model_validate_json(row[0])
+    for record in catalog.load_catalog(conn=conn):
         if record.source_category == "本厂产品" and record.style_code and record.review_status != "rejected":
             found[record.style_code] = record
     return found

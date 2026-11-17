@@ -20,12 +20,27 @@ from src.factory.tables import gap_report, now, own_factory_images
 from src.factory.import_impact import import_impact, projected_impact
 
 
-def completeness(conn) -> list[dict]:
-    archives = {r[0] for r in conn.execute("SELECT DISTINCT style_code FROM style_variants")}
-    sales = {r[0] for table in ("style_sales", "style_order_lines")
-             for r in conn.execute(f"SELECT DISTINCT style_code FROM {table}")}
+def completeness(
+    conn,
+    *,
+    verify_remote: bool = True,
+    archives: set[str] | None = None,
+    sales: set[str] | None = None,
+) -> list[dict]:
+    if archives is None:
+        archives = {r[0] for r in conn.execute("SELECT DISTINCT style_code FROM style_variants")}
+    if sales is None:
+        sales = {r[0] for table in ("style_sales", "style_order_lines")
+                 for r in conn.execute(f"SELECT DISTINCT style_code FROM {table}")}
     images = own_factory_images(conn)
-    available = storage.existing_files(record.image_path for record in images.values())
+    if verify_remote:
+        available = storage.existing_files(record.image_path for record in images.values())
+    else:
+        available = {
+            record.image_path
+            for record in images.values()
+            if record.image_path and (storage.is_remote(record.image_path) or Path(record.image_path).is_file())
+        }
     result = []
     for code in sorted(archives | sales | set(images)):
         record = images.get(code)
@@ -41,10 +56,45 @@ def completeness(conn) -> list[dict]:
     return result
 
 
-def workspace(status="missing", query="", page=1, page_size=20) -> dict:
-    with catalog._database() as conn:
-        items = completeness(conn)
-        policy = policy_summary(conn)
+def workspace(status="missing", query="", page=1, page_size=20, *, verify_remote: bool = True) -> dict:
+    if not verify_remote:
+        from src.factory.library import load_index
+
+        idx = load_index()
+        archives = set(idx.variants)
+        sales = set(idx.sales) | set(idx.orders)
+        images: dict = {}
+        for rec in catalog.load_catalog():
+            if rec.source_category == "本厂产品" and rec.style_code and rec.review_status != "rejected":
+                images[rec.style_code] = rec
+        available = {
+            rec.image_path
+            for rec in images.values()
+            if rec.image_path and (storage.is_remote(rec.image_path) or Path(rec.image_path).is_file())
+        }
+        items = []
+        for code in sorted(archives | sales | set(images)):
+            rec = images.get(code)
+            has_image = bool(rec and rec.image_path in available)
+            missing = []
+            if not has_image:
+                missing.append("image")
+            if code not in archives:
+                missing.append("archive")
+            items.append({
+                "style_code": code,
+                "has_image": has_image,
+                "has_archive": code in archives,
+                "has_sales": code in sales,
+                "record_id": rec.id if has_image else None,
+                "pending_review": bool(has_image and rec.review_status == "pending"),
+                "missing": missing,
+            })
+        policy = {"reference_rows": 0, "reference_quantity": 0, "note": ""}
+    else:
+        with catalog.read_database() as conn:
+            items = completeness(conn, verify_remote=True)
+            policy = policy_summary(conn)
     counts = {"styles": len(items), "missing_images": sum(not r["has_image"] for r in items),
               "missing_archives": sum(not r["has_archive"] for r in items),
               "no_sales": sum(not r["has_sales"] for r in items),
@@ -58,11 +108,17 @@ def workspace(status="missing", query="", page=1, page_size=20) -> dict:
             "page": page, "page_size": page_size, "sales_policy": policy}
 
 
-def _fingerprint(conn, complete=None) -> str:
-    state = {"style_grouping": "starred_style_codes_v1", "archive_template": "product_table_11_columns_v1"}
+def _fingerprint(conn, complete=None, *, tables_data: dict[str, list[dict]] | None = None) -> str:
+    state: dict = {"style_grouping": "starred_style_codes_v1", "archive_template": "product_table_11_columns_v1"}
     for table in ("style_variants", "style_sales", "style_order_lines"):
-        state[table] = sorted([dict(r) for r in conn.execute(f"SELECT * FROM {table}")],
-                              key=lambda r: json.dumps(r, sort_keys=True, default=str))
+        raw_rows = (
+            tables_data[table]
+            if tables_data is not None and table in tables_data
+            else [dict(r) for r in conn.execute(f"SELECT * FROM {table}")]
+        )
+        decorated = [(json.dumps(r, sort_keys=True, default=str), r) for r in raw_rows]
+        decorated.sort(key=lambda pair: pair[0])
+        state[table] = [pair[1] for pair in decorated]
     state["images"] = [(r["style_code"], r["has_image"], r["record_id"])
                        for r in (completeness(conn) if complete is None else complete)]
     return hashlib.sha256(json.dumps(state, sort_keys=True, default=str).encode()).hexdigest()
@@ -76,12 +132,21 @@ def _row_data(kind, item):
     return {k: v for k, v in item.items() if k != "extra_json"}
 
 
-def _plan(conn, kind, rows, fmt):
+def _plan(conn, kind, rows, fmt, *, table_rows: list[dict] | None = None):
     table = "style_variants" if kind == "archive" else "style_order_lines" if fmt == "sales_lines" else "style_sales"
     keys = ["variant_code"] if kind == "archive" else (
         ["order_no", "variant_code", "color", "size_label"] if fmt == "sales_lines" else
         ["variant_code", "color", "size_label", "year", "period"])
-    existing = {tuple(r[k] for k in keys): dict(r) for r in conn.execute(f"SELECT * FROM {table}")}
+    if table_rows is not None:
+        existing = {tuple(r[k] for k in keys): r for r in table_rows}
+    else:
+        variants = sorted({r["variant_code"] for r in rows if r.get("variant_code")})
+        existing = {}
+        for i in range(0, len(variants), 500):
+            chunk = variants[i:i + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            for r in conn.execute(f"SELECT * FROM {table} WHERE variant_code IN ({placeholders})", chunk):
+                existing[tuple(r[k] for k in keys)] = dict(r)
     planned = []
     for item in rows:
         previous = existing.get(tuple(item[k] for k in keys))
@@ -137,17 +202,42 @@ def preview_table(path: Path, filename: str, requested_kind: str) -> dict:
     issues, ignored = _issues(path, kind, meta["format"], sheet_rows=sheet_rows)
     del sheet_rows
     token = uuid4().hex
-    with catalog._database() as conn:
-        plan = _plan(conn, kind, rows, meta["format"])
-        complete = completeness(conn)
-        state = _fingerprint(conn, complete)
+    with catalog.read_database() as conn:
+        tables_data = {
+            t: [dict(r) for r in conn.execute(f"SELECT * FROM {t}")]
+            for t in ("style_variants", "style_sales", "style_order_lines")
+        }
+        target_table = (
+            "style_variants" if kind == "archive"
+            else "style_order_lines" if meta["format"] == "sales_lines"
+            else "style_sales"
+        )
+        plan = _plan(conn, kind, rows, meta["format"], table_rows=tables_data[target_table])
+        archive_codes = {r["style_code"] for r in tables_data["style_variants"]}
+        sales_codes = {r["style_code"] for r in tables_data["style_sales"]} | {
+            r["style_code"] for r in tables_data["style_order_lines"]
+        }
+        complete = completeness(conn, archives=archive_codes, sales=sales_codes)
+        state = _fingerprint(conn, complete, tables_data=tables_data)
         codes = sorted({r["style_code"] for r in rows})
         selected = set(codes)
         gaps = [r for r in complete if r["style_code"] in selected]
-        ordered = {r[0] for r in conn.execute("SELECT DISTINCT variant_code FROM style_order_lines")}
-        summarized = {r[0] for r in conn.execute("SELECT DISTINCT variant_code FROM style_sales")}
-        impact = projected_impact(read_rows(conn), plan,
-                                  "orders" if meta["format"] == "sales_lines" else "summary", rows) if kind == "sales" else None
+        ordered = {r["variant_code"] for r in tables_data["style_order_lines"]}
+        summarized = {r["variant_code"] for r in tables_data["style_sales"]}
+        if kind == "sales":
+            before_sales = {
+                row_id("orders", r): {"kind": "orders", "row": r}
+                for r in tables_data["style_order_lines"]
+            }
+            before_sales.update(
+                (row_id("summary", r), {"kind": "summary", "row": r})
+                for r in tables_data["style_sales"]
+            )
+            impact = projected_impact(
+                before_sales, plan, "orders" if meta["format"] == "sales_lines" else "summary", rows,
+            )
+        else:
+            impact = None
     collisions = sorted({r["variant_code"] for r in rows} & (summarized if meta["format"] == "sales_lines" else ordered)) if kind == "sales" else []
     response = {"token": token, "kind": kind, "requested_kind": requested_kind, "source_file": filename,
                 "format": meta["format"], "format_label": meta["format_label"], "meta": meta,
@@ -229,11 +319,14 @@ def confirm_table(token: str, acknowledge=False, historical_start="", historical
             report["_sales_references"] = sorted(row_id(row_kind, row) for row in rows)
         conn.execute("INSERT INTO factory_import_history (id, payload, created_at) VALUES (?, ?, ?)",
                      (token, json.dumps(report, ensure_ascii=False), report["created_at"]))
+    from src.factory.library import invalidate_factory_snapshot
+
+    invalidate_factory_snapshot()
     return public_report(report)
 
 
 def history() -> list[dict]:
-    with catalog._database() as conn:
+    with catalog.read_database() as conn:
         return [public_report(json.loads(r[0])) for r in conn.execute("SELECT payload FROM factory_import_history ORDER BY created_at DESC LIMIT 30")]
 
 
@@ -266,7 +359,7 @@ def replan_table(token: str, historical_start="", historical_end="") -> dict:
     preview = manifest["response"]
     if preview["kind"] != "sales" or preview["format"] == "sales_lines":
         raise ValueError("仅销量汇总可调整历史范围。")
-    with catalog._database() as conn:
+    with catalog.read_database() as conn:
         if manifest["fingerprint"] != _fingerprint(conn):
             raise catalog.CatalogConflict("资料在预览后有更新，请重新选择文件。")
         rows = manifest.get("base_rows", manifest["rows"])

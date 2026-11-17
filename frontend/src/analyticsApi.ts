@@ -73,6 +73,132 @@ export type QuestionAnswer = {
   }[]
 }
 
+export type YarnTimeMode = 'period' | 'date'
+export type YarnCompareMode = 'none' | 'previous_period' | 'custom_period' | 'custom_date'
+
+export type YarnPeriodOption = {
+  key: string
+  label: string
+  start: string
+  end: string
+  has_orders: boolean
+}
+
+export type YarnFilterOptions = {
+  seasons: string[]
+  periods: YarnPeriodOption[]
+  first_order_date: string | null
+  last_order_date: string | null
+  dated_lines: number
+  undated_lines: number
+}
+
+export type YarnReportFilters = {
+  seasons: string[]
+  time_mode: YarnTimeMode
+  period_start: string
+  period_end: string
+  start_date: string | null
+  end_date: string | null
+  compare_mode: YarnCompareMode
+  compare_period_start: string
+  compare_period_end: string
+  compare_start_date: string | null
+  compare_end_date: string | null
+}
+
+export type YarnMissingWarning = {
+  code: string
+  severity: 'high' | 'medium'
+  title: string
+  detail: string
+  style_count: number
+  brand_style_count: number
+  line_count: number
+  quantity: number
+  sample_codes: string[]
+}
+
+export type YarnMissingSummary = {
+  has_warnings: boolean
+  warning_count: number
+  warnings: YarnMissingWarning[]
+}
+
+export type YarnScopeMeta = {
+  seasons: string[]
+  season_label: string
+  time_mode: YarnTimeMode
+  window_label: string
+  effective_start_date: string | null
+  effective_end_date: string
+  end_period_key: string
+  end_period_label: string
+  compare_mode: YarnCompareMode
+  compare_label: string
+  order_line_count: number
+}
+
+export type YarnMaterialRow = {
+  rank: number
+  material: string
+  is_unmatched: boolean
+  is_main: boolean
+  style_count: number
+  brand_style_count: number
+  customer_count: number
+  customer_share: number
+  quantity: number
+  amount: number
+  quantity_share: number
+  avg_per_style: number
+  compare_quantity: number | null
+  growth_quantity: number | null
+  growth_rate: number | null
+}
+
+export type YarnMaterialTotals = Omit<YarnMaterialRow, 'rank' | 'material' | 'is_unmatched' | 'is_main'>
+
+export type YarnColorRow = {
+  rank: number
+  material: string
+  color_group: string
+  style_count: number
+  brand_style_count: number
+  customer_count: number
+  quantity: number
+  amount: number
+  share: number
+  compare_quantity: number | null
+  growth_quantity: number | null
+  growth_rate: number | null
+}
+
+export type YarnColorBlock = {
+  material: string
+  is_main: boolean
+  is_unmatched: boolean
+  rows: YarnColorRow[]
+  totals: Omit<YarnColorRow, 'rank' | 'material' | 'color_group'>
+}
+
+export type YarnReportData = {
+  scope: YarnScopeMeta
+  main_materials: string[]
+  materials_summary: YarnMaterialRow[]
+  materials_totals: YarnMaterialTotals
+  color_blocks: YarnColorBlock[]
+  snapshot: string
+}
+
+export type YarnPreviewResponse = {
+  requires_confirmation: boolean
+  filters: YarnReportFilters
+  scope: YarnScopeMeta
+  missing: YarnMissingSummary
+  report: YarnReportData | null
+}
+
 const base = '/api/analytics'
 function jsonPost(body: object = {}): RequestInit {
   return { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
@@ -91,3 +217,27 @@ export async function exportReport(report: AnalysisReport) {
 }
 export const sendAnalysisMessage = (question: string, history: string[], context?: QuestionContext) =>
   request<QuestionAnswer>(base + '/chat', jsonPost({ question, history, context }))
+
+export const yarnTableOptions = () => request<YarnFilterOptions>(base + '/yarn-table/options')
+export const previewYarnTable = (filters: YarnReportFilters, acknowledgeMissing = false) =>
+  request<YarnPreviewResponse>(
+    base + '/yarn-table/preview',
+    jsonPost({ filters, acknowledge_missing: acknowledgeMissing }),
+  )
+export async function exportYarnTable(
+  filters: YarnReportFilters,
+  snapshot: string,
+  acknowledgeMissing: boolean,
+  selectedMaterials: string[],
+) {
+  const response = await requestResponse(
+    base + '/yarn-table/xlsx',
+    jsonPost({
+      filters,
+      snapshot,
+      acknowledge_missing: acknowledgeMissing,
+      selected_materials: selectedMaterials,
+    }),
+  )
+  return response.blob()
+}

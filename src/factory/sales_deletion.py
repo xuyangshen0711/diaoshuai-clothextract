@@ -114,7 +114,7 @@ def _batch_scope(conn, batch_id, rows):
 
 
 def list_rows(*, batch_id="", q="", page=1, page_size=50):
-    with catalog._database() as conn:
+    with catalog.read_database() as conn:
         rows = read_rows(conn)
         ids, batch = _batch_scope(conn, batch_id, rows) if batch_id else (set(rows), None)
     query = q.strip().casefold()
@@ -183,7 +183,7 @@ def _plan(conn, rows, scope, batch_id, ids):
 
 
 def preview(*, scope="selected", batch_id="", ids=()):
-    with catalog._database() as conn:
+    with catalog.read_database() as conn:
         plan, _ = _plan(conn, read_rows(conn), scope, batch_id, ids)
     return plan
 
@@ -218,11 +218,14 @@ def delete(*, scope="selected", batch_id="", ids=(), token):
                 kind, row = entry["kind"], entry["row"]
                 where = " AND ".join(f"`{field}`=?" for field in KEYS[kind])
                 conn.execute(f"DELETE FROM {TABLES[kind]} WHERE {where}", tuple(row[field] for field in KEYS[kind]))
+    from src.factory.library import invalidate_factory_snapshot
+
+    invalidate_factory_snapshot()
     return {"deleted": len(selected), "backup_id": audit["id"], "before": plan["before"], "after": plan["after"]}
 
 
 def deletions(*, page=1):
-    with catalog._database() as conn:
+    with catalog.read_database() as conn:
         records = conn.execute(
             "SELECT id, created_at, " + json_extract("payload", "$.preview.row_count") + " AS row_count, "
             + json_extract("payload", "$.preview.batch.name") + " AS source_file, "
@@ -237,7 +240,7 @@ def deletions(*, page=1):
 
 
 def backup(identifier):
-    with catalog._database() as conn:
+    with catalog.read_database() as conn:
         row = conn.execute("SELECT payload FROM sales_deletions WHERE id=?", (identifier,)).fetchone()
     if row is None:
         raise KeyError(identifier)
@@ -294,7 +297,7 @@ def _restore_plan(conn, audit, rows):
 
 
 def restore_preview(identifier):
-    with catalog._database() as conn:
+    with catalog.read_database() as conn:
         plan, _ = _restore_plan(conn, _saved(conn, identifier), read_rows(conn))
     return plan
 
@@ -327,4 +330,7 @@ def restore(identifier, token):
         audit["restoration"] = result
         # Rows and the single-use restoration receipt commit or roll back together.
         conn.execute("UPDATE sales_deletions SET payload=? WHERE id=?", (_json(audit), identifier))
+    from src.factory.library import invalidate_factory_snapshot
+
+    invalidate_factory_snapshot()
     return {**result, "already_restored": False}

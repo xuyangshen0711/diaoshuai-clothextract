@@ -330,4 +330,7 @@ def _write_sales_rows(conn, rows, source_name, table, keys, columns, assignments
             data = {**item, "source_file": source_name, "extra_json": "{}", "updated_at": timestamp}
             values.append(tuple(data[column] for column in columns))
         conn.executemany(sql, values)
+    from src.factory.library import invalidate_factory_snapshot
+
+    invalidate_factory_snapshot()
     return imported, updated

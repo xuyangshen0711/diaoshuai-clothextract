@@ -51,6 +51,7 @@ from src.factory.library import (  # noqa: E402
     in_group,
     load_index,
     load_metadata_index,
+    load_style_index,
     matches_factory,
     matches_level2,
     order_statistics_index,
@@ -121,16 +122,22 @@ app.include_router(analytics_router)
 
 
 class CatalogCompressionMiddleware:
-    """Compress only gallery JSON; leave original files and image streams untouched."""
+    """Compress JSON API responses; leave original files, images, PDFs, and Excel streams untouched."""
+
+    _BINARY_SUFFIXES = ("/image", "/source", "/pdf", "/xlsx", "/backup")
 
     def __init__(self, app):
         self.app = app
-        self.compressed = GZipMiddleware(app, minimum_size=1000, compresslevel=5)
+        self.compressed = GZipMiddleware(app, minimum_size=1000, compresslevel=1)
 
     async def __call__(self, scope, receive, send):
-        target = self.compressed if (scope["type"] == "http" and scope["path"] in {
-            "/api/catalog", "/api/meta/library",
-        }) else self.app
+        path = scope.get("path", "")
+        should_compress = (
+            scope["type"] == "http"
+            and path.startswith("/api/")
+            and not path.endswith(self._BINARY_SUFFIXES)
+        )
+        target = self.compressed if should_compress else self.app
         await target(scope, receive, send)
 
 
@@ -151,20 +158,76 @@ async def catalog_conflict_handler(_request, exc):
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
-def _serialize(record: ImageRecord, score: float | None = None, index=None, *,
-               defer_oss_images: bool = False, order_index=None) -> dict[str, Any]:
+_CARD_BASE_CACHE: dict[tuple, dict[str, Any]] = {}
+_CARD_FULL_CACHE: dict[tuple, dict[str, Any]] = {}
+_CARD_BASE_EPOCH = -1
+_CARD_FULL_INDEX_ID = -1
+
+
+def _deferred_card_base(record: ImageRecord) -> dict[str, Any]:
+    global _CARD_BASE_EPOCH
+    if _CARD_BASE_EPOCH != catalog_store._MUTATION_EPOCH or len(_CARD_BASE_CACHE) > 12000:
+        _CARD_BASE_CACHE.clear()
+        _CARD_FULL_CACHE.clear()
+        _CARD_BASE_EPOCH = catalog_store._MUTATION_EPOCH
+    crop_key = record.cover_crop.model_dump_json() if record.cover_crop else ""
+    key = (record.id, record.revision, record.updated_at, record.image_path, record.pending_image_path or "", crop_key)
+    cached = _CARD_BASE_CACHE.get(key)
+    if cached is not None:
+        return dict(cached)
     payload = record.model_dump()
     url = f"/api/records/{record.id}/image"
+    version = f"r{record.revision}"
+    payload.update(
+        image_width=None,
+        image_height=None,
+        image_url=f"{url}?v={version}",
+        thumbnail_url=f"{url}?variant=thumbnail&v={version}",
+        cover_url=f"{url}?variant=cover&v={version}" if record.cover_crop else f"{url}?variant=thumbnail&v={version}",
+        download_url=f"{url}?download=true&v={version}",
+        display_tags=record.display_tags.model_dump(),
+        tag_overrides=record.human_overrides,
+        manually_edited=bool(record.human_overrides),
+        entry_ready=record.ready,
+        pending_image_url=f"{url}?variant=pending&v={version}" if record.pending_image_path else None,
+    )
+    _CARD_BASE_CACHE[key] = payload
+    return dict(payload)
+
+
+def _serialize(record: ImageRecord, score: float | None = None, index=None, *,
+               defer_oss_images: bool = False, order_index=None) -> dict[str, Any]:
+    global _CARD_FULL_INDEX_ID
     original_cdn = storage.public_url(record.image_path)
     use_revision = defer_oss_images and storage.is_remote(record.image_path) and not original_cdn
     if use_revision:
-        # The grid has fixed-size previews. Fetch original metadata only on detail views.
-        version = f"r{record.revision}"
-        payload.update(image_width=None, image_height=None)
-    else:
-        metadata = image_metadata(record.image_path)
-        version = metadata.pop("version")
-        payload.update(metadata)
+        factory = index if index is not None else load_index()
+        unscoped = order_index is None or order_index is factory
+        if unscoped and score is None:
+            if _CARD_FULL_INDEX_ID != id(factory) or _CARD_BASE_EPOCH != catalog_store._MUTATION_EPOCH or len(_CARD_FULL_CACHE) > 12000:
+                _CARD_FULL_CACHE.clear()
+                _CARD_FULL_INDEX_ID = id(factory)
+            crop_key = record.cover_crop.model_dump_json() if record.cover_crop else ""
+            fkey = (record.id, record.revision, record.updated_at, record.source_category, record.style_code, record.image_path, record.pending_image_path or "", crop_key)
+            full_hit = _CARD_FULL_CACHE.get(fkey)
+            if full_hit is not None:
+                return full_hit
+            payload = _deferred_card_base(record)
+            payload.update(card_fields(record, factory, order_index=order_index))
+            _CARD_FULL_CACHE[fkey] = payload
+            return payload
+
+        payload = _deferred_card_base(record)
+        payload.update(card_fields(record, factory, order_index=order_index))
+        if score is not None:
+            payload["score"] = score
+        return payload
+
+    payload = record.model_dump()
+    url = f"/api/records/{record.id}/image"
+    metadata = image_metadata(record.image_path)
+    version = metadata.pop("version")
+    payload.update(metadata)
     payload["image_url"] = f"{original_cdn}?v={version}" if original_cdn else f"{url}?v={version}"
     thumb_cdn = None
     if original_cdn and storage.is_file(record.image_path):
@@ -174,7 +237,7 @@ def _serialize(record: ImageRecord, score: float | None = None, index=None, *,
             thumb_cdn = None
     payload["thumbnail_url"] = thumb_cdn or f"{url}?variant=thumbnail&v={version}"
     if record.cover_crop:
-        cover_token = version if use_revision else cover_version(record)
+        cover_token = cover_version(record)
         payload["cover_url"] = f"{url}?variant=cover&v={cover_token}"
     else:
         payload["cover_url"] = payload["thumbnail_url"]
@@ -185,9 +248,7 @@ def _serialize(record: ImageRecord, score: float | None = None, index=None, *,
     payload["entry_ready"] = record.ready
     factory = index if index is not None else load_index()
     payload.update(card_fields(record, factory, order_index=order_index))
-    if use_revision and record.pending_image_path:
-        payload["pending_image_url"] = f"{url}?variant=pending&v={version}"
-    elif record.pending_image_path and storage.is_file(record.pending_image_path):
+    if record.pending_image_path and storage.is_file(record.pending_image_path):
         pending_cdn = storage.public_url(record.pending_image_path)
         pending_version = image_version(record.pending_image_path)
         payload["pending_image_url"] = (
@@ -231,27 +292,26 @@ def _narrow(records: list[ImageRecord], *, filters: dict, group: str | None, q: 
             source_category: str | None, factory_filters: dict, index) -> list[ImageRecord]:
     if source_category and source_category not in {"", "全部"}:
         records = [record for record in records if record.source_category == source_category]
-    by_id = {record.id: record for record in records}
     category = filters.get("category")
     subcategory = filters.get("subcategory")
     sleeve_length = filters.get("sleeve_length")
     fabric = filters.get("fabric")
-    projected = [record.model_copy(update={"tags": record.display_tags}) for record in records]
+    projected = list(records)
     if group in CATEGORY_GROUPS:
-        projected = [record for record in projected if in_group(by_id[record.id], group, index)]
+        projected = [record for record in projected if in_group(record, group, index)]
     skipped = {"category", "subcategory", "sleeve_length", "fabric"}
     projected = filter_records(projected, **{key: value for key, value in filters.items() if key not in skipped})
     if any(value and value != "全部" for value in (category, subcategory, sleeve_length, fabric)):
         kept = []
         for record in projected:
-            placement = effective_placement(by_id[record.id], index)
+            placement = effective_placement(record, index)
             if category and category != "全部":
                 if ">" in category:
                     if placement.label != category:
                         continue
-                elif category not in display_categories(by_id[record.id], index) and placement.level1 != category:
+                elif category not in display_categories(record, index) and placement.level1 != category:
                     continue
-            if not matches_level2(by_id[record.id], index, subcategory, placement.level2):
+            if not matches_level2(record, index, subcategory, placement.level2):
                 continue
             if sleeve_length and sleeve_length != "全部" and placement.sleeve != sleeve_length:
                 continue
@@ -259,13 +319,11 @@ def _narrow(records: list[ImageRecord], *, filters: dict, group: str | None, q: 
                 continue
             kept.append(record)
         projected = kept
-    chosen = [by_id[record.id] for record in projected
-              if matches_factory(by_id[record.id], index, **factory_filters)]
+    chosen = [record for record in projected
+              if matches_factory(record, index, **factory_filters)]
     if q and q.strip():
         needle = q.strip().lower()
-        # Match the proposal the library is showing, and the archive text primed for this request.
-        chosen = [record for record in chosen if needle in record.model_copy(
-            update={"tags": record.display_tags}).search_text().lower()]
+        chosen = [record for record in chosen if needle in record.search_text().lower()]
     return chosen
 
 
@@ -361,6 +419,7 @@ def health() -> dict[str, Any]:
         shown = "gpt-4o-mini"
     else:
         shown = "mock"
+    total_count, pending_count = catalog_store.catalog_counts()
     return {
         "ok": True,
         "openai_ready": ready,
@@ -372,8 +431,8 @@ def health() -> dict[str, Any]:
         "embedding_backend": backend_name,
         "database": "mysql" if mysql_config() else "sqlite",
         "storage": "oss" if storage.using_oss() else "local",
-        "catalog_count": len(load_catalog()),
-        "pending_count": sum(r.review_status == "pending" for r in load_catalog()),
+        "catalog_count": total_count,
+        "pending_count": pending_count,
     }
 
 
@@ -391,7 +450,7 @@ def ai_service_check(provider: Literal["openai", "deepseek"]) -> dict[str, Any]:
 def meta_filters() -> dict[str, Any]:
     from src.taxonomy import FABRICS, SLEEVE_LENGTHS, active
 
-    with catalog_store._database():
+    with catalog_store.read_database():
         labels = active().labels()
     fields = {**FILTER_FIELDS, "品类": labels, "细节元素": DETAIL_OPTIONS,
               "袖长": list(SLEEVE_LENGTHS), "面料": list(FABRICS)}
@@ -425,19 +484,17 @@ def catalog(
 ) -> dict[str, Any]:
     with loaded_environment():
         started = perf_counter()
-        with catalog_store._database() as conn:
-            connected = perf_counter()
-            records = load_catalog(conn=conn)
-            if source_category and source_category != "全部":
-                records = [record for record in records if record.source_category == source_category]
-            loaded = perf_counter()
-            # A reference image with a style code can still use archive search text.
-            # Keep that behavior; only skip the archive when no candidate has a code.
-            index = load_index(conn=conn, include_facets=False) if any(record.style_code for record in records) else FactoryIndex()
-            indexed = perf_counter()
+        connected = perf_counter()
+        records = catalog_store.load_library_catalog()
+        if source_category and source_category != "全部":
+            records = [record for record in records if record.source_category == source_category]
+        loaded = perf_counter()
+        # A reference image with a style code can still use archive search text.
+        # Keep that behavior; only skip the archive when no candidate has a code.
+        index = load_index(include_facets=False) if any(record.style_code for record in records) else FactoryIndex()
+        indexed = perf_counter()
         token = prime_search(index)
         try:
-            records = library_records(records)
             if exclude_samples:
                 records = [r for r in records if r.source.source_type != "sample"]
             if review_status:
@@ -450,8 +507,11 @@ def catalog(
             basis = _narrow(records, filters=basis_filters, group=group, q=q, source_category=source_category,
                             factory_filters=basis_factory, index=index)
             counts = color_tally(basis, index, source_category)
-            records = _narrow(records, filters=filters, group=group, q=q, source_category=source_category,
-                              factory_filters=factory_filters, index=index)
+            if basis_filters == filters and basis_factory == factory_filters:
+                records = list(basis)
+            else:
+                records = _narrow(records, filters=filters, group=group, q=q, source_category=source_category,
+                                  factory_filters=factory_filters, index=index)
             statistics = order_statistics_index(index, **factory_filters)
             if sort == "sales":
                 records.sort(key=lambda record: (
@@ -820,7 +880,7 @@ def decide_review(record_id: str, body: ReviewDecision) -> dict[str, Any]:
 
 @app.get("/api/records/{record_id}/history")
 def record_history(record_id: str) -> dict[str, Any]:
-    if get_by_id(load_catalog(), record_id) is None:
+    if catalog_store.get_record(record_id) is None:
         raise HTTPException(status_code=404, detail="记录不存在")
     return {"items": review_history(record_id)}
 
@@ -838,35 +898,49 @@ def rebuild_index() -> dict[str, Any]:
 def record_image(record_id: str, download: bool = False,
                  variant: Literal["original", "thumbnail", "cover", "pending", "history"] = "original",
                  index: int = 0, v: str | None = None):
-    with catalog_store._database() as conn:
-        row = conn.execute("SELECT payload FROM records WHERE id=?", (record_id,)).fetchone()
-    if row is None:
+    record = catalog_store.get_record(record_id)
+    if record is None:
         raise HTTPException(status_code=404, detail="图片不存在")
-    record = ImageRecord.model_validate_json(row[0])
     if variant == "pending":
         pending = record.pending_image_path or ""
-        if not storage.is_file(pending):
+        if not pending:
             raise HTTPException(status_code=404, detail="没有待确认的新图片")
-        return FileResponse(storage.local_file(pending), headers={"Cache-Control": "no-cache"})
+        try:
+            local_pending = storage.local_file(pending)
+        except (FileNotFoundError, OSError):
+            raise HTTPException(status_code=404, detail="没有待确认的新图片") from None
+        if not local_pending.is_file():
+            raise HTTPException(status_code=404, detail="没有待确认的新图片")
+        return FileResponse(local_pending, headers={"Cache-Control": "no-cache"})
     if variant == "history":
         if index < 0 or index >= len(record.image_history):
             raise HTTPException(status_code=404, detail="历史图片不存在")
         stored = record.image_history[index].get("image_path") or ""
-        if not storage.is_file(stored):
+        if not stored:
             raise HTTPException(status_code=404, detail="历史图片不存在")
-        return FileResponse(storage.local_file(stored), headers={"Cache-Control": "no-cache"})
-    if not storage.is_file(record.image_path):
+        try:
+            local_hist = storage.local_file(stored)
+        except (FileNotFoundError, OSError):
+            raise HTTPException(status_code=404, detail="历史图片不存在") from None
+        if not local_hist.is_file():
+            raise HTTPException(status_code=404, detail="历史图片不存在")
+        return FileResponse(local_hist, headers={"Cache-Control": "no-cache"})
+    if not record.image_path:
         raise HTTPException(status_code=404, detail="图片不存在")
-    if variant == "cover" and not download:
-        path = cover_path(record)
-    elif variant == "thumbnail" and not download:
-        path = thumbnail_path(record.id, record.image_path)
-    else:
-        path = storage.local_file(record.image_path)
+    try:
+        if variant == "cover" and not download:
+            path = cover_path(record)
+        elif variant == "thumbnail" and not download:
+            path = thumbnail_path(record.id, record.image_path)
+        else:
+            path = storage.local_file(record.image_path)
+    except (FileNotFoundError, OSError):
+        raise HTTPException(status_code=404, detail="图片不存在") from None
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="图片不存在")
     cache = "no-cache"
     if v == f"r{record.revision}":
-        # A revision tracks edits through the app. Recheck OSS after a short cache period.
-        cache = "private, max-age=300"
+        cache = "private, max-age=86400, stale-while-revalidate=604800"
     elif v:
         expected_version = cover_version(record) if variant == "cover" and not download else image_version(record.image_path)
         if v == expected_version:
@@ -920,29 +994,30 @@ def update_source_category(body: SourceCategoryUpdate):
 
 @app.get("/api/records/{record_id}")
 def record_detail(record_id: str):
-    record = get_by_id(load_catalog(), record_id)
+    record = catalog_store.get_record(record_id)
     if record is None:
         raise HTTPException(status_code=404, detail="款式不存在")
-    index = load_index()
-    token = prime_search(index)
-    try:
-        payload = _serialize(record, index=index)
-        payload["source_url"] = f"/api/records/{record_id}/source" if _source_path(record) else None
-        payload.update(detail_fields(record, index))
-        history = []
-        for position, item in enumerate(record.image_history):
-            stored = item.get("image_path") or ""
-            if not storage.is_file(stored):
-                continue
-            history.append({
-                "url": f"/api/records/{record_id}/image?variant=history&index={position}",
-                "archived_at": item.get("archived_at"),
-                "note": item.get("note") or "替换前保留的原图",
-            })
-        payload["image_history"] = history
-        return payload
-    finally:
-        reset_search_blobs(token)
+    index = load_style_index(record.style_code)
+    defer_meta = (
+        storage.is_remote(record.image_path)
+        and not storage.public_url(record.image_path)
+        and not (storage._cache_root() / storage._key(record.image_path)).is_file()
+    )
+    payload = _serialize(record, index=index, defer_oss_images=defer_meta)
+    payload["source_url"] = f"/api/records/{record_id}/source" if _source_path(record) else None
+    payload.update(detail_fields(record, index))
+    history = []
+    for position, item in enumerate(record.image_history):
+        stored = item.get("image_path") or ""
+        if not storage.is_file(stored):
+            continue
+        history.append({
+            "url": f"/api/records/{record_id}/image?variant=history&index={position}",
+            "archived_at": item.get("archived_at"),
+            "note": item.get("note") or "替换前保留的原图",
+        })
+    payload["image_history"] = history
+    return payload
 
 
 class CategoryAssignBody(BaseModel):
@@ -957,7 +1032,7 @@ class CategoryAssignBody(BaseModel):
 def taxonomy_view() -> dict[str, Any]:
     from src.taxonomy import snapshot
 
-    with catalog_store._database() as conn:
+    with catalog_store.read_database() as conn:
         return snapshot(conn)
 
 
@@ -974,12 +1049,12 @@ def assign_record_category(record_id: str, body: CategoryAssignBody) -> dict[str
         raise
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return _serialize(record)
+    return _serialize(record, index=load_style_index(record.style_code))
 
 
 @app.get("/api/records/{record_id}/source")
 def source_document(record_id: str):
-    record = get_by_id(load_catalog(), record_id)
+    record = catalog_store.get_record(record_id)
     path = _source_path(record) if record else None
     if path is None:
         raise HTTPException(status_code=404, detail="原始资料文件不存在")
