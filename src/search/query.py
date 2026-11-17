@@ -37,7 +37,7 @@ def filter_records(records: list[ImageRecord], **filters: str | None) -> list[Im
     for param, value in filters.items():
         if value and value != "全部":
             field = FILTER_PARAMS[param]
-            records = [r for r in records if getattr(r.tags, field) == value]
+            records = [r for r in records if getattr(r.display_tags, field) == value]
     return records
 
 
@@ -183,6 +183,7 @@ def search_by_image(
     backend=None,
     filtered: list[ImageRecord] | None = None,
     include_pending: bool = False,
+    reference: ImageRecord | None = None,
 ) -> list[tuple[ImageRecord, float]]:
     visible = library_records if include_pending else approved_records
     records = visible(records)
@@ -192,11 +193,27 @@ def search_by_image(
         return []
     backend = backend or get_embedding_backend()
     candidate_ids = {r.id for r in pool}
-    return _vector_rank(
+    hits = _vector_rank(
         records,
         backend.encode_image(image_path),
-        top_k=top_k,
+        top_k=top_k * 3 if reference else top_k,
         candidate_ids=candidate_ids,
         backend=backend,
         include_pending=include_pending,
     )
+    if reference is None:
+        return hits
+    # A gallery reference already has tags; compare current effective fields
+    # without another paid classification or rebuilding the image index.
+    fields = {"品类": 3, "颜色主色调": 1, "版型": 1, "领型": 1, "袖长": 1, "面料": 1, "图案": 1}
+    tags = reference.display_tags
+    comparable = {key: weight for key, weight in fields.items()
+                  if getattr(tags, key) not in {"", "其他", "未判断", "待归类"}}
+    if not comparable:
+        return hits[:top_k]
+    total = sum(comparable.values())
+    ranked = [(record, score * .9 + .1 * sum(
+        weight for key, weight in comparable.items()
+        if getattr(record.display_tags, key) == getattr(tags, key)
+    ) / total) for record, score in hits]
+    return sorted(ranked, key=lambda hit: hit[1], reverse=True)[:top_k]

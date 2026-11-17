@@ -1,7 +1,8 @@
 import { computed, ref } from 'vue'
-import { getJobs, type ImportJob } from '../api'
+import { getJobs, type ImportJob, type ImportQueue } from '../api'
 
 export const jobs = ref<ImportJob[]>([])
+export const importQueue = ref<ImportQueue | null>(null)
 export const jobsError = ref('')
 export const jobNotice = ref('')
 export const activeJobCount = computed(() => jobs.value.filter(isActive).length)
@@ -25,6 +26,7 @@ export async function refreshJobs() {
       }
     }
     jobs.value = data.items
+    importQueue.value = data.queue
     jobsError.value = ''
   } catch {
     if (sequence === latest) jobsError.value = '无法读取任务进度，请检查服务后刷新；已提交任务不会因关闭页面而取消。'

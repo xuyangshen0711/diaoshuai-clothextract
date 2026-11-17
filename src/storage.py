@@ -7,25 +7,20 @@ References stored in the database are either a filesystem path (local mode) or
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import local
 from types import SimpleNamespace
 
-ROOT = Path(__file__).resolve().parents[1]
+from src.db import _load_env
+
 OSS_SCHEME = "oss://"
 
 _bucket_override = None
 _cdn_override: str | None = None
 _cleanups: contextvars.ContextVar[list | None] = contextvars.ContextVar("oss_cleanups", default=None)
-
-
-def _load_env() -> None:
-    try:
-        from dotenv import load_dotenv
-
-        load_dotenv(ROOT / ".env")
-    except Exception:
-        return
 
 
 def bind_cleanups(sink: list):
@@ -201,6 +196,33 @@ def is_file(ref: str | Path | None) -> bool:
     return Path(ref).is_file()
 
 
+def existing_files(refs) -> set[str]:
+    """Check a set of image references once, with bounded parallel OSS reads.
+
+    Results live only for this call. Each worker owns its bucket/session so its
+    HTTP connections can be reused without sharing a session across threads.
+    """
+    refs = list(dict.fromkeys(str(ref) for ref in refs if ref))
+    found = {ref for ref in refs if not is_remote(ref) and Path(ref).is_file()}
+    remote = [ref for ref in refs if is_remote(ref)]
+    if not remote:
+        return found
+    worker = local()
+
+    def check(ref):
+        try:
+            if not hasattr(worker, "bucket"):
+                worker.bucket = _bucket()
+            return ref if worker.bucket.object_exists(_key(ref)) else None
+        except Exception:
+            # Match is_file: an unavailable object is not reported as present.
+            return None
+
+    with ThreadPoolExecutor(max_workers=min(8, len(remote)), thread_name_prefix="image-presence") as pool:
+        found.update(ref for ref in pool.map(check, remote) if ref is not None)
+    return found
+
+
 def local_file(ref: str | Path) -> Path:
     """Filesystem path for reading. OSS objects are cached on local disk first."""
     if not is_remote(ref):
@@ -253,6 +275,24 @@ def remove(ref: str | None) -> None:
     Path(ref).unlink(missing_ok=True)
 
 
+def remove_thumbnails(record_id: str, *, remote: bool) -> None:
+    from src.catalog import PROCESSED_DIR
+
+    key = hashlib.sha256(record_id.encode()).hexdigest()[:24]
+    for thumbnail in (PROCESSED_DIR / "thumbnails").glob(f"{key}-*.jpg"):
+        thumbnail.unlink(missing_ok=True)
+    if remote and (oss_settings() or {}).get("cdn_base_url"):
+        bucket = _bucket()
+        marker = ""
+        while True:
+            page = bucket.list_objects(prefix=f"thumbnails/{record_id}-", marker=marker)
+            for obj in page.object_list:
+                bucket.delete_object(obj.key)
+            if not page.is_truncated:
+                break
+            marker = page.next_marker
+
+
 def same_bytes(left: str | Path, right: str | Path) -> bool:
     left_path, right_path = local_file(left), local_file(right)
     if not left_path.is_file() or not right_path.is_file():
@@ -292,6 +332,10 @@ class MemoryBucket:
 
     def object_exists(self, key: str) -> bool:
         return key in self.objects
+
+    def list_objects(self, prefix="", marker=""):
+        keys = sorted(key for key in self.objects if key.startswith(prefix) and key > marker)
+        return SimpleNamespace(object_list=[SimpleNamespace(key=key) for key in keys], is_truncated=False)
 
     def head_object(self, key: str):
         data = self.objects[key]

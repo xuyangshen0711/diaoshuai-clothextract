@@ -12,7 +12,6 @@ Official notes used here:
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import time
@@ -25,6 +24,8 @@ from openai import OpenAI
 
 from src.schema import FashionTags
 from src.tag.openai_tagger import _coerce_tags, _extract_json, _load_system_prompt, _user_text
+from src.tag.errors import TaggingError
+from src.tag.images import image_data_url
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL = "deepseek-flash"
@@ -37,16 +38,6 @@ BACKOFF_SECONDS = (1.0, 2.0, 4.0)
 _FALSE = {"0", "false", "no", "off", "disabled"}
 
 
-class TaggingError(Exception):
-    """Chinese message safe to show on a job. status_code stops the rest of the batch."""
-
-    def __init__(self, message: str, status_code: int | None = None) -> None:
-        super().__init__(message)
-        self.user_message = message
-        if status_code is not None:
-            self.status_code = status_code
-
-
 def thinking_enabled(value: str | None = None) -> bool:
     """Thinking stays on unless DEEPSEEK_THINKING is an explicit false value."""
     raw = os.getenv("DEEPSEEK_THINKING") if value is None else value
@@ -55,31 +46,8 @@ def thinking_enabled(value: str | None = None) -> bool:
     return str(raw).strip().strip('"').strip("'").lower() not in _FALSE
 
 
-def _sniff_mime(raw: bytes) -> str | None:
-    if raw.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if raw.startswith((b"GIF87a", b"GIF89a")):
-        return "image/gif"
-    if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
-        return "image/webp"
-    return None
-
-
 def _image_data_url(path: Path) -> str:
-    from src.storage import local_file
-
-    path = local_file(path)
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    if path.stat().st_size > MAX_IMAGE_BYTES:
-        raise TaggingError("图片超过 32 MiB，DeepSeek 无法接收这张图")
-    raw = path.read_bytes()
-    mime = _sniff_mime(raw)
-    if mime is None:
-        raise TaggingError("DeepSeek 只支持 JPEG、PNG、GIF 和 WebP 图片")
-    return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+    return image_data_url(path, max_encoded_bytes=MAX_IMAGE_BYTES)
 
 
 def _answer_text(message) -> str | None:
@@ -114,6 +82,8 @@ def _tags_from_content(content: str | None) -> FashionTags | None:
         raise TaggingError("模型返回的不是合法 JSON，这张图片已标记为失败")
     try:
         return _coerce_tags(data)
+    except TaggingError:
+        raise
     except Exception as exc:
         raise TaggingError("模型返回的标签没有通过校验，这张图片已标记为失败") from exc
 
@@ -191,10 +161,14 @@ class DeepSeekTagger:
             try:
                 return self.client.chat.completions.create(**payload)
             except openai.RateLimitError as exc:
+                if exc.code == "insufficient_quota":
+                    raise
                 last_error = exc
             except openai.APIStatusError as exc:
-                if exc.status_code != 429:
+                if exc.status_code != 429 and exc.status_code not in {500, 502, 503, 504}:
                     raise
+                last_error = exc
+            except openai.APIConnectionError as exc:
                 last_error = exc
             if attempt == MAX_ATTEMPTS - 1:
                 break
@@ -206,5 +180,7 @@ class DeepSeekTagger:
         from src.storage import local_file
 
         response = self._complete(self._payload(local_file(image_path), context))
+        if response.choices and response.choices[0].finish_reason == "length":
+            raise TaggingError("AI 的识别结果未完整返回，请重试；图片尚未进入图库。")
         message = response.choices[0].message if response.choices else None
         return _tags_from_content(_answer_text(message))

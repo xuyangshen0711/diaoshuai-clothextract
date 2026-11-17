@@ -3,6 +3,7 @@ import { computed, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ensureSession, logoutSite, type SiteSession } from './api'
 import { activeJobCount, jobNotice, startJobPolling } from './composables/importJobs'
+import { serviceSummary, startServiceStatusPolling } from './composables/serviceStatus'
 
 const route = useRoute()
 const router = useRouter()
@@ -14,32 +15,40 @@ const ready = ref(false)
 const showShell = computed(() => ready.value && (!session.value?.required || session.value.authenticated))
 
 let stopPolling: (() => void) | undefined
+let stopServicePolling: (() => void) | undefined
 async function syncPolling() {
   try {
     if (route.name === 'login') {
       stopPolling?.()
       stopPolling = undefined
+      stopServicePolling?.()
+      stopServicePolling = undefined
       return
     }
     session.value = await ensureSession()
     if (session.value.required && !session.value.authenticated) {
       stopPolling?.()
       stopPolling = undefined
+      stopServicePolling?.()
+      stopServicePolling = undefined
       return
     }
     if (!stopPolling) stopPolling = startJobPolling()
+    if (!stopServicePolling) stopServicePolling = startServiceStatusPolling()
   } finally {
     ready.value = true
   }
 }
 watch(() => route.fullPath, () => { void syncPolling() }, { immediate: true })
-onUnmounted(() => stopPolling?.())
+onUnmounted(() => { stopPolling?.(); stopServicePolling?.() })
 
 async function logout() {
   await logoutSite()
   session.value = { required: true, authenticated: false }
   stopPolling?.()
   stopPolling = undefined
+  stopServicePolling?.()
+  stopServicePolling = undefined
   await router.push({ name: 'login' })
 }
 </script>
@@ -63,7 +72,7 @@ async function logout() {
         <RouterLink to="/search?mode=text" active-class="" exact-active-class="" :class="{ 'is-current': textSearch }">灵感找款</RouterLink>
         <RouterLink to="/search?mode=image" active-class="" exact-active-class="" :class="{ 'is-current': imageSearch }">以图搜</RouterLink>
         <RouterLink to="/import" exact-active-class="is-current" active-class="">导入<span v-if="activeJobCount" class="nav-count">{{ activeJobCount }}</span></RouterLink>
-        <RouterLink to="/review" exact-active-class="is-current" active-class="">审核</RouterLink>
+        <RouterLink to="/import#api-status" class="service-status-link" :class="serviceSummary.tone" active-class="" exact-active-class="" title="查看分类 API 配置与连接检测结果"><span aria-hidden="true"></span>{{ serviceSummary.label }}</RouterLink>
         <button v-if="session?.required" class="text-button nav-logout" type="button" @click="logout">退出</button>
       </nav>
     </header>
@@ -75,3 +84,12 @@ async function logout() {
     </aside>
   </div>
 </template>
+
+<style scoped>
+.util-links .service-status-link { display: inline-flex; align-items: center; gap: 7px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); font-size: 12px; letter-spacing: 0; line-height: 1.6; }
+.service-status-link span { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: 0 0 6px; }
+.util-links .service-status-link.connected { color: #41624a; border-color: #c8d5c7; }
+.util-links .service-status-link.pending { color: #80602f; border-color: #d9c8aa; }
+.util-links .service-status-link.error { color: #9a403a; border-color: #dfbbb5; }
+.util-links .service-status-link:focus-visible { outline: 2px solid var(--gold); outline-offset: 4px; }
+</style>

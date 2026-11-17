@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -79,6 +79,10 @@ _SQLITE_CORE = """
         id TEXT PRIMARY KEY,
         payload TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS media_cleanup (
+        id TEXT PRIMARY KEY,
+        payload TEXT NOT NULL
+    );
 """
 
 
@@ -101,7 +105,7 @@ def _database():
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA journal_mode=WAL")
         _ensure_core(conn)
-        from src.factory.tables import ensure_factory, migrate_source_categories
+        from src.factory.tables import ensure_factory, migrate_source_categories, migrate_starred_styles
         from src.taxonomy import ensure_taxonomy, migrate_record_labels
         ensure_factory(conn)
         ensure_taxonomy(conn)
@@ -113,23 +117,27 @@ def _database():
             if CATALOG_PATH.exists():
                 for item in json.loads(CATALOG_PATH.read_text(encoding="utf-8")):
                     record = ImageRecord.model_validate(item)
-                    record.review_status = "pending"
-                    record.reviewer = record.reviewed_at = None
-                    record.review_note = ""
-                    record.proposed_tags = record.tags.model_copy(deep=True)
-                    if record.tags_source in {"openai", "mock"}:
+                    record.tag_overrides = dict(record.human_overrides)
+                    if record.ai_tags is None and record.tags_source in {"openai", "deepseek", "mock"}:
                         record.ai_tags = record.tags.model_copy(deep=True)
                         record.ai_tags_source = record.tags_source
+                    if record.review_status != "rejected" and (
+                        record.has_ai_suggestion or record.tags_source == "manual"
+                    ):
+                        record.review_status = "approved"
+                        record.proposed_tags = None
                     record.revision = 1
                     publish_record(record)
                     conn.execute(
                         "INSERT INTO records (id, image_path, review_status, revision, payload) VALUES (?, ?, ?, ?, ?)",
                         (record.id, record.image_path, record.review_status, 1, record.model_dump_json()),
                     )
-                    _event(conn, record, "legacy_imported", note="历史 JSON 导入，等待人工审核")
+                    _event(conn, record, "legacy_imported", note="导入历史资料，保留 AI 建议与人工修改")
             conn.execute("INSERT INTO migrations VALUES ('legacy_json')")
         migrate_source_categories(conn)
+        migrate_starred_styles(conn)
         migrate_record_labels(conn)
+        _migrate_automatic_entry(conn)
         yield conn
         conn.commit()
         for path in cleanups:
@@ -142,34 +150,142 @@ def _database():
         conn.close()
 
 
-def load_catalog() -> list[ImageRecord]:
-    with _database() as conn:
+def load_catalog(*, conn=None) -> list[ImageRecord]:
+    with (nullcontext(conn) if conn is not None else _database()) as conn:
         return [ImageRecord.model_validate_json(row[0]) for row in conn.execute(
             f"SELECT payload FROM records ORDER BY {insert_order()}"
         )]
 
 
 def approved_records(records: Iterable[ImageRecord]) -> list[ImageRecord]:
-    return [r for r in records if r.review_status == "approved"]
+    # Compatibility name for index/search callers. Valid AI results are usable
+    # immediately, including records loaded from an older catalog snapshot.
+    return library_records(records)
 
 
 def library_records(records: Iterable[ImageRecord]) -> list[ImageRecord]:
-    return [r for r in records if r.review_status != "rejected" and (
-        r.review_status == "approved" or r.proposed_tags is not None
-        or r.ai_tags is not None or r.tags_source != "untagged"
-    )]
+    return [r for r in records if r.ready]
+
+
+def _migrate_automatic_entry(conn) -> None:
+    name = "automatic_entry_overrides_v1"
+    if conn.execute("SELECT 1 FROM migrations WHERE name=?", (name,)).fetchone():
+        return
+    for row in conn.execute("SELECT payload FROM records").fetchall():
+        record = ImageRecord.model_validate_json(row[0])
+        before = record.model_dump()
+        overrides = dict(record.human_overrides)
+        # Recover the actual human decisions, rather than comparing old human
+        # tags against a newer AI run (which would pin untouched fields too).
+        events = [] if "tag_overrides" in record.model_fields_set else conn.execute(
+            "SELECT action, before_json, after_json FROM review_events "
+            "WHERE record_id=? AND action IN ('approve', 'category_assigned') ORDER BY id", (record.id,)
+        )
+        for event in events:
+            after = ImageRecord.model_validate_json(event["after_json"])
+            if event["action"] == "approve":
+                ai = after.ai_tags
+                overrides = {k: v for k, v in after.tags.model_dump().items()
+                             if ai is None or v != getattr(ai, k)}
+            else:
+                old = ImageRecord.model_validate_json(event["before_json"]) if event["before_json"] else None
+                for key in ("品类", "袖长", "面料"):
+                    value = getattr(after.proposed_tags or after.tags, key)
+                    if key == "品类" or old is None or value != getattr(old.display_tags, key):
+                        overrides[key] = value
+        record.tag_overrides = overrides
+        if record.ai_tags is None and record.tags_source in {"openai", "deepseek", "mock"}:
+            record.ai_tags = (record.proposed_tags or record.tags).model_copy(deep=True)
+            record.ai_tags_source = record.tags_source
+        if record.ready:
+            record.review_status = "approved"  # Stored enum retained for DB compatibility.
+            record.proposed_tags = None
+            if record.pending_image_path and is_file(record.pending_image_path):
+                _adopt_pending_image(record)
+        record.sync_effective_tags()
+        record.revision += 1
+        record.touch()
+        conn.execute("UPDATE records SET image_path=?, review_status=?, revision=?, payload=? WHERE id=?",
+                     (record.image_path, record.review_status, record.revision, record.model_dump_json(), record.id))
+        _event(conn, record, "automatic_entry_migrated", note="启用自动入库，保留历史人工修改", before=before)
+    conn.execute("INSERT INTO migrations VALUES (?)", (name,))
+
+
+def _validated_overrides(values: dict) -> dict:
+    from src.schema import DETAILS, FILTER_FIELDS
+    from src.taxonomy import FABRICS, SLEEVE_LENGTHS, resolve
+
+    cleaned = {}
+    for key, value in values.items():
+        if key not in FashionTags.model_fields:
+            raise ValueError(f"不支持修改标签：{key}")
+        if key == "细节元素":
+            if not isinstance(value, list) or any(not isinstance(v, str) or v not in DETAILS for v in value):
+                raise ValueError("细节元素不在允许的标签范围内")
+            cleaned[key] = list(dict.fromkeys(value))
+            continue
+        if not isinstance(value, str):
+            raise ValueError(f"{key}必须是文本")
+        value = value.strip()
+        if len(value) > 2000:
+            raise ValueError(f"{key}不能超过 2000 字")
+        if value and key == "品类":
+            placement = resolve(value)
+            if placement.unmapped:
+                raise ValueError("品类不在允许的标签范围内")
+            value = placement.label
+        elif value and key != "一句话描述":
+            options = {**FILTER_FIELDS, "袖长": SLEEVE_LENGTHS, "面料": FABRICS}[key]
+            if value not in options and not (key == "季节" and value == "其他"):
+                raise ValueError(f"{key}不在允许的标签范围内")
+        cleaned[key] = value
+    return cleaned
+
+
+def update_tags(record_id: str, *, changes: dict, reset_fields: list[str], expected_revision: int,
+                note: str = "") -> ImageRecord:
+    """Patch individual overrides. Resetting a field returns it to the latest AI value."""
+    with _database() as conn:
+        row = conn.execute("SELECT payload FROM records WHERE id=?", (record_id,)).fetchone()
+        if row is None:
+            raise KeyError(record_id)
+        record = ImageRecord.model_validate_json(row[0])
+        if record.revision != expected_revision:
+            raise CatalogConflict("这款资料已更新，请重新载入后再修改；你的修改尚未保存")
+        if not record.ready:
+            raise ValueError("这款资料尚未完成有效 AI 识别，请在导入任务中重试")
+        if set(reset_fields) - FashionTags.model_fields.keys():
+            raise ValueError("恢复列表包含不支持的标签")
+        if set(reset_fields) & changes.keys():
+            raise ValueError("同一标签不能同时修改和恢复")
+        if reset_fields and record.ai_tags is None:
+            raise ValueError("这款历史资料没有 AI 建议，不能恢复")
+        patch = _validated_overrides(changes)
+        overrides = dict(record.human_overrides)
+        for key in reset_fields:
+            overrides.pop(key, None)
+        overrides.update(patch)
+        if overrides == record.human_overrides:
+            return record
+        record.tag_overrides = overrides
+        record.sync_effective_tags()
+        record.proposed_tags = None
+        record.touch()
+        record.revision = _save(conn, record, "tags_updated" if patch else "tags_reset", "人工修改", note)
+    return record
 
 
 def _save(conn, record: ImageRecord, action: str | None = None, actor="", note="") -> int:
-    publish_record(record)
-    row = conn.execute("SELECT payload FROM records WHERE id=?", (record.id,)).fetchone()
+    lock = " FOR UPDATE" if is_mysql(conn) else ""
+    row = conn.execute("SELECT payload FROM records WHERE id=?" + lock, (record.id,)).fetchone()
     previous = ImageRecord.model_validate_json(row[0]) if row else None
+    if previous is None and record.revision != 0:
+        raise CatalogConflict("记录已不存在，请刷新")
+    publish_record(record)
     if previous and previous.model_dump(exclude={"revision"}) == record.model_dump(exclude={"revision"}):
         return previous.revision
     if previous and previous.revision != record.revision:
-        raise CatalogConflict("记录已被其他操作更新，请刷新后重新审核")
-    if previous is None and record.revision != 0:
-        raise CatalogConflict("记录已不存在，请刷新")
+        raise CatalogConflict("记录已被其他操作更新，请刷新后再修改")
     stored = record.model_copy(deep=True)
     stored.revision = (previous.revision if previous else 0) + 1
     if stored.source_category == "本厂产品" and stored.style_code:
@@ -253,7 +369,9 @@ def review_record(record_id: str, *, action: str, reviewer: str, expected_revisi
                 record.proposed_tags = None
             record.pending_image_path = None
         else:
-            if record.review_status != "pending":
+            # Keep old clients functional without reintroducing an approval gate.
+            # Optimistic revision checks above still reject duplicate decisions.
+            if record.review_status == "rejected":
                 raise CatalogConflict("记录已完成审核，请勿重复提交")
             if action == "approve":
                 from src.taxonomy import UNSORTED, learn_phrase, resolve
@@ -266,6 +384,8 @@ def review_record(record_id: str, *, action: str, reviewer: str, expected_revisi
                 stored = final.normalized()
                 phrase = getattr(final, "_category_phrase", "") or getattr(stored, "_category_phrase", "")
                 record.tags = stored.model_copy(deep=True)
+                record.tag_overrides = {key: value for key, value in stored.model_dump().items()
+                                        if record.ai_tags is None or value != getattr(record.ai_tags, key)}
                 if phrase and phrase != stored.品类:
                     record.category_raw = phrase
                 if stored.袖长:
@@ -333,19 +453,10 @@ def assign_garment_category(record_id: str, *, level1: str, level2: str = "", sl
         shown = record.proposed_tags or record.tags
         raw_phrase = record.category_raw or shown.品类
         was_unsorted = resolve(shown.品类).label == UNSORTED or resolve(raw_phrase).label == UNSORTED
-        for name in ("tags", "proposed_tags"):
-            block = getattr(record, name)
-            if block is None:
-                continue
-            setattr(record, name, block.model_copy(update={
-                "品类": label,
-                "袖长": sleeve_length or block.袖长,
-                "面料": fabric or block.面料,
-            }))
-        if sleeve_length:
-            record.sleeve_length = sleeve_length
-        if fabric:
-            record.fabric = fabric
+        record.tag_overrides = {**record.human_overrides, "品类": label,
+                                **({"袖长": sleeve_length} if sleeve_length else {}),
+                                **({"面料": fabric} if fabric else {})}
+        record.sync_effective_tags()
         if was_unsorted and raw_phrase and raw_phrase != label:
             learn_phrase(conn, raw_phrase, level1, level2, sleeve_length, fabric)
         record.touch()

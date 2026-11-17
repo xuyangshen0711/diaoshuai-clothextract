@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-from src.db import MYSQL_FACTORY_SCHEMA, exec_script, is_mysql, json_extract
+from src.db import MYSQL_FACTORY_SCHEMA, exec_script, is_mysql, json_extract, on_conflict_update
 from src.schema import UNCLASSIFIED_SOURCE, ImageRecord
 
 # Added after the first release. Existing databases gain these with ALTER, not a rebuild.
@@ -114,6 +114,8 @@ def ensure_factory(conn) -> None:
     payload_type = "LONGTEXT" if is_mysql(conn) else "TEXT"
     conn.execute(f"CREATE TABLE IF NOT EXISTS factory_import_history ("
                  f"id VARCHAR(32) PRIMARY KEY, payload {payload_type} NOT NULL, created_at VARCHAR(40) NOT NULL)")
+    conn.execute(f"CREATE TABLE IF NOT EXISTS sales_deletions ("
+                 f"id VARCHAR(32) PRIMARY KEY, payload {payload_type} NOT NULL, created_at VARCHAR(40) NOT NULL)")
 
 
 def migrate_source_categories(conn) -> None:
@@ -139,6 +141,26 @@ def migrate_source_categories(conn) -> None:
     conn.execute("INSERT INTO migrations VALUES ('source_category_v1')")
 
 
+def migrate_starred_styles(conn) -> None:
+    """Reclassify previously grouped rows using their existing complete variant key."""
+    name = "starred_style_codes_v1"
+    if conn.execute("SELECT 1 FROM migrations WHERE name=?", (name,)).fetchone():
+        return
+    # The marker and data updates share a transaction. A concurrent startup can
+    # repeat the idempotent updates after the marker lock is released.
+    conn.execute(
+        "INSERT INTO migrations (name) VALUES (?) "
+        + on_conflict_update("name", ["name"], dialect="mysql" if is_mysql(conn) else "sqlite"),
+        (name,),
+    )
+    for table in ("style_variants", "style_sales", "style_order_lines"):
+        conn.execute(
+            f"UPDATE {table} SET style_code=variant_code "
+            "WHERE variant_code LIKE ? AND style_code <> variant_code",
+            ("%*%",),
+        )
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -157,7 +179,9 @@ def gap_report(conn) -> dict[str, list[str]]:
     bases = {row[0] for row in conn.execute("SELECT DISTINCT style_code FROM style_variants")}
     sales = {row[0] for table in ("style_sales", "style_order_lines")
              for row in conn.execute(f"SELECT DISTINCT style_code FROM {table}")}
-    images = {code for code, record in own_factory_images(conn).items() if storage.is_file(record.image_path)}
+    records = own_factory_images(conn)
+    available = storage.existing_files(record.image_path for record in records.values())
+    images = {code for code, record in records.items() if record.image_path in available}
     return {
         "archive_without_image": sorted(bases - images),
         "image_without_archive": sorted(images - bases),

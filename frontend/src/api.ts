@@ -1,3 +1,5 @@
+import { batchProblem, fileProblem } from './utils/uploadGuidance'
+
 export type FashionTags = {
   品类: string
   风格: string
@@ -38,6 +40,8 @@ export type CatalogItem = {
   display_tags: FashionTags
   tags_source: string
   manually_edited: boolean
+  tag_overrides: Partial<FashionTags>
+  entry_ready: boolean
   ai_tags: FashionTags | null
   ai_tags_source: string | null
   proposed_tags: FashionTags | null
@@ -69,6 +73,8 @@ export type CatalogItem = {
   craftsman?: string
   design_codes?: string[]
   seasons?: string[]
+  order_seasons?: string[]
+  archive_seasons?: string[]
   sales_quantity: number
   sales_amount: number
   color_families?: string[]
@@ -156,6 +162,7 @@ export type LibraryMeta = {
 }
 
 export type TableReport = {
+  impact?: SalesImportImpact
   imported: number
   updated: number
   skipped_rows: number
@@ -202,7 +209,7 @@ function redirectToLogin() {
   window.location.assign(`/login?next=${encodeURIComponent(next)}`)
 }
 
-async function request<T>(url: string, init?: RequestInit): Promise<T> {
+export async function requestResponse(url: string, init?: RequestInit): Promise<Response> {
   const res = await fetch(url, init)
   if (res.status === 401 && !url.startsWith('/api/login')) {
     rememberSession({ required: true, authenticated: false })
@@ -216,15 +223,31 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     } catch {
       /* ignore */
     }
+    if (res.status === 413 && detail === res.statusText) detail = '文件超过本次上传上限，请刷新页面使用分批上传；单张图片最多 100 MB，文档最多 512 MB，单批最多 2 GB。'
+    if (res.status === 504 && url.startsWith('/api/import/table-')) {
+      detail = url.startsWith('/api/import/table-confirm')
+        ? '确认入库响应超时，结果尚未确认。请先查看导入记录；也可再次点击确认，系统会按同一预览编号返回结果，不会重复累计。'
+        : '表格预览等待超时，尚未确认入库。请稍后重新选择文件；这不是表头格式错误。'
+    }
     throw new Error(detail)
   }
-  return res.json() as Promise<T>
+  return res
+}
+
+export async function request<T>(url: string, init?: RequestInit): Promise<T> {
+  return (await requestResponse(url, init)).json() as Promise<T>
 }
 
 export async function ensureSession(force = false) {
   if (!force && sessionCache) return sessionCache
-  sessionCache = await request<SiteSession>('/api/auth/session')
-  return sessionCache
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), 15000)
+  try {
+    const session = await request<SiteSession>('/api/auth/session', { signal: controller.signal, cache: 'no-store' })
+    if (typeof session.required !== 'boolean' || typeof session.authenticated !== 'boolean') throw new Error('登录状态读取失败，请刷新重试。')
+    sessionCache = session
+    return sessionCache
+  } finally { window.clearTimeout(timer) }
 }
 
 export async function loginSite(password: string) {
@@ -256,6 +279,34 @@ export function getHealth() {
   }>('/api/health')
 }
 
+export type AiProvider = 'deepseek' | 'openai'
+export type AiService = {
+  provider: AiProvider
+  name: string
+  configured: boolean
+  placeholder: boolean
+  model: string
+  status: 'not_configured' | 'placeholder' | 'unchecked' | 'checking' | 'connected' | 'error' | 'unsupported'
+  message: string
+  checked_at: string | null
+  latency_ms: number | null
+  model_listed: boolean | null
+}
+export type AiServiceStatus = { default_backend: string; providers: AiService[] }
+
+async function serviceRequest<T>(url: string, init?: RequestInit): Promise<T> {
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), 15000)
+  try { return await request<T>(url, { ...init, signal: controller.signal }) }
+  finally { window.clearTimeout(timer) }
+}
+export function getAiServiceStatus() {
+  return serviceRequest<AiServiceStatus>('/api/services/ai')
+}
+export function checkAiService(provider: AiProvider) {
+  return serviceRequest<AiService>(`/api/services/ai/${provider}/check`, { method: 'POST' })
+}
+
 export type TaxonomyNode = { level1: string; children: string[] }
 export type Taxonomy = {
   unsorted: string
@@ -284,11 +335,13 @@ export function getLibraryMeta() {
   return request<LibraryMeta>('/api/meta/library')
 }
 
-export function getCatalog(params: Record<string, string | boolean>) {
+export function getCatalog(params: Record<string, string | string[] | boolean>) {
   const qs = new URLSearchParams()
   Object.entries(params).forEach(([k, v]) => {
     if (v === undefined || v === null || v === '' || v === '全部') return
-    qs.set(k, String(v))
+    for (const value of new Set(Array.isArray(v) ? v : [v])) {
+      if (value !== '' && value !== '全部') qs.append(k, String(value))
+    }
   })
   if (!('exclude_samples' in params)) qs.set('exclude_samples', 'true')
   const suffix = qs.toString() ? `?${qs}` : ''
@@ -319,21 +372,26 @@ export async function searchImage(file: File, params: Record<string, string | bo
   })
 }
 
+export type ImportSource = { index: number; name: string; deleted: boolean; source_category: string }
+
 export type ImportJob = {
   id: string
   kind: 'import' | 'retag'
   backend: string
-  status: 'queued' | 'extracting' | 'tagging' | 'completed' | 'partial' | 'failed' | 'interrupted'
+  status: 'queued' | 'extracting' | 'tagging' | 'awaiting_ai' | 'completed' | 'partial' | 'failed' | 'interrupted' | 'deleted'
   name: string
   created_at: string
   updated_at: string
   total: number
   processed: number
+  running: number
+  pending: number
   succeeded: number
   filtered: number
   failed: number
   files_total: number
   files_processed: number
+  files?: ImportSource[]
   elapsed_seconds: number
   eta_seconds: number | null
   current_file: string
@@ -343,11 +401,86 @@ export type ImportJob = {
   source_categories?: string[]
 }
 
-export async function importFiles(files: { file: File; relativePath: string; category: string }[], backend: string) {
+export type ImportQueue = { concurrency: number; running: number; pending: number; batches: number; preparing: number; processed: number; total: number }
+
+export type UploadSession = { id: string; chunk_size: number; files: { size: number; received: number }[] }
+export type UploadEntry = { file: File; name: string; styleCode?: string }
+export function createUpload(files: UploadEntry[], category: string) {
+  const total = files.reduce((sum, entry) => sum + entry.file.size, 0)
+  const problem = batchProblem(files.length, total) || files.map(entry => fileProblem(entry.name, entry.file.size)).find(Boolean)
+  if (problem) throw new Error(problem)
+  return request<UploadSession>('/api/import/uploads', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ category, files: files.map(entry => ({ name: entry.name, size: entry.file.size, style_code: entry.styleCode })) }) })
+}
+export function getUploadActivity(exclude: string[]) {
+  return request<{ active_uploads: number }>(`/api/import/uploads/activity?${new URLSearchParams({ exclude: exclude.join(',') })}`, { signal: AbortSignal.timeout(5000) })
+}
+export function setUploadActivity(id: string, active: boolean) {
+  return request(`/api/import/uploads/${id}/activity`, { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ active }), signal: AbortSignal.timeout(5000) })
+}
+export async function transferUpload(id: string, files: UploadEntry[], progress: (sent: number, total: number, current?: { index: number; name: string }) => void, signal?: AbortSignal) {
+  const url = `/api/import/uploads/${id}`
+  const session = await request<UploadSession>(url, { signal })
+  const total = session.files.reduce((sum, file) => sum + file.size, 0)
+  let sent = session.files.reduce((sum, file) => sum + file.received, 0)
+  progress(sent, total)
+  for (const [index, entry] of files.entries()) {
+    const saved = session.files[index]!
+    // The server may have stopped part way through a chunk. Re-send that chunk only.
+    let offset = saved.received === saved.size ? saved.size : Math.floor(saved.received / session.chunk_size) * session.chunk_size
+    sent -= saved.received - offset
+    progress(sent, total, { index, name: entry.name })
+    while (offset < entry.file.size) {
+      const end = Math.min(offset + session.chunk_size, entry.file.size)
+      const body = new FormData()
+      body.append('file', entry.file.slice(offset, end), 'chunk')
+      await request(`${url}/files/${index}?offset=${offset}`, { method: 'PUT', body, signal })
+      sent += end - offset
+      offset = end
+      progress(sent, total, { index, name: entry.name })
+    }
+  }
+}
+export function inspectUpload(id: string) {
+  return request<{ items: InspectedFile[] }>(`/api/import/uploads/${id}/inspect`, { method: 'POST' })
+}
+export function commitUpload(id: string, indices: number[], backend: string) {
+  return request<ImportJob>(`/api/import/uploads/${id}/commit`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ indices, backend }) })
+}
+
+type DeletionResult = { deleted: number; cleanup_pending: number }
+type SourceDeletionPreview = { name: string; image_count: number; delete_source: boolean; deleted: boolean }
+
+export function previewImportFileDeletion(jobId: string, fileIndex: number) {
+  return request<SourceDeletionPreview>(`/api/import/jobs/${jobId}/files/${fileIndex}`)
+}
+
+export function deleteImportFile(jobId: string, fileIndex: number, preview: SourceDeletionPreview) {
+  const query = new URLSearchParams({
+    expected_count: String(preview.image_count), expected_source: String(preview.delete_source),
+  })
+  return request<DeletionResult>(`/api/import/jobs/${jobId}/files/${fileIndex}?${query}`, { method: 'DELETE' })
+}
+
+export function deleteGalleryImages(ids: string[]) {
+  return request<DeletionResult>('/api/records/bulk-delete', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }),
+  })
+}
+
+export function retryMediaCleanup() {
+  return request<{ cleanup_pending: number }>('/api/media/deletions/retry', { method: 'POST' })
+}
+
+export async function importFiles(files: { file: File; relativePath: string; category: string; styleCode?: string }[], backend: string) {
   const body = new FormData()
+  const hasStyleCodes = files.some(item => item.styleCode !== undefined)
   files.forEach(item => {
     body.append('files', item.file, item.relativePath || item.file.name)
     body.append('source_categories', item.category)
+    if (hasStyleCodes) body.append('style_codes', item.styleCode ?? '')
   })
   return request<ImportJob>(`/api/import/jobs?backend=${encodeURIComponent(backend)}`, { method: 'POST', body })
 }
@@ -380,15 +513,24 @@ export function retag(backend: string, overwrite: boolean) {
 }
 
 export function getJobs() {
-  return request<{ items: ImportJob[] }>('/api/import/jobs')
+  return request<{ items: ImportJob[]; queue: ImportQueue }>('/api/import/jobs')
 }
 
-export function retryJob(id: string) {
-  return request<ImportJob>(`/api/import/jobs/${id}/retry`, { method: 'POST' })
+export function retryJob(id: string, backend?: string) {
+  const query = backend ? `?backend=${encodeURIComponent(backend)}` : ''
+  return request<ImportJob>(`/api/import/jobs/${encodeURIComponent(id)}/retry${query}`, { method: 'POST' })
 }
 
 export function getRecord(id: string) {
   return request<CatalogItem>(`/api/records/${encodeURIComponent(id)}`)
+}
+
+export function updateRecordTags(item: CatalogItem, changes: Partial<FashionTags>, resetFields: string[]) {
+  return request<CatalogItem>(`/api/records/${encodeURIComponent(item.id)}/tags`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expected_revision: item.revision, changes, reset_fields: resetFields }),
+  })
 }
 
 export function updateRecordCover(item: CatalogItem, crop: CoverCrop | null) {
@@ -399,8 +541,8 @@ export function updateRecordCover(item: CatalogItem, crop: CoverCrop | null) {
   })
 }
 
-export function getSimilarRecords(id: string, includePending = false) {
-  return request<{ count: number; items: CatalogItem[] }>(`/api/records/${encodeURIComponent(id)}/similar?include_pending=${includePending}`)
+export function getSimilarRecords(id: string, includePending = false, sourceCategory = '全部') {
+  return request<{ count: number; items: CatalogItem[] }>(`/api/records/${encodeURIComponent(id)}/similar?include_pending=${includePending}&source_category=${encodeURIComponent(sourceCategory)}`)
 }
 
 export type ReviewSnapshot = Pick<CatalogItem, 'tags' | 'ai_tags' | 'proposed_tags' | 'review_status'>
@@ -449,16 +591,24 @@ export type FactoryWorkspace = {
   sales_policy: { reference_rows: number; reference_quantity: number; note: string }
 }
 export type TablePreview = {
+  impact?: SalesImportImpact
   historical_start?: string; historical_end?: string
   token: string; kind: 'archive' | 'sales'; requested_kind: string; source_file: string
   format: string; format_label: string; row_count: number; style_codes: string[]
   counts: { new: number; updated: number; unchanged: number }
   meta: { warnings?: string[]; parsed_quantity?: number; parsed_amount?: number; sheet_quantity?: number | null; sheet_amount?: number | null; reconciled?: boolean | null; reconcile_note?: string; evidence_columns?: string[] }
-  samples: { variant_code: string; style_code: string; customer: string; color?: string; size_label?: string; quantity?: number; amount?: number; season?: string; action: string }[]
+  samples: { variant_code: string; style_code: string; customer: string; color?: string; size_label?: string; quantity?: number; amount?: number; season?: string; category?: string; subcategory?: string; design_code?: string; action: string }[]
   issues: { row: number; style_code: string; message: string }[]; issue_count: number; ignored_rows: number
   overlap_variants: string[]; missing_images: string[]; can_confirm: boolean
 }
 export type TableImportResult = TableReport & { id: string; kind: 'archive' | 'sales'; created_at: string; unchanged: number; issue_count: number; sales_policy: FactoryWorkspace['sales_policy'] }
+export type ImportMetric = { quantity: number; amount: number }
+export type ImportMetricChange = { before: ImportMetric; after: ImportMetric; delta: ImportMetric }
+export type SalesImportImpact = {
+  version: number; row_kind: 'orders' | 'summary'; scope: 'all_records_all_seasons'
+  retained_rows: number; summaries_deactivated: number; summaries_reactivated: number
+  orders: ImportMetricChange; counted: ImportMetricChange
+}
 export type InspectedFile = { name: string; kind: string; action: string; style_code: string; message: string; width?: number; height?: number }
 export function getFactoryWorkspace(status = 'missing', q = '', page = 1) {
   return request<FactoryWorkspace>(`/api/import/workspace?${new URLSearchParams({ status, q, page: String(page) })}`)
@@ -474,10 +624,41 @@ export function confirmTable(token: string, acknowledge: boolean, historical_sta
 export function replanTable(token: string, historical_start = '', historical_end = '') {
   return request<TablePreview>('/api/import/table-replan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, historical_start, historical_end }) })
 }
-export function inspectImport(files: { file: File; name: string }[], category: string) {
-  const body = new FormData(); files.forEach(f => body.append('files', f.file, f.name)); body.append('category', category)
+export function inspectImport(files: { file: File; name: string; styleCode?: string }[], category: string) {
+  const body = new FormData()
+  const hasStyleCodes = files.some(item => item.styleCode !== undefined)
+  files.forEach(item => {
+    body.append('files', item.file, item.name)
+    if (hasStyleCodes) body.append('style_codes', item.styleCode ?? '')
+  })
+  body.append('category', category)
   return request<{ items: InspectedFile[] }>('/api/import/inspect', { method: 'POST', body })
 }
 export function classifyBatch(backend: string, batch_id: string) {
   return request<ImportJob>('/api/tag/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ backend, batch_id, overwrite: false }) })
+}
+
+export type SalesRow = { id: string; kind: 'orders' | 'summary'; order_no: string; variant_code: string; style_code: string; customer: string; color: string; size_label: string; quantity: number; amount: number; source_file: string; order_date: string; year: string; period: string; updated_at: string }
+export type SalesBatch = { name: string; protected: number; legacy: boolean }
+export type SalesRows = { items: SalesRow[]; total: number; page: number; page_size: number; batch: SalesBatch | null }
+export type SalesSelection = { scope: 'selected' | 'batch' | 'all'; batch_id: string; ids: string[] }
+export type SalesDeletePreview = { token: string; row_count: number; order_rows: number; summary_rows: number; style_codes: string[]; before: { quantity: number; amount: number }; after: { quantity: number; amount: number }; reactivated_summary_rows: number; batch: SalesBatch | null }
+export type SalesDeletionLog = { id: string; created_at: string; row_count: number; source_file: string; restored_at: string | null; restored_rows: number; skipped_rows: number }
+export function getSalesData(batch_id = '', q = '', page = 1) {
+  return request<SalesRows>(`/api/import/sales-data?${new URLSearchParams({ batch_id, q, page: String(page) })}`)
+}
+export function previewSalesDeletion(selection: SalesSelection) {
+  return request<SalesDeletePreview>('/api/import/sales-data/delete-preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(selection) })
+}
+export function deleteSalesData(selection: SalesSelection, token: string) {
+  return request<{ deleted: number; backup_id: string }>('/api/import/sales-data/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...selection, token }) })
+}
+export function getSalesDeletions(page = 1) { return request<SalesDeletionLog[]>(`/api/import/sales-deletions?page=${page}`) }
+
+export type SalesRestorePreview = { token: string; backup_id: string; row_count: number; restore_count: number; skipped_existing: number; identical_rows: number; conflicting_rows: number; conflicts: { order_no: string; variant_code: string; color: string; size_label: string }[]; before: { quantity: number; amount: number }; after: { quantity: number; amount: number }; style_codes: string[]; suppressed_summary_rows: number }
+export function previewSalesRestoration(id: string) {
+  return request<SalesRestorePreview>(`/api/import/sales-deletions/${encodeURIComponent(id)}/restore-preview`, { method: 'POST' })
+}
+export function restoreSalesData(id: string, token: string) {
+  return request<{ restored: number; skipped_existing: number; already_restored: boolean }>(`/api/import/sales-deletions/${encodeURIComponent(id)}/restore`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) })
 }

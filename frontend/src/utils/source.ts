@@ -12,7 +12,7 @@ export function importTime(source: CatalogItem['source']): string {
 export function visibleDescription(text: string | null | undefined, status: string): string {
   const value = text || ''
   if (status !== 'approved') return value
-  return value.replaceAll('（待人工确认）', '').replaceAll('(待人工确认)', '').trim()
+  return value.split('（待人工确认）').join('').split('(待人工确认)').join('').trim()
 }
 
 const SWATCHES: Record<string, string> = {

@@ -13,7 +13,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 
-def load_sheet_rows(path: Path) -> list[tuple]:
+def load_sheet_rows(path: Path, *, max_rows: int | None = None) -> list[tuple]:
     if path.suffix.lower() not in {".xlsx", ".xlsm"}:
         raise ValueError("请上传 Excel 文件（.xlsx 或 .xlsm）")
     if not path.is_file():
@@ -21,7 +21,7 @@ def load_sheet_rows(path: Path) -> list[tuple]:
     workbook = load_workbook(path, data_only=True, read_only=True)
     try:
         sheet = workbook.worksheets[0]
-        return [tuple(row) for row in sheet.iter_rows(values_only=True)]
+        return [tuple(row) for row in sheet.iter_rows(values_only=True, max_row=max_rows)]
     finally:
         workbook.close()
 
@@ -80,16 +80,17 @@ def table_kind_from_headers(names: set[str]) -> str:
 
 def workbook_table_kind(path: Path) -> str:
     try:
-        rows = load_sheet_rows(path)
+        rows = load_sheet_rows(path, max_rows=8)
     except (OSError, ValueError):
         return ""
     return table_kind_from_headers(sheet_headers(rows))
 
 
-# Columns that mark the newer 款式档案. 设计款号 already appeared on older exports;
-# 设计师 / 工艺师 / 二级品类 are what make a sheet the new template.
-ARCHIVE_IDENTITY = ("大货款号", "季节", "颜色", "尺码", "原料名称", "一级品类", "系列", "设计款号")
-ARCHIVE_NEW_MARKERS = ("设计师", "工艺师", "二级品类")
+# The user's 商品资料表 is the canonical archive template. Match names, not positions.
+ARCHIVE_COLUMNS = (
+    "季节", "大货款号", "设计款号", "颜色", "尺码", "针型", "一级品类",
+    "设计师", "工艺师", "原料名称", "二级品类",
+)
 SALES_SUMMARY_IDENTITY = ("款号", "颜色", "尺码", "订单数量", "订单金额")
 SALES_LINE_MARKERS = ("订单分类", "订单日期", "客户", "业务员", "客户款号")
 
@@ -97,27 +98,17 @@ SALES_LINE_MARKERS = ("订单分类", "订单日期", "客户", "业务员", "�
 def describe_headers(headers: list[str]) -> dict:
     """Name the sheet the user already chose a button for, plus the columns that decided it.
 
-    This does not choose between 款式档案 and 销量. Each import button asks for its own kind
-    and then tells the old template apart from the new one.
+    Archive uploads use the 商品资料表 template; sales still distinguish summary/lines.
     """
     present = [name for name in headers if name]
     names = set(present)
     kind = table_kind_from_headers(names)
     if kind == "archive":
-        new_columns = [name for name in ("设计款号", *ARCHIVE_NEW_MARKERS) if name in names]
-        if any(name in names for name in ARCHIVE_NEW_MARKERS):
-            return {
-                "kind": "archive",
-                "format": "archive_v2",
-                "format_label": "新版款式档案",
-                "evidence_columns": new_columns,
-            }
-        evidence = [name for name in ARCHIVE_IDENTITY if name in names]
         return {
             "kind": "archive",
-            "format": "archive",
-            "format_label": "款式档案",
-            "evidence_columns": evidence,
+            "format": "archive_v2",
+            "format_label": "商品资料表",
+            "evidence_columns": [name for name in ARCHIVE_COLUMNS if name in names],
         }
     if kind == "sales":
         order_column = "订单号" if "订单号" in names else ("订单" if "订单" in names else "")

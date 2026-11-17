@@ -6,6 +6,7 @@ venv/
 .env
 .env.local
 .env.*.local
+.analytics-access.json
 .DS_Store
 .streamlit/secrets.toml
 node_modules/

@@ -104,7 +104,7 @@ function share(value: number, max: number) {
         <header>
           <h3 id="monthly-title">月度下单走势</h3>
           <div class="chart-legend">
-            <span><i class="order-key"></i>首单</span><span><i class="gold-key"></i>补单</span>
+            <span><i class="order-key"></i>常规订单</span><span><i class="gold-key"></i>补单</span>
           </div>
         </header>
         <template v-if="months.length">
@@ -134,7 +134,7 @@ function share(value: number, max: number) {
                   v-for="(row, index) in months"
                   :key="row.month"
                   class="plot-column"
-                  :title="`${row.month}：首单 ${number(row.order_quantity)} 件，补单 ${number(row.replenishment_quantity)} 件`"
+                  :title="`${row.month}：常规订单 ${number(row.order_quantity)} 件，补单 ${number(row.replenishment_quantity)} 件`"
                 >
                   <div
                     class="stacked-column"
@@ -167,12 +167,12 @@ function share(value: number, max: number) {
             <div class="chart-scroll">
               <table>
                 <caption class="visually-hidden">
-                  每月首单与补单件数
+                  每月常规订单与补单件数（常规订单指非补单记录）
                 </caption>
                 <thead>
                   <tr>
                     <th scope="col">月份</th>
-                    <th scope="col">首单</th>
+                    <th scope="col">常规订单</th>
                     <th scope="col">补单</th>
                     <th scope="col">合计</th>
                   </tr>
@@ -194,7 +194,7 @@ function share(value: number, max: number) {
 
       <section class="analytics-card" aria-labelledby="colors-title">
         <header>
-          <h3 id="colors-title">颜色销量占比</h3>
+          <h3 id="colors-title">颜色订单件数占比</h3>
           <span class="chart-note">按件数</span>
         </header>
         <div v-if="colors.length && colorTotal" class="color-chart">
@@ -202,7 +202,7 @@ function share(value: number, max: number) {
             <svg
               viewBox="0 0 180 180"
               role="img"
-              :aria-label="`颜色销量占比，总计 ${number(colorTotal)} 件，比例详见右侧列表`"
+              :aria-label="`颜色订单件数占比，总计 ${number(colorTotal)} 件，比例详见右侧列表`"
             >
               <circle
                 cx="90"
@@ -237,7 +237,7 @@ function share(value: number, max: number) {
               ><span>总件数</span>
             </div>
           </div>
-          <p v-else class="chart-note">包含负数销量，请以明细为准。</p>
+          <p v-else class="chart-note">包含负数订单件数，请以明细为准。</p>
           <ul class="color-legend">
             <li v-for="row in colors" :key="row.name">
               <span class="color-label"
@@ -247,7 +247,7 @@ function share(value: number, max: number) {
             </li>
           </ul>
         </div>
-        <p v-else class="chart-empty">暂无颜色销量数据。</p>
+        <p v-else class="chart-empty">暂无颜色订单数据。</p>
       </section>
 
       <section class="analytics-card" aria-labelledby="heat-title">
@@ -259,11 +259,11 @@ function share(value: number, max: number) {
           v-if="sales.heatmap?.rows.length"
           class="chart-scroll"
           tabindex="0"
-          aria-label="颜色与尺码销量表，可横向滚动"
+          aria-label="颜色与尺码订单表，可横向滚动"
         >
           <table class="sales-heatmap">
             <caption class="visually-hidden">
-              各颜色和尺码的销量件数
+              各颜色和尺码的订单件数
             </caption>
             <thead>
               <tr>
@@ -304,14 +304,14 @@ function share(value: number, max: number) {
 
       <section class="analytics-card" aria-labelledby="sizes-title">
         <header>
-          <h3 id="sizes-title">尺码销量</h3>
+          <h3 id="sizes-title">尺码订单件数</h3>
           <span class="chart-note">按尺码顺序</span>
         </header>
         <div
           v-if="sizes.length"
           class="chart-scroll"
           tabindex="0"
-          aria-label="尺码销量，可横向滚动"
+          aria-label="尺码订单件数，可横向滚动"
         >
           <div
             class="size-columns"
@@ -332,7 +332,7 @@ function share(value: number, max: number) {
             </div>
           </div>
         </div>
-        <p v-else class="chart-empty">暂无尺码销量数据。</p>
+        <p v-else class="chart-empty">暂无尺码订单数据。</p>
       </section>
     </div>
 

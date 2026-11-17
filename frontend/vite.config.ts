@@ -7,10 +7,13 @@ export default defineConfig(({ mode }) => {
   const apiTarget = process.env.API_PROXY_TARGET || env.API_PROXY_TARGET || 'http://127.0.0.1:8520'
   return {
     plugins: [vue()],
+    build: { target: ['chrome79', 'edge79', 'firefox72', 'safari13'] },
     server: {
       host: '0.0.0.0',
       port: 8518,
       proxy: {
+        // The analytics origin check uses the browser-facing Host.
+        '/api/analytics': { target: apiTarget, changeOrigin: false },
         '/api': apiTarget,
       },
     },

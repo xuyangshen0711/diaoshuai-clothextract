@@ -12,7 +12,6 @@ import pymupdf
 from openpyxl import load_workbook
 from PIL import Image
 from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 from src.catalog import EXTRACTED_DIR, ensure_data_dirs
 from src.extract.pdf_notes import page_notes
@@ -179,18 +178,24 @@ def extract_from_pptx(path: Path, out_dir: Path) -> list[ImageRecord]:
 
     for slide_idx, slide in enumerate(prs.slides, start=1):
         image_idx = 0
-        for shape in slide.shapes:
-            if shape.shape_type != MSO_SHAPE_TYPE.PICTURE:
+        # XML descendants include nested groups, image fills and slide backgrounds.
+        # Extract each embedded resource once per slide, preserving its source page.
+        seen = set()
+        for blip in slide.element.xpath(".//a:blip"):
+            relationship_id = blip.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
+            if not relationship_id or relationship_id in seen:
                 continue
+            seen.add(relationship_id)
             image_idx += 1
-            image = shape.image
-            content = image.blob
-            ext = f".{(image.ext or 'png').lstrip('.')}"
+            try:
+                part = slide.part.related_part(relationship_id)
+            except (KeyError, ValueError):
+                continue
+            # WebP can be stored as a generic part. Pillow recognizes its bytes directly.
             saved = _save_image_bytes(
-                content,
+                part.blob,
                 out_dir,
                 f"{stem}_slide{slide_idx}_{image_idx:02d}",
-                preferred_suffix=ext,
             )
             if saved is None:
                 continue

@@ -17,8 +17,13 @@ def historical_range(row) -> tuple[str, str] | None:
 
 def counted_summaries(conn) -> list:
     summaries = list(conn.execute("SELECT * FROM style_sales"))
+    return counted_from_rows(summaries, conn.execute("SELECT variant_code, order_date FROM style_order_lines"))
+
+
+def counted_from_rows(summaries, order_rows) -> list:
+    """The same counting policy for database reads and deletion previews."""
     orders: dict[str, list[str]] = {}
-    for row in conn.execute("SELECT variant_code, order_date FROM style_order_lines"):
+    for row in order_rows:
         orders.setdefault(row["variant_code"], []).append(row["order_date"] or "")
     histories = {row["variant_code"] for row in summaries if historical_range(row)}
     result = []

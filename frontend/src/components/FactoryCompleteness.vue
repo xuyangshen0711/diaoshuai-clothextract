@@ -34,25 +34,25 @@ onUnmounted(() => { clearTimeout(timer); sequence++ })
       <div v-if="data" class="completeness-counts">
         <button @click="show('image')">待补图片 <strong>{{ data.counts.missing_images }}</strong></button>
         <button @click="show('archive')">待补档案 <strong>{{ data.counts.missing_archives }}</strong></button>
-        <button class="optional" @click="show('no_sales')">暂无销量 <span>{{ data.counts.no_sales }}</span><small>可选</small></button>
+        <button class="optional" @click="show('no_sales')">暂无订单 <span>{{ data.counts.no_sales }}</span><small>可选</small></button>
       </div>
       <button class="text-button" :aria-expanded="expanded" @click="expanded = !expanded">{{ expanded ? '收起清单' : '查看清单' }}</button>
     </div>
-    <p v-if="data && !data.counts.styles" class="meta">还没有本厂资料。可以先上传图片，也可以先导入档案或销量。</p>
+    <p v-if="data && !data.counts.styles" class="meta">还没有本厂资料。可以先上传图片，也可以先导入档案或订单数据。</p>
     <p v-else-if="data && !data.counts.missing_images && !data.counts.missing_archives" class="complete-note">现有款号的图片和档案已齐全。</p>
     <div v-if="expanded" class="completeness-body">
-      <div class="toolbar"><label>查看 <select v-model="filter" @change="page = 1; load()"><option value="missing">待补资料</option><option value="image">待补图片</option><option value="archive">待补档案</option><option value="no_sales">暂无销量（可选）</option><option value="all">全部款号</option></select></label>
+      <div class="toolbar"><label>查看 <select v-model="filter" @change="page = 1; load()"><option value="missing">待补资料</option><option value="image">待补图片</option><option value="archive">待补档案</option><option value="no_sales">暂无订单（可选）</option><option value="all">全部款号</option></select></label>
         <input v-model="query" type="search" placeholder="搜索款号" aria-label="搜索待办款号" />
         <button class="btn" :disabled="loading" @click="load">刷新清单</button></div>
-      <div class="workspace-table-wrap" :aria-busy="loading" tabindex="0" role="region" aria-label="可横向滚动的资料清单"><table class="workspace-table"><thead><tr><th>本厂款号</th><th>图片</th><th>款式档案</th><th>销量</th><th>下一步</th></tr></thead>
+      <div class="workspace-table-wrap" :aria-busy="loading" tabindex="0" role="region" aria-label="可横向滚动的资料清单"><table class="workspace-table"><thead><tr><th>本厂款号</th><th>图片</th><th>款式档案</th><th>订单数据</th><th>下一步</th></tr></thead>
         <tbody><tr v-for="row in data?.items" :key="row.style_code"><th><RouterLink v-if="row.record_id" :to="`/records/${row.record_id}`">{{ row.style_code }}</RouterLink><span v-else>{{ row.style_code }}</span></th>
-          <td :class="{ 'gap-text': !row.has_image }">{{ row.has_image ? (row.pending_review ? '已上传 · 待审核' : '已上传') : '待补图片' }}</td>
+          <td :class="{ 'gap-text': !row.has_image }">{{ row.has_image ? (row.pending_review ? '已上传 · 待识别' : '已上传') : '待补图片' }}</td>
           <td :class="{ 'gap-text': !row.has_archive }">{{ row.has_archive ? '已导入' : '待补档案' }}</td><td class="meta">{{ row.has_sales ? '已导入' : '暂无（可选）' }}</td>
           <td><div class="toolbar"><button v-if="!row.has_image" class="btn small" @click="emit('task', 'images', row.style_code)">补图片</button><button v-if="!row.has_archive" class="btn small" @click="emit('task', 'archive', row.style_code)">补档案</button><RouterLink v-if="!row.missing.length && row.record_id" class="text-button" :to="`/records/${row.record_id}`">查看款式</RouterLink></div></td></tr></tbody></table></div>
       <p v-if="data && !data.items.length" class="workspace-empty">{{ query ? '没有找到这个款号。' : '当前没有这类待补资料。' }}</p>
       <div v-if="data && data.total > data.page_size" class="toolbar pagination"><button class="btn" :disabled="page <= 1 || loading" @click="page--; load()">上一页</button><span class="meta">第 {{ page }} 页，共 {{ data.total }} 款</span><button class="btn" :disabled="page * data.page_size >= data.total || loading" @click="page++; load()">下一页</button></div>
     </div>
-    <div v-if="data?.sales_policy.reference_rows" class="policy-note">有 {{ data.sales_policy.reference_rows }} 行汇总仅用于核对，未重复计入销量。<details><summary>查看统计口径</summary><p>{{ data.sales_policy.note }}</p></details></div>
+    <div v-if="data?.sales_policy.reference_rows" class="policy-note">有 {{ data.sales_policy.reference_rows }} 行汇总仅用于核对，未重复计入订单件数。<details><summary>查看统计口径</summary><p>{{ data.sales_policy.note }}</p></details></div>
     <p v-if="error" class="error" role="alert">{{ error }}</p>
   </section>
 </template>

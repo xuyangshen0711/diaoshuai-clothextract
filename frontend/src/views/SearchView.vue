@@ -3,8 +3,9 @@ import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { getHealth, getLibraryMeta, getRecord, getSimilarRecords, searchImage, searchText, type LibraryMeta, type SearchInfo } from '../api'
 import { searchMode as mode, searchQuery as query, searchFile as file, searchItems as items,
-  searchIncludePending as includePending, searchPerformed as searched, referenceId, referenceUrl,
+  searchPerformed as searched, referenceId, referenceUrl,
   referenceTitle } from '../composables/searchState'
+import { tagStatus } from '../utils/recordPresentation'
 const route = useRoute()
 const router = useRouter()
 const loading = ref(false)
@@ -21,7 +22,7 @@ onMounted(async () => {
 function engineLabel() {
   const engine = info.value?.engine || (mode.value === 'image' ? embeddingBackend.value : '')
   if (engine === 'clip-multilingual') return '本地语义检索'
-  if (engine) return '本地词汇匹配'
+  if (engine) return mode.value === 'image' ? '本地图片外观匹配' : '本地词汇匹配'
   return '图片、标签与已有说明综合检索'
 }
 let sequence = 0
@@ -34,14 +35,14 @@ async function executeSearch() {
     let data
     if (mode.value === 'text') {
       if (!query.value.trim()) throw new Error('请描述想找的风格、场景或款式')
-      const response = await searchText(query.value.trim(), { include_pending: includePending.value, source_category: sourceCategory() })
+      const response = await searchText(query.value.trim(), { source_category: sourceCategory() })
       data = response
       if (seq === sequence) info.value = response.search_info
     } else if (referenceId.value && !file.value) {
-      data = await getSimilarRecords(referenceId.value, includePending.value)
+      data = await getSimilarRecords(referenceId.value, false, sourceCategory())
     } else {
       if (!file.value) throw new Error('请选择一张参考图')
-      data = await searchImage(file.value, { include_pending: includePending.value, source_category: sourceCategory() })
+      data = await searchImage(file.value, { source_category: sourceCategory() })
     }
     if (seq === sequence) items.value = data.items
   } catch (e) {
@@ -52,7 +53,7 @@ async function submitSearch() {
   const target = { name: 'search', query: { mode: mode.value,
     q: mode.value === 'text' ? query.value.trim() || undefined : undefined,
     record: mode.value === 'image' && referenceId.value && !file.value ? referenceId.value : undefined,
-    include_pending: includePending.value ? undefined : 'false' } }
+    source_category: sourceCategory() === '全部' ? undefined : sourceCategory() } }
   if (router.resolve(target).fullPath === route.fullPath) await executeSearch()
   else await router.push(target)
 }
@@ -63,7 +64,7 @@ function setSource(value: string) {
   router.push({ name: 'search', query: { ...route.query, source_category: value === '全部' ? undefined : value } })
 }
 function switchMode(value: 'text' | 'image') {
-  router.push({ name: 'search', query: { mode: value, include_pending: includePending.value ? undefined : 'false' } })
+  router.push({ name: 'search', query: { mode: value, source_category: sourceCategory() === '全部' ? undefined : sourceCategory() } })
 }
 function useExample(value: string) { query.value = value; submitSearch() }
 function onFile(e: Event) {
@@ -77,7 +78,6 @@ function onFile(e: Event) {
 watch(() => route.fullPath, async () => {
   const seq = ++sequence
   mode.value = route.query.record || route.query.mode === 'image' ? 'image' : 'text'
-  includePending.value = route.query.include_pending !== 'false'
   error.value = ''; info.value = null; loading.value = false
   if (typeof route.query.q === 'string') query.value = route.query.q
   else if (mode.value === 'text') query.value = ''
@@ -118,17 +118,18 @@ watch(() => route.fullPath, async () => {
     <div class="source-tabs" role="group" aria-label="资料大类">
       <button v-for="item in sourceTabs()" :key="item" type="button" :aria-pressed="sourceCategory() === item" @click="setSource(item)">{{ item }}</button>
     </div>
-    <div class="inspiration-options"><label><input v-model="includePending" type="checkbox" @change="submitSearch" />包含未审核图片</label>
+    <div class="inspiration-options"><span class="meta">标签按人工修改优先生效</span>
       <p class="meta">{{ engineLabel() }} · 不调用付费接口</p></div>
+    <p v-if="mode === 'image'" class="meta">{{ referenceId && !file ? '以图片外观为主，并参考这款的当前生效标签排序；人工修改优先于 AI 建议。' : '新上传的参考图按图片外观匹配；结果展示图库中当前生效的标签。' }}</p>
     <div v-if="info?.concepts.length" class="inspiration-concepts" role="group" aria-label="识别到的灵感条件"><span>已识别</span><span v-for="concept in info.concepts" :key="concept" class="inspiration-concept">{{ concept }}</span></div>
     <div v-if="referenceUrl && mode === 'image'" class="search-reference"><img :src="referenceUrl" alt="本次检索参考图" width="90" height="120" /><div><strong>参考款式</strong><p class="meta">{{ referenceTitle }}</p><RouterLink v-if="referenceId" class="review-text-link" :to="{ name: 'record', params: { id: referenceId } }">查看参考款详情</RouterLink></div></div>
     <p v-if="error" class="error" role="alert">{{ error }}</p>
     <p v-if="loading" class="meta" role="status">正在本机匹配款式，首次搜索需要准备图片索引…</p>
     <p v-else-if="searched && !error" class="meta" role="status">找到 {{ items.length }} 款，按相似程度排序；结果可能只符合部分偏好。</p>
-    <p v-if="!items.length && !loading && !error" class="empty">{{ searched ? includePending ? '暂时没有匹配款式，试试更具体的颜色、版型或材质描述。' : '暂时没有匹配的已审核款式，可勾选包含未审核图片，或调整描述。' : '选择一个灵感示例，或输入你想找的款式。' }}</p>
+    <p v-if="!items.length && !loading && !error" class="empty">{{ searched ? '暂时没有匹配款式，试试更具体的颜色、版型或材质描述。' : '选择一个灵感示例，或输入你想找的款式。' }}</p>
     <div v-if="items.length" class="grid"><article v-for="item in items" :key="item.id" class="card"><RouterLink class="card-link" :to="{ name: 'record', params: { id: item.id }, query: { from: route.fullPath } }">
       <img :src="item.thumbnail_url || item.image_url" :alt="item.display_tags.一句话描述 || item.display_tags.品类" loading="lazy" width="180" height="240" />
-      <div class="card-body"><div class="library-card-heading"><h3>{{ item.library_category || item.display_tags.品类 }}</h3><span class="library-review-badge" :class="item.review_status">{{ item.review_status === 'approved' ? '已审核' : '未审核' }}</span></div>
+      <div class="card-body"><div class="library-card-heading"><h3>{{ item.library_category || item.display_tags.品类 }}</h3><span class="library-review-badge" :class="item.review_status">{{ tagStatus(item) }}</span></div>
       <p class="sub">{{ item.display_tags.颜色主色调 }} · {{ item.display_tags.风格 }}</p>
       <p v-if="item.style_code" class="sub">款号 {{ item.style_code }}</p>
       <p v-else-if="item.notes.款号" class="sub">{{ item.notes.款号 }}</p>

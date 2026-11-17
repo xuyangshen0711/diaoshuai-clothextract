@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 from src import catalog
@@ -12,7 +13,7 @@ from src.factory.colors import COLOR_FAMILIES, classify_color
 from src.factory.context import set_search_blobs
 from src.factory.excel_io import as_number
 from src.factory.periods import normalize_period, period_in_range, period_label
-from src.factory.sizes import size_sort_key, split_sizes
+from src.factory.sizes import normalize_size, size_matches, size_sort_key, split_sizes
 from src.schema import CATEGORY_GROUPS, ImageRecord
 
 
@@ -89,47 +90,132 @@ class FactoryIndex:
         return quantity, amount
 
 
-def load_index() -> FactoryIndex:
+def selected_order_seasons(value: str | list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+    """Accept old scalar links and repeated query values without double-counting orders."""
+    values = [value] if isinstance(value, str) else value or ()
+    return tuple(dict.fromkeys(season for item in values if (season := _chosen(item))))
+
+
+def orders_in_scope(orders: list[OrderView], *, order_season=None, ordered_from=None,
+                    ordered_to=None) -> list[OrderView]:
+    """Intersect the order's own season and date; never infer them from image/archive tags."""
+    seasons = selected_order_seasons(order_season)
+    start, end = normalize_period(ordered_from), normalize_period(ordered_to)
+    if start and end and start > end:
+        start, end = end, start
+    return [row for row in orders
+            if (not seasons or row.season in seasons)
+            and (not (start or end) or bool(row.period) and period_in_range(row.period, start, end))]
+
+
+def order_statistics_index(index: FactoryIndex, *, order_season=None, archive_season=None,
+                           ordered_from=None, ordered_to=None, **_unused) -> FactoryIndex:
+    """Request-local read view. Unscoped totals retain the existing summary counting policy."""
+    season = selected_order_seasons(order_season) or selected_order_seasons(archive_season)
+    if not season and not normalize_period(ordered_from) and not normalize_period(ordered_to):
+        return index
+    return FactoryIndex(variants=index.variants, facets=index.facets, orders={
+        code: orders_in_scope(rows, order_season=season,
+                              ordered_from=ordered_from, ordered_to=ordered_to)
+        for code, rows in index.orders.items()
+    })  # Legacy summaries cannot be attributed to an order season/date.
+
+
+def _load_variants(conn, index: FactoryIndex) -> None:
+    for row in conn.execute(
+        "SELECT style_code, variant_code, customer, season, needle, series, category, material, "
+        "design_code, designer, craftsman, subcategory, colors_json, sizes_json "
+        f"FROM style_variants ORDER BY {insert_order()}"
+    ):
+        view = VariantView(
+            style_code=row["style_code"], variant_code=row["variant_code"], customer=row["customer"],
+            season=row["season"], needle=row["needle"], series=row["series"], category=row["category"],
+            material=row["material"], design_code=row["design_code"] or "", designer=row["designer"] or "",
+            craftsman=row["craftsman"] or "", subcategory=row["subcategory"] or "",
+            colors=json.loads(row["colors_json"]), sizes=json.loads(row["sizes_json"]),
+        )
+        index.variants.setdefault(view.style_code, []).append(view)
+
+
+def _load_summaries(conn, index: FactoryIndex, order_rows=None) -> None:
+    from src.factory.sales_policy import counted_from_rows
+    summaries = list(conn.execute("SELECT * FROM style_sales"))
+    if not summaries:
+        return
+    if order_rows is None:
+        order_rows = conn.execute("SELECT variant_code, order_date FROM style_order_lines")
+    for row in counted_from_rows(summaries, order_rows):
+        sale = SaleView(
+            variant_code=row["variant_code"], style_code=row["style_code"], customer=row["customer"],
+            color=row["color"], size_label=row["size_label"], quantity=int(row["quantity"]), amount=float(row["amount"]),
+        )
+        index.sales.setdefault(sale.style_code, []).append(sale)
+
+
+def load_index(*, conn=None, include_facets: bool = True) -> FactoryIndex:
     index = FactoryIndex()
-    with catalog._database() as conn:
-        for row in conn.execute(
-            "SELECT style_code, variant_code, customer, season, needle, series, category, material, "
-            "design_code, designer, craftsman, subcategory, colors_json, sizes_json "
-            f"FROM style_variants ORDER BY {insert_order()}"
-        ):
-            view = VariantView(
-                style_code=row["style_code"], variant_code=row["variant_code"], customer=row["customer"],
-                season=row["season"], needle=row["needle"], series=row["series"], category=row["category"],
-                material=row["material"], design_code=row["design_code"] or "", designer=row["designer"] or "",
-                craftsman=row["craftsman"] or "", subcategory=row["subcategory"] or "",
-                colors=json.loads(row["colors_json"]), sizes=json.loads(row["sizes_json"]),
-            )
-            index.variants.setdefault(view.style_code, []).append(view)
-        from src.factory.sales_policy import counted_summaries
-        for row in counted_summaries(conn):
-            sale = SaleView(
-                variant_code=row["variant_code"], style_code=row["style_code"], customer=row["customer"],
-                color=row["color"], size_label=row["size_label"], quantity=int(row["quantity"]), amount=float(row["amount"]),
-            )
-            index.sales.setdefault(sale.style_code, []).append(sale)
-        for row in conn.execute(
+    with (nullcontext(conn) if conn is not None else catalog._database()) as conn:
+        _load_variants(conn, index)
+        # Use the same current rows for summary overlap and card/detail statistics.
+        # All caches below are request-local transformations of strings, not cached business data.
+        rows = list(conn.execute(
             "SELECT order_no, variant_code, style_code, customer, customer_style_code, color, size_label, "
             "quantity, amount, order_kind, order_date, salesperson, season FROM style_order_lines"
-        ):
-            parsed = parse_style_code(row["variant_code"])
+        ))
+        _load_summaries(conn, index, rows)
+        codes, periods = {}, {}
+        for row in rows:
+            code, day = row["variant_code"], row["order_date"] or ""
+            if code not in codes:
+                codes[code] = parse_style_code(code)
+            if day not in periods:
+                periods[day] = _period_key(day)
+            parsed = codes[code]
             order = OrderView(
-                order_no=row["order_no"], variant_code=row["variant_code"], style_code=row["style_code"],
+                order_no=row["order_no"], variant_code=code, style_code=row["style_code"],
                 customer=parsed.customer if parsed else (row["customer"] or ""),
                 buyer=row["customer"] or "",
                 customer_style_code=row["customer_style_code"] or "",
                 color=row["color"], size_label=row["size_label"],
                 quantity=int(row["quantity"]), amount=float(row["amount"]),
-                order_kind=row["order_kind"] or "", order_date=row["order_date"] or "",
+                order_kind=row["order_kind"] or "", order_date=day,
                 salesperson=row["salesperson"] or "", season=row["season"] or "",
-                period=_period_key(row["order_date"] or ""),
+                period=periods[day],
             )
             index.orders.setdefault(order.style_code, []).append(order)
-    index.facets = _facets(index)
+    if include_facets:
+        index.facets = _facets(index)
+    return index
+
+
+def load_metadata_index(*, conn=None) -> FactoryIndex:
+    """Read dropdown options without transferring/materializing every order line.
+
+    The returned index intentionally contains no order lines and is only for /meta/library.
+    HEX keeps distinct values distinct under MySQL's case/accent/space-insensitive collations.
+    """
+    index = FactoryIndex()
+    values = {key: set() for key in ("customer", "buyer", "season", "period", "color", "size_label")}
+    with (nullcontext(conn) if conn is not None else catalog._database()) as conn:
+        _load_variants(conn, index)
+        _load_summaries(conn, index)
+        columns = {"variant": "variant_code", "buyer": "customer", "season": "season",
+                   "date": "order_date", "color": "color", "size_label": "size_label"}
+        sql = " UNION ALL ".join(
+            f"SELECT DISTINCT '{key}' AS facet_name, {column} AS facet_value, HEX({column}) AS facet_exact FROM style_order_lines"
+            for key, column in columns.items()
+        )
+        for row in conn.execute(sql):
+            key, value = row["facet_name"], row["facet_value"] or ""
+            if key == "variant":
+                parsed = parse_style_code(value)
+                if parsed:
+                    values["customer"].add(parsed.customer)
+            elif key == "date":
+                values["period"].add(_period_key(value))
+            else:
+                values[key].add(value)
+    index.facets = _facets(index, order_values=values)
     return index
 
 
@@ -137,42 +223,56 @@ def prime_search(index: FactoryIndex):
     blobs = {}
     for code, rows in index.variants.items():
         parts = [code]
+        categories, seasons, colors, materials = [], [], [], []
         for row in rows:
             parts.extend([
-                row.variant_code, row.customer, row.season, row.needle, row.series, row.category,
-                row.material, row.design_code, row.designer, row.craftsman, row.subcategory,
+                row.variant_code, row.customer, row.needle, row.series,
+                row.design_code, row.designer, row.craftsman,
             ])
-            parts.extend(color["name"] for color in row.colors)
-            parts.extend(color["family"] for color in row.colors)
+            categories.extend([row.category, row.subcategory])
+            seasons.append(row.season)
+            materials.append(row.material)
+            colors.extend(color["name"] for color in row.colors)
+            colors.extend(color["family"] for color in row.colors)
             parts.extend(size["label"] for size in row.sizes)
         for sale in index.sales.get(code, []):
-            parts.extend([sale.customer, sale.color, sale.size_label, sale.variant_code])
+            parts.extend([sale.customer, sale.size_label, sale.variant_code])
+            colors.append(sale.color)
         for order in index.orders.get(code, []):
             parts.extend([
-                order.customer, order.buyer, order.salesperson, order.color, order.size_label,
-                order.variant_code, order.order_no, order.customer_style_code, order.season,
+                order.customer, order.buyer, order.salesperson, order.size_label,
+                order.variant_code, order.order_no, order.customer_style_code,
             ])
-        blobs[code] = " ".join(part for part in parts if part)
+            colors.append(order.color)
+            seasons.append(order.season)
+        blobs[code] = {field: " ".join(filter(None, values)) for field, values in
+                       {"source": parts, "品类": categories, "季节": seasons,
+                        "颜色主色调": colors, "面料": materials}.items()}
     for code in index.sales:
-        blobs.setdefault(code, code)
+        blobs.setdefault(code, {"source": code})
     for code in index.orders:
-        blobs.setdefault(code, code)
+        blobs.setdefault(code, {"source": code})
     return set_search_blobs(blobs)
 
 
 def effective_placement(record: ImageRecord, index: FactoryIndex):
-    """Fixed-table placement. A 本厂产品 archive category wins over the AI label."""
+    """Human fields win; otherwise preserve factory archive classification."""
     from src.taxonomy import Placement, resolve
 
-    if record.source_category == "本厂产品" and record.style_code:
+    manual = record.human_overrides
+    shown = record.display_tags
+    if "品类" not in manual and record.source_category == "本厂产品" and record.style_code:
         raws = index.categories(record.style_code)
         if raws:
-            return resolve(raws[0], factory=True)
-    shown = record.display_tags
+            placement = resolve(raws[0], factory=True)
+            return Placement(placement.level1, placement.level2,
+                             shown.袖长 if "袖长" in manual else placement.sleeve,
+                             shown.面料 if "面料" in manual else placement.fabric,
+                             placement.raw, placement.unmapped)
     placement = resolve(shown.品类)
-    sleeve = placement.sleeve or shown.袖长 or record.sleeve_length
-    fabric = placement.fabric or shown.面料 or record.fabric
-    raw = record.category_raw or (shown.品类 if shown.品类 != placement.label else "")
+    sleeve = shown.袖长 if "袖长" in manual else (shown.袖长 or placement.sleeve or record.sleeve_length)
+    fabric = shown.面料 if "面料" in manual else (shown.面料 or placement.fabric or record.fabric)
+    raw = "" if "品类" in manual else record.category_raw or (shown.品类 if shown.品类 != placement.label else "")
     if (sleeve, fabric, raw) == (placement.sleeve, placement.fabric, placement.raw):
         return placement
     return Placement(placement.level1, placement.level2, sleeve, fabric, raw, placement.unmapped)
@@ -201,6 +301,8 @@ def matches_level2(record: ImageRecord, index: FactoryIndex, subcategory: str | 
         return True
     if placement_level2 == chosen:
         return True
+    if "品类" in record.human_overrides:
+        return False
     from src.taxonomy import resolve
 
     for row in index.variants.get(record.style_code) or []:
@@ -212,11 +314,12 @@ def matches_level2(record: ImageRecord, index: FactoryIndex, subcategory: str | 
 
 
 def matches_factory(record: ImageRecord, index: FactoryIndex, *, color_family=None, size=None,
-                    series=None, needle=None, customer=None, archive_season=None,
+                    series=None, needle=None, customer=None, archive_season=None, order_season=None,
                     ordered_from=None, ordered_to=None) -> bool:
     selected = {
         "色系": _chosen(color_family), "尺码": _chosen(size), "系列": _chosen(series),
-        "针型": _chosen(needle), "客户": _chosen(customer), "季节": _chosen(archive_season),
+        "针型": _chosen(needle), "客户": _chosen(customer),
+        "季节": selected_order_seasons(order_season) or selected_order_seasons(archive_season),
     }
     start = normalize_period(ordered_from)
     end = normalize_period(ordered_to)
@@ -229,9 +332,8 @@ def matches_factory(record: ImageRecord, index: FactoryIndex, *, color_family=No
     variants = index.variants.get(record.style_code) or []
     sales = index.sales.get(record.style_code) or []
     orders = index.orders.get(record.style_code) or []
-    if selected["季节"]:
-        seasons = {row.season for row in variants if row.season} | {row.season for row in orders if row.season}
-        if selected["季节"] not in seasons:
+    if selected["季节"] or start or end:
+        if not orders_in_scope(orders, order_season=selected["季节"], ordered_from=start, ordered_to=end):
             return False
     if selected["系列"] and not any(row.series == selected["系列"] for row in variants):
         return False
@@ -243,20 +345,14 @@ def matches_factory(record: ImageRecord, index: FactoryIndex, *, color_family=No
         if selected["客户"] not in names:
             return False
     if selected["色系"]:
-        families = {color["family"] for row in variants for color in row.colors}
-        families |= {classify_color(row.color) for row in sales}
-        families |= {classify_color(row.color) for row in orders}
+        families = set(card_color_families(record, index))
         if selected["色系"] not in families:
             return False
     if selected["尺码"]:
         labels = {size_item["label"] for row in variants for size_item in row.sizes}
         letters = {size_item["letter"] for row in variants for size_item in row.sizes if size_item.get("letter")}
         labels |= {row.size_label for row in sales} | {row.size_label for row in orders}
-        if selected["尺码"] not in labels and selected["尺码"] not in letters:
-            return False
-    if start or end:
-        periods = {row.period for row in orders if row.period}
-        if not any(period_in_range(key, start, end) for key in periods):
+        if not any(size_matches(label, selected["尺码"]) for label in labels | letters):
             return False
     return True
 
@@ -268,14 +364,16 @@ def style_color_families(record: ImageRecord, index: FactoryIndex) -> list[str]:
     found: set[str] = set()
     for row in index.variants.get(record.style_code) or []:
         found.update(color["family"] for color in row.colors if color.get("family"))
-    for row in index.sales.get(record.style_code) or []:
-        found.add(classify_color(row.color))
-    for row in index.orders.get(record.style_code) or []:
-        found.add(classify_color(row.color))
+    names = {row.color for row in index.sales.get(record.style_code) or []}
+    names.update(row.color for row in index.orders.get(record.style_code) or [])
+    found.update(classify_color(name) for name in names)
     return [name for name in COLOR_FAMILIES if name in found]
 
 
 def card_color_families(record: ImageRecord, index: FactoryIndex) -> list[str]:
+    if "颜色主色调" in record.human_overrides:
+        color = record.display_tags.颜色主色调
+        return [classify_color(color)] if color else []
     families = style_color_families(record, index)
     if families or record.source_category == "本厂产品":
         return families
@@ -297,7 +395,7 @@ def color_tally(records: list[ImageRecord], index: FactoryIndex, source_category
     counts: dict[str, int] = {}
     for record in records:
         if source_category == "本厂产品":
-            names = style_color_families(record, index)
+            names = card_color_families(record, index)
         else:
             names = [record.display_tags.颜色主色调] if record.display_tags.颜色主色调 else []
         for name in names:
@@ -328,7 +426,7 @@ def style_activity(index: FactoryIndex, style_code: str) -> dict:
     }
 
 
-def card_fields(record: ImageRecord, index: FactoryIndex) -> dict:
+def card_fields(record: ImageRecord, index: FactoryIndex, *, order_index: FactoryIndex | None = None) -> dict:
     placement = effective_placement(record, index)
     quantity, amount = (0, 0.0)
     activity = {
@@ -337,13 +435,16 @@ def card_fields(record: ImageRecord, index: FactoryIndex) -> dict:
         "average_price": 0, "has_order_lines": False,
     }
     seasons: list[str] = []
+    statistics = order_index if order_index is not None else index
     if record.source_category == "本厂产品" and record.style_code:
-        quantity, amount = index.sales_totals(record.style_code)
-        activity = style_activity(index, record.style_code)
+        quantity, amount = statistics.sales_totals(record.style_code)
+        activity = style_activity(statistics, record.style_code)
         seasons = _unique(row.season for row in index.variants.get(record.style_code) or [])
         if not seasons:
             seasons = _unique(row.season for row in index.orders.get(record.style_code) or [])
     archive_category = placement.raw if record.source_category == "本厂产品" else ""
+    if "季节" in record.human_overrides:
+        seasons = [record.display_tags.季节] if record.display_tags.季节 else []
     rows = index.variants.get(record.style_code) or [] if record.style_code else []
     return {
         "source_category": record.source_category,
@@ -354,11 +455,14 @@ def card_fields(record: ImageRecord, index: FactoryIndex) -> dict:
         "sleeve_length": placement.sleeve,
         "fabric": placement.fabric,
         "archive_category": archive_category,
-        "subcategory": _first_text(rows, "subcategory"),
+        "subcategory": placement.level2 if "品类" in record.human_overrides else _first_text(rows, "subcategory"),
         "designer": _first_text(rows, "designer"),
         "craftsman": _first_text(rows, "craftsman"),
         "design_codes": _unique(row.design_code for row in rows),
         "seasons": seasons,
+        "order_seasons": sorted({row.season for row in statistics.orders.get(record.style_code, []) if row.season})
+                         if record.source_category == "本厂产品" else [],
+        "archive_seasons": _unique(row.season for row in rows),
         "sales_quantity": quantity,
         "sales_amount": as_number(amount),
         "has_pending_image": bool(record.pending_image_path),
@@ -404,7 +508,7 @@ def detail_fields(record: ImageRecord, index: FactoryIndex) -> dict:
             "total_amount": as_number(amount),
             **activity,
             "by_color": _group_sales(combined, lambda row: row.color, family=True),
-            "by_size": _group_sales(combined, lambda row: row.size_label),
+            "by_size": _group_sales(combined, lambda row: normalize_size(row.size_label)),
             "by_customer": _group_customers(combined, variants),
             "monthly": _monthly(orders),
             "heatmap": _heatmap(combined),
@@ -458,7 +562,7 @@ def _group_customers(sales, variants: list[VariantView]) -> list[dict]:
     return items
 
 
-def _facets(index: FactoryIndex) -> dict[str, list[str]]:
+def _facets(index: FactoryIndex, *, order_values=None) -> dict[str, list[str]]:
     categories, seasons, series, needles, customers, sizes, families = set(), set(), set(), set(), set(), [], set()
     seen_sizes: set[str] = set()
     periods: set[str] = set()
@@ -487,26 +591,24 @@ def _facets(index: FactoryIndex) -> dict[str, list[str]]:
             if row.size_label not in seen_sizes:
                 seen_sizes.add(row.size_label)
                 sizes.append(row.size_label)
-    for rows in index.orders.values():
-        for row in rows:
-            if row.buyer:
-                customers.add(row.buyer)
-            if row.customer:
-                customers.add(row.customer)
-            if row.season:
-                seasons.add(row.season)
-            if row.period:
-                periods.add(row.period)
-            families.add(classify_color(row.color))
-            if row.size_label not in seen_sizes:
-                seen_sizes.add(row.size_label)
-                sizes.append(row.size_label)
+    if order_values is None:
+        order_values = {key: set() for key in ("customer", "buyer", "season", "period", "color", "size_label")}
+        for rows in index.orders.values():
+            for row in rows:
+                for key, values in order_values.items():
+                    values.add(getattr(row, key))
+    customers.update(value for key in ("customer", "buyer") for value in order_values[key] if value)
+    seasons.update(value for value in order_values["season"] if value)
+    periods.update(value for value in order_values["period"] if value)
+    families.update(classify_color(value) for value in order_values["color"])
+    sizes.extend(order_values["size_label"])
     color_families = [name for name in COLOR_FAMILIES if name in families] or list(COLOR_FAMILIES)
     return {
         "品类": sorted(categories),
         "季节": sorted(seasons),
+        "订单年度/季节": sorted(value for value in order_values["season"] if value),
         "色系": color_families,
-        "尺码": sizes,
+        "尺码": _ordered_sizes(set(sizes)),
         "系列": sorted(series),
         "针型": sorted(needles),
         "客户": sorted(customers, key=lambda name: (name != OWN_CUSTOMER, name)),
@@ -574,7 +676,7 @@ def _heatmap(rows) -> dict:
     for row in rows:
         if not row.color or not row.size_label:
             continue
-        key = (row.color, row.size_label)
+        key = (row.color, normalize_size(row.size_label))
         totals[key] = totals.get(key, 0) + row.quantity
     sizes = _ordered_sizes({size for _color, size in totals})
     colors = sorted({color for color, _size in totals}, key=lambda name: (-sum(totals.get((name, size), 0) for size in sizes), name))
@@ -652,7 +754,7 @@ def _order_rows(orders: list[OrderView]) -> list[dict]:
 
 def _ordered_sizes(labels: set[str]) -> list[str]:
     items = []
-    for label in labels:
+    for label in {normalize_size(label) for label in labels if label}:
         parsed = split_sizes(label)
         items.append(parsed[0] if parsed else {"label": label, "number": "", "letter": ""})
     items.sort(key=size_sort_key)

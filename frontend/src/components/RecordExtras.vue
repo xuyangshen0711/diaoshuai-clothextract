@@ -21,7 +21,7 @@ defineExpose({ showTags })
 </script>
 <template>
   <component :is="reference ? 'details' : 'div'" ref="root" class="record-extras" :class="{ 'reference-extras': reference }">
-    <summary v-if="reference">分类标签对照与审核记录</summary>
+    <summary v-if="reference">标签对照与修改记录</summary>
     <div class="record-extras-content">
       <details v-if="item.image_history?.length" class="detail-fold">
         <summary>历史原图</summary>
@@ -48,8 +48,9 @@ defineExpose({ showTags })
               <tr>
                 <th scope="col">标签</th>
                 <th scope="col">AI 建议{{ item.ai_tags_source === 'mock' ? '（模拟）' : '' }}</th>
+                <th scope="col">人工修改</th>
                 <th scope="col">
-                  {{ item.review_status === 'approved' ? '最终分类' : '待审核分类' }}
+                  当前生效
                 </th>
               </tr>
             </thead>
@@ -68,6 +69,7 @@ defineExpose({ showTags })
                       : display(item.ai_tags?.[key])
                   }}
                 </td>
+                <td>{{ Object.hasOwn(item.tag_overrides || {}, key) ? (display(item.tag_overrides[key]) === '未提供' || (Array.isArray(item.tag_overrides[key]) && !item.tag_overrides[key]?.length) ? '已清空' : display(item.tag_overrides[key])) : '沿用 AI' }}</td>
                 <td>
                   {{
                     key === '一句话描述'
@@ -85,7 +87,7 @@ defineExpose({ showTags })
         <DesignNotesList :notes="item.notes" />
       </details>
       <details class="detail-fold" @toggle="historyOpened = historyOpened || ($event.target as HTMLDetailsElement).open">
-        <summary>审核记录</summary>
+        <summary>修改记录</summary>
         <RecordHistory v-if="historyOpened" :id="item.id" />
       </details>
     </div>

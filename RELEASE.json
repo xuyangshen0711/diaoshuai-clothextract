@@ -1,0 +1,21 @@
+{
+  "release": "20261116-archive-batch",
+  "base_commit": "c6cd1d475aff8f2dc8b0d81c72709a56d88b8895",
+  "base_code_sha256": "a61c020c8775601780e87e9d10cfee701479efa5118d70d062c4e77243593541",
+  "previous_release": "20261116-order-import-timeout",
+  "includes_local_changes": true,
+  "prebuilt_frontend": true,
+  "business_data_included": false,
+  "local_configuration_included": false,
+  "database_schema_changes": false,
+  "preserved_features": ["order-season multiselect", "order preview and batch import optimizations"],
+  "validation": {
+    "regressions": "94 passed, 29 optional integration cases skipped; 7 failures reproduced unchanged on the pre-edit baseline; 1 separately known deferred-image case excluded",
+    "archive_batch": "500-row writes; real PyMySQL driver combines batches; later-batch failure rolls back inserts, updates and history; retry and repeat confirmation are idempotent; preserves series and unrelated orders",
+    "frontend": "Existing frontend source and compiled assets unchanged byte for byte; all 7 season/date/union API regressions passed",
+    "actual_workbook": "232-row product archive preview, confirmation, repeated confirmation, reimport and every stored field verified in disposable SQLite; 1001-style duplicate workbook keeps the last row",
+    "write_benchmark": "5001 rows reduced from 5001 individual writes to 11 bulk calls; simulated 5ms database round trip: 31.898s to 0.179s for write stage only, not a live RDS timing claim",
+    "live_rds_and_oss": "Pre-edit online and main code verified identical; new release awaits user upload and installation",
+    "installer": "9 apply/rollback/protection tests passed; real local HTTP archive and order preview smoke checks passed without business writes"
+  }
+}

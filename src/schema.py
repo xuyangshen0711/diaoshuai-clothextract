@@ -220,7 +220,9 @@ class ImageRecord(BaseModel):
     notes: DesignNotes = Field(default_factory=DesignNotes)
     tags_source: str = "untagged"  # mock | openai | manual | untagged
     manually_edited: bool = False
-    # tags retains the last human-approved classification during re-tagging.
+    # An absent key follows AI; an explicit empty value is a human correction.
+    tag_overrides: dict[str, str | list[str]] = Field(default_factory=dict)
+    # AI output is retained independently of the effective tags.
     ai_tags: FashionTags | None = None
     ai_tags_source: str | None = None
     proposed_tags: FashionTags | None = None
@@ -240,37 +242,86 @@ class ImageRecord(BaseModel):
         self.updated_at = datetime.now(timezone.utc).isoformat()
 
     @property
+    def human_overrides(self) -> dict[str, str | list[str]]:
+        if "tag_overrides" in self.model_fields_set:
+            return self.tag_overrides
+        # Compatibility for old snapshots; the catalog migration also recovers
+        # category edits and pre-retagging values from the append-only history.
+        if self.manually_edited or self.tags_source == "manual":
+            baseline = self.ai_tags or self.proposed_tags
+            return {key: value for key, value in self.tags.model_dump().items()
+                    if baseline is None or value != getattr(baseline, key)}
+        return {}
+
+    @property
     def display_tags(self) -> FashionTags:
-        if self.review_status == "pending":
-            return self.proposed_tags or self.ai_tags or self.tags
-        return self.tags
+        base = self.ai_tags or self.proposed_tags or self.tags
+        return FashionTags.model_validate({**base.model_dump(), **self.human_overrides})
+
+    @property
+    def has_ai_suggestion(self) -> bool:
+        from src.tag.openai_tagger import validate_suggestion
+        from src.tag.errors import TaggingError
+
+        suggestion = self.ai_tags
+        if suggestion is None and self.tags_source in {"openai", "deepseek", "mock"}:
+            suggestion = self.proposed_tags or self.tags
+        try:
+            validate_suggestion(suggestion)
+            return True
+        except TaggingError:
+            return False
+
+    @property
+    def ready(self) -> bool:
+        return self.review_status != "rejected" and (self.has_ai_suggestion or (
+            self.review_status == "approved" and self.tags_source == "manual"))
+
+    def sync_effective_tags(self) -> None:
+        self.tags = self.display_tags.model_copy(deep=True)
+        self.manually_edited = bool(self.human_overrides)
+        self.tags_source = "manual" if self.manually_edited else (self.ai_tags_source or self.tags_source)
+        self.sleeve_length = self.tags.袖长
+        self.fabric = self.tags.面料
 
     def search_text(self) -> str:
-        detail = " ".join(self.tags.细节元素)
+        shown = self.display_tags
+        detail = " ".join(shown.细节元素)
+        # An old AI summary can repeat a corrected colour/category. Keep it in
+        # the comparison UI, but do not use it to undo a structured correction.
+        description = shown.一句话描述
+        if self.ai_tags and "一句话描述" not in self.human_overrides:
+            for key, value in self.human_overrides.items():
+                previous = getattr(self.ai_tags, key)
+                if previous == value:
+                    continue
+                terms = previous if isinstance(previous, list) else [previous]
+                if key == "品类":
+                    terms = [*terms, self.category_raw, *previous.split(">")]
+                for term in sorted(filter(None, terms), key=len, reverse=True):
+                    description = description.replace(term, "")
         from src.factory.context import search_blob
 
         return " ".join(
             [
-                self.tags.一句话描述,
-                self.tags.品类,
-                self.tags.风格,
-                self.tags.季节,
-                self.tags.版型,
-                self.tags.颜色主色调,
-                self.tags.领型,
-                self.tags.袖型,
-                self.tags.图案,
+                description,
+                shown.品类,
+                shown.风格,
+                shown.季节,
+                shown.版型,
+                shown.颜色主色调,
+                shown.领型,
+                shown.袖型,
+                shown.图案,
                 detail,
                 self.notes.text(),
                 self.source.source_file,
                 self.source.location,
                 self.source_category,
                 self.style_code,
-                self.category_raw,
-                self.sleeve_length,
-                self.fabric,
-                self.tags.袖长,
-                self.tags.面料,
-                search_blob(self.style_code),
+                self.category_raw if "品类" not in self.human_overrides else "",
+                shown.袖长,
+                shown.面料,
+                search_blob(self.style_code, self.human_overrides),
             ]
         ).strip()

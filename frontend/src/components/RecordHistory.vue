@@ -4,7 +4,7 @@ import { getReviewHistory, type FashionTags, type ReviewEvent } from '../api'
 const props = defineProps<{ id: string }>()
 const events = ref<ReviewEvent[]>([])
 const error = ref('')
-const actions: Record<string, string> = { cover_updated: '调整图库封面', approve: '审核通过', reject: '驳回分类', resubmit: '重新提交审核',
+const actions: Record<string, string> = { tags_updated: '人工修改标签', tags_reset: '恢复 AI 标签', automatic_entry_migrated: '启用自动入库并保留原有修改', image_replaced: '新图片识别后替换', category_assigned: '修改品类', cover_updated: '调整图库封面', approve: '审核通过', reject: '驳回分类', resubmit: '重新提交审核',
   record_created: '导入并生成分类', classification_proposed: '提交新的分类', legacy_imported: '迁移历史资料', image_refreshed: '恢复图片清晰度' }
 const describe = (tags: FashionTags) => Object.entries(tags).map(([key, value]) => `${key}：${Array.isArray(value) ? value.join('、') || '无' : value || '未提供'}`).join('；')
 let latest = 0
@@ -16,7 +16,7 @@ watch(() => props.id, async id => {
 }, { immediate: true })
 </script>
 <template>
-  <section class="review-history" aria-label="分类与审核历史"><h3>分类与审核历史</h3>
+  <section class="review-history" aria-label="标签修改历史"><h3>标签修改历史</h3>
     <p v-if="error" class="error" role="alert">{{ error }}</p>
     <details v-for="event in events" :key="event.id"><summary>{{ actions[event.action] || event.action }}<span>{{ event.actor || '系统' }} · {{ new Date(event.created_at).toLocaleString('zh-CN', { hour12: false }) }}</span></summary>
       <p v-if="event.note">{{ event.note }}</p><p v-if="event.after.ai_tags" class="meta">AI 建议：{{ describe(event.after.ai_tags) }}</p>

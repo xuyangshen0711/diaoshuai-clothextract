@@ -15,7 +15,9 @@ from src.factory.excel_io import (cell_at, column_index, find_header, load_sheet
                                  plain_text, sheet_headers, table_kind_from_headers)
 from src.factory.sales import _stored_totals, _write_lines, _write_summary, is_total_row, parse_sales_rows
 from src.factory.sales_policy import historical_range, policy_summary
+from src.factory.sales_deletion import capture_batch, mutation_lock, public_report, read_rows, row_id
 from src.factory.tables import gap_report, now, own_factory_images
+from src.factory.import_impact import import_impact, projected_impact
 
 
 def completeness(conn) -> list[dict]:
@@ -23,10 +25,11 @@ def completeness(conn) -> list[dict]:
     sales = {r[0] for table in ("style_sales", "style_order_lines")
              for r in conn.execute(f"SELECT DISTINCT style_code FROM {table}")}
     images = own_factory_images(conn)
+    available = storage.existing_files(record.image_path for record in images.values())
     result = []
     for code in sorted(archives | sales | set(images)):
         record = images.get(code)
-        has_image = bool(record and storage.is_file(record.image_path))
+        has_image = bool(record and record.image_path in available)
         missing = []
         if not has_image:
             missing.append("image")
@@ -55,12 +58,13 @@ def workspace(status="missing", query="", page=1, page_size=20) -> dict:
             "page": page, "page_size": page_size, "sales_policy": policy}
 
 
-def _fingerprint(conn) -> str:
-    state = {}
+def _fingerprint(conn, complete=None) -> str:
+    state = {"style_grouping": "starred_style_codes_v1", "archive_template": "product_table_11_columns_v1"}
     for table in ("style_variants", "style_sales", "style_order_lines"):
         state[table] = sorted([dict(r) for r in conn.execute(f"SELECT * FROM {table}")],
                               key=lambda r: json.dumps(r, sort_keys=True, default=str))
-    state["images"] = [(r["style_code"], r["has_image"], r["record_id"]) for r in completeness(conn)]
+    state["images"] = [(r["style_code"], r["has_image"], r["record_id"])
+                       for r in (completeness(conn) if complete is None else complete)]
     return hashlib.sha256(json.dumps(state, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -87,8 +91,8 @@ def _plan(conn, kind, rows, fmt):
     return planned
 
 
-def _issues(path, kind, fmt) -> tuple[list, int]:
-    rows = load_sheet_rows(path)
+def _issues(path, kind, fmt, *, sheet_rows=None) -> tuple[list, int]:
+    rows = load_sheet_rows(path) if sheet_rows is None else sheet_rows
     header, headers = find_header(rows, "大货款号" if kind == "archive" else "款号")
     idx = {name: column_index(headers, name) for name in headers if name}
     issues = []
@@ -121,33 +125,41 @@ def _folder() -> Path:
 
 
 def preview_table(path: Path, filename: str, requested_kind: str) -> dict:
-    kind = table_kind_from_headers(sheet_headers(load_sheet_rows(path)))
+    sheet_rows = load_sheet_rows(path)
+    kind = table_kind_from_headers(sheet_headers(sheet_rows))
     if kind not in {"archive", "sales"}:
         raise ValueError("未识别到款式档案或销量表，请检查表头。")
     if kind == "archive":
-        rows, skipped, warnings, recognized = parse_archive_rows(path)
+        rows, skipped, warnings, recognized = parse_archive_rows(path, sheet_rows=sheet_rows)
         meta = {**recognized, "skipped_rows": skipped, "warnings": warnings}
     else:
-        rows, meta = parse_sales_rows(path)
-    issues, ignored = _issues(path, kind, meta["format"])
+        rows, meta = parse_sales_rows(path, sheet_rows=sheet_rows)
+    issues, ignored = _issues(path, kind, meta["format"], sheet_rows=sheet_rows)
+    del sheet_rows
     token = uuid4().hex
     with catalog._database() as conn:
         plan = _plan(conn, kind, rows, meta["format"])
-        state = _fingerprint(conn)
+        complete = completeness(conn)
+        state = _fingerprint(conn, complete)
         codes = sorted({r["style_code"] for r in rows})
-        gaps = [r for r in completeness(conn) if r["style_code"] in codes]
+        selected = set(codes)
+        gaps = [r for r in complete if r["style_code"] in selected]
         ordered = {r[0] for r in conn.execute("SELECT DISTINCT variant_code FROM style_order_lines")}
         summarized = {r[0] for r in conn.execute("SELECT DISTINCT variant_code FROM style_sales")}
+        impact = projected_impact(read_rows(conn), plan,
+                                  "orders" if meta["format"] == "sales_lines" else "summary", rows) if kind == "sales" else None
     collisions = sorted({r["variant_code"] for r in rows} & (summarized if meta["format"] == "sales_lines" else ordered)) if kind == "sales" else []
     response = {"token": token, "kind": kind, "requested_kind": requested_kind, "source_file": filename,
                 "format": meta["format"], "format_label": meta["format_label"], "meta": meta,
                 "row_count": len(rows), "style_codes": codes,
                 "counts": {action: sum(p["action"] == action for p in plan) for action in ("new", "updated", "unchanged")},
-                "issues": issues[:100], "issue_count": len(issues), "ignored_rows": ignored,
+                "issues": issues, "issue_count": len(issues), "ignored_rows": ignored,
                 "samples": [{**p["row"], "action": p["action"]} for p in plan[:8]],
                 "overlap_variants": collisions,
                 "missing_images": sorted(set(codes) - {r["style_code"] for r in gaps if r["has_image"]}),
                 "can_confirm": bool(rows)}
+    if impact is not None:
+        response["impact"] = impact
     manifest = {"response": response, "rows": rows, "base_rows": rows, "fingerprint": state, "created_at": now()}
     (_folder() / f"{token}.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
     return response
@@ -156,10 +168,10 @@ def preview_table(path: Path, filename: str, requested_kind: str) -> dict:
 def confirm_table(token: str, acknowledge=False, historical_start="", historical_end="") -> dict:
     if not re.fullmatch(r"[a-f0-9]{32}", token):
         raise ValueError("预览编号无效，请重新选择文件。")
-    with catalog._database() as conn:
+    with mutation_lock, catalog._database() as conn:
         previous = conn.execute("SELECT payload FROM factory_import_history WHERE id=?", (token,)).fetchone()
         if previous:
-            return json.loads(previous[0])
+            return public_report(json.loads(previous[0]))
         path = _folder() / f"{token}.json"
         if not path.is_file():
             raise ValueError("预览已失效，请重新选择文件。")
@@ -184,6 +196,15 @@ def confirm_table(token: str, acknowledge=False, historical_start="", historical
             rows = _historical_rows(conn, rows, historical_start, historical_end)
         plan = _plan(conn, kind, rows, fmt)
         changed = [p["row"] for p in plan if p["action"] != "unchanged"]
+        before_sales = read_rows(conn) if kind == "sales" else {}
+        row_kind = "orders" if fmt == "sales_lines" else "summary"
+        if kind == "sales":
+            expected_impact = projected_impact(before_sales, plan, row_kind, rows, historical_start, historical_end)
+            # Old API callers could supply a historical range at confirmation. Keep that
+            # route compatible; the UI still requires re-previewing every range change.
+            same_range = (preview.get("historical_start", ""), preview.get("historical_end", "")) == (historical_start, historical_end)
+            if preview.get("impact") is not None and same_range and preview["impact"] != expected_impact:
+                raise catalog.CatalogConflict("导入影响已变化，请重新预览后再确认。")
         writer = write_archive if kind == "archive" else _write_lines if fmt == "sales_lines" else _write_summary
         imported, updated = writer(conn, changed, preview["source_file"])
         if historical_start:
@@ -198,14 +219,22 @@ def confirm_table(token: str, acknowledge=False, historical_start="", historical
                   "style_codes": preview["style_codes"], "issue_count": preview["issue_count"],
                   "stored_quantity": quantity, "stored_amount": round(amount, 2), **gap_report(conn),
                   "sales_policy": policy_summary(conn)}
+        if kind == "sales":
+            after_sales = read_rows(conn)
+            actual_impact = import_impact(before_sales, after_sales, row_kind, rows)
+            if actual_impact != expected_impact:
+                raise catalog.CatalogConflict("实际匹配结果与预览不一致，本次导入已撤销。请核对订单号、款号、颜色和尺码后重新预览。")
+            report["impact"] = actual_impact
+            report["_sales_rows"] = capture_batch(before_sales, after_sales, row_kind, rows)
+            report["_sales_references"] = sorted(row_id(row_kind, row) for row in rows)
         conn.execute("INSERT INTO factory_import_history (id, payload, created_at) VALUES (?, ?, ?)",
                      (token, json.dumps(report, ensure_ascii=False), report["created_at"]))
-    return report
+    return public_report(report)
 
 
 def history() -> list[dict]:
     with catalog._database() as conn:
-        return [json.loads(r[0]) for r in conn.execute("SELECT payload FROM factory_import_history ORDER BY created_at DESC LIMIT 30")]
+        return [public_report(json.loads(r[0])) for r in conn.execute("SELECT payload FROM factory_import_history ORDER BY created_at DESC LIMIT 30")]
 
 
 def _historical_rows(conn, rows, historical_start, historical_end):
@@ -244,10 +273,11 @@ def replan_table(token: str, historical_start="", historical_end="") -> dict:
         if historical_start or historical_end:
             rows = _historical_rows(conn, rows, historical_start, historical_end)
         plan = _plan(conn, "sales", rows, preview["format"])
+        impact = projected_impact(read_rows(conn), plan, "summary", rows, historical_start, historical_end)
     new_token = uuid4().hex
     preview.update(token=new_token, historical_start=historical_start, historical_end=historical_end,
                    counts={action: sum(p["action"] == action for p in plan) for action in ("new", "updated", "unchanged")},
-                   samples=[{**p["row"], "action": p["action"]} for p in plan[:8]])
+                   samples=[{**p["row"], "action": p["action"]} for p in plan[:8]], impact=impact)
     manifest["rows"] = rows
     (_folder() / f"{new_token}.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
     return preview

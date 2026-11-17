@@ -8,11 +8,13 @@ import sys
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
@@ -32,12 +34,14 @@ from src.catalog import (  # noqa: E402
     review_history,
     review_record,
 )
-from src import catalog as catalog_store, import_jobs  # noqa: E402
-from src.extract.office import SUPPORTED_SUFFIXES  # noqa: E402
+from src import catalog as catalog_store, import_jobs, media_deletion  # noqa: E402
+from src.extract.office import IMAGE_SUFFIXES, SUPPORTED_SUFFIXES  # noqa: E402
 from src.index.embeddings import build_index, get_embedding_backend  # noqa: E402
 from src.factory.archive import import_archive  # noqa: E402
+from src.factory.codes import parse_style_code  # noqa: E402
 from src.factory.context import reset_search_blobs  # noqa: E402
 from src.factory.library import (  # noqa: E402
+    FactoryIndex,
     card_fields,
     color_tally,
     detail_fields,
@@ -46,9 +50,12 @@ from src.factory.library import (  # noqa: E402
     imported_at,
     in_group,
     load_index,
+    load_metadata_index,
     matches_factory,
     matches_level2,
+    order_statistics_index,
     prime_search,
+    selected_order_seasons,
     style_activity,
 )
 from src.factory.sales import import_sales  # noqa: E402
@@ -76,9 +83,10 @@ from src.tag.tagger import (  # noqa: E402
     openai_key_is_placeholder,
     provider_ready,
 )
+from src.tag.service_status import check_provider, service_status  # noqa: E402
 from src.images import cover_path, cover_version, image_metadata, image_version, thumbnail_path  # noqa: E402
 from src import storage  # noqa: E402
-from src.db import mysql_config  # noqa: E402
+from src.db import loaded_environment, mysql_config  # noqa: E402
 from src.site_gate import (  # noqa: E402
     COOKIE_NAME,
     LOGIN_FAILURE,
@@ -103,8 +111,30 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="服装内部图片库 API", version="0.4.0", lifespan=lifespan)
+from api.analytics import COOKIE as ANALYTICS_COOKIE, COOKIE_PATH as ANALYTICS_COOKIE_PATH
+from api.analytics import router as analytics_router
 from api.import_workspace import router as import_workspace_router
+from api.import_uploads import router as import_uploads_router
 app.include_router(import_workspace_router)
+app.include_router(import_uploads_router)
+app.include_router(analytics_router)
+
+
+class CatalogCompressionMiddleware:
+    """Compress only gallery JSON; leave original files and image streams untouched."""
+
+    def __init__(self, app):
+        self.app = app
+        self.compressed = GZipMiddleware(app, minimum_size=1000, compresslevel=5)
+
+    async def __call__(self, scope, receive, send):
+        target = self.compressed if (scope["type"] == "http" and scope["path"] in {
+            "/api/catalog", "/api/meta/library",
+        }) else self.app
+        await target(scope, receive, send)
+
+
+app.add_middleware(CatalogCompressionMiddleware)
 # Added first so CORS stays outside and can still label a 401.
 app.add_middleware(SiteGateMiddleware)
 app.add_middleware(
@@ -121,13 +151,20 @@ async def catalog_conflict_handler(_request, exc):
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
-def _serialize(record: ImageRecord, score: float | None = None, index=None) -> dict[str, Any]:
+def _serialize(record: ImageRecord, score: float | None = None, index=None, *,
+               defer_oss_images: bool = False, order_index=None) -> dict[str, Any]:
     payload = record.model_dump()
-    metadata = image_metadata(record.image_path)
     url = f"/api/records/{record.id}/image"
-    version = metadata.pop("version")
-    payload.update(metadata)
     original_cdn = storage.public_url(record.image_path)
+    use_revision = defer_oss_images and storage.is_remote(record.image_path) and not original_cdn
+    if use_revision:
+        # The grid has fixed-size previews. Fetch original metadata only on detail views.
+        version = f"r{record.revision}"
+        payload.update(image_width=None, image_height=None)
+    else:
+        metadata = image_metadata(record.image_path)
+        version = metadata.pop("version")
+        payload.update(metadata)
     payload["image_url"] = f"{original_cdn}?v={version}" if original_cdn else f"{url}?v={version}"
     thumb_cdn = None
     if original_cdn and storage.is_file(record.image_path):
@@ -136,12 +173,21 @@ def _serialize(record: ImageRecord, score: float | None = None, index=None) -> d
         except OSError:
             thumb_cdn = None
     payload["thumbnail_url"] = thumb_cdn or f"{url}?variant=thumbnail&v={version}"
-    payload["cover_url"] = f"{url}?variant=cover&v={cover_version(record)}" if record.cover_crop else payload["thumbnail_url"]
+    if record.cover_crop:
+        cover_token = version if use_revision else cover_version(record)
+        payload["cover_url"] = f"{url}?variant=cover&v={cover_token}"
+    else:
+        payload["cover_url"] = payload["thumbnail_url"]
     payload["download_url"] = f"{url}?download=true&v={version}"
     payload["display_tags"] = record.display_tags.model_dump()
+    payload["tag_overrides"] = record.human_overrides
+    payload["manually_edited"] = bool(record.human_overrides)
+    payload["entry_ready"] = record.ready
     factory = index if index is not None else load_index()
-    payload.update(card_fields(record, factory))
-    if record.pending_image_path and storage.is_file(record.pending_image_path):
+    payload.update(card_fields(record, factory, order_index=order_index))
+    if use_revision and record.pending_image_path:
+        payload["pending_image_url"] = f"{url}?variant=pending&v={version}"
+    elif record.pending_image_path and storage.is_file(record.pending_image_path):
         pending_cdn = storage.public_url(record.pending_image_path)
         pending_version = image_version(record.pending_image_path)
         payload["pending_image_url"] = (
@@ -168,11 +214,16 @@ def _factory_filters(
     needle: str | None = None,
     customer: str | None = None,
     archive_season: str | None = None,
+    order_season: list[str] | None = Query(default=None),
     ordered_from: str | None = None,
     ordered_to: str | None = None,
-) -> dict[str, str | None]:
+) -> dict[str, Any]:
+    seasons = selected_order_seasons(order_season)
+    legacy_seasons = selected_order_seasons(archive_season)
+    if seasons and legacy_seasons and set(seasons) != set(legacy_seasons):
+        raise HTTPException(status_code=422, detail="订单季节筛选冲突，请重新选择。")
     return dict(color_family=color_family, size=size, series=series, needle=needle,
-                customer=customer, archive_season=archive_season,
+                customer=customer, archive_season=archive_season, order_season=seasons,
                 ordered_from=ordered_from, ordered_to=ordered_to)
 
 
@@ -289,6 +340,7 @@ def login(body: LoginBody, request: Request, response: Response) -> dict[str, bo
 @app.post("/api/logout")
 def logout(request: Request, response: Response) -> dict[str, bool]:
     _clear_session_cookie(response, request)
+    response.delete_cookie(ANALYTICS_COOKIE, path=ANALYTICS_COOKIE_PATH, httponly=True, samesite="strict")
     return {"ok": True}
 
 
@@ -325,6 +377,16 @@ def health() -> dict[str, Any]:
     }
 
 
+@app.get("/api/services/ai")
+def ai_service_status() -> dict[str, Any]:
+    return service_status()
+
+
+@app.post("/api/services/ai/{provider}/check")
+def ai_service_check(provider: Literal["openai", "deepseek"]) -> dict[str, Any]:
+    return check_provider(provider)
+
+
 @app.get("/api/meta/filters")
 def meta_filters() -> dict[str, Any]:
     from src.taxonomy import FABRICS, SLEEVE_LENGTHS, active
@@ -338,7 +400,7 @@ def meta_filters() -> dict[str, Any]:
 
 @app.get("/api/meta/library")
 def library_meta() -> dict[str, Any]:
-    index = load_index()
+    index = load_metadata_index()
     return {
         "source_categories": list(SOURCE_CATEGORIES),
         "unclassified": UNCLASSIFIED_SOURCE,
@@ -349,55 +411,83 @@ def library_meta() -> dict[str, Any]:
 
 @app.get("/api/catalog")
 def catalog(
+    response: Response,
     filters: dict = Depends(tag_filters),
     factory_filters: dict = Depends(_factory_filters),
     group: str | None = None,
     exclude_samples: bool = True,
     q: str | None = None,
     review_status: Literal["pending", "approved"] | None = None,
+    tag_origin: Literal["ai", "manual"] | None = None,
+    batch: str | None = None,
     source_category: str | None = None,
     sort: str | None = None,
 ) -> dict[str, Any]:
-    index = load_index()
-    token = prime_search(index)
-    try:
-        records = library_records(load_catalog())
-        if exclude_samples:
-            records = [r for r in records if r.source.source_type != "sample"]
-        if review_status:
-            records = [r for r in records if r.review_status == review_status]
-        basis_filters, basis_factory = _without_color(filters, factory_filters, source_category)
-        basis = _narrow(records, filters=basis_filters, group=group, q=q, source_category=source_category,
-                        factory_filters=basis_factory, index=index)
-        counts = color_tally(basis, index, source_category)
-        records = _narrow(records, filters=filters, group=group, q=q, source_category=source_category,
-                          factory_filters=factory_filters, index=index)
-        if sort == "sales":
-            records.sort(key=lambda record: (
-                -(index.sales_totals(record.style_code)[0] if record.source_category == "本厂产品" else 0),
-                record.style_code, record.id,
-            ))
-        elif sort == "amount":
-            records.sort(key=lambda record: (
-                -(index.sales_totals(record.style_code)[1] if record.source_category == "本厂产品" else 0),
-                record.style_code, record.id,
-            ))
-        elif sort == "ordered":
-            records.sort(key=lambda record: (
-                style_activity(index, record.style_code)["last_order_date"] if record.source_category == "本厂产品" else "",
-                record.style_code, record.id,
-            ), reverse=True)
-        elif sort == "replenishment":
-            records.sort(key=lambda record: (
-                -(style_activity(index, record.style_code)["replenishment_count"] if record.source_category == "本厂产品" else 0),
-                record.style_code, record.id,
-            ))
-        elif sort == "imported":
-            records.sort(key=lambda record: (imported_at(record), record.id), reverse=True)
-        return {"count": len(records), "items": [_serialize(record, index=index) for record in records],
-                "color_counts": counts}
-    finally:
-        reset_search_blobs(token)
+    with loaded_environment():
+        started = perf_counter()
+        with catalog_store._database() as conn:
+            connected = perf_counter()
+            records = load_catalog(conn=conn)
+            if source_category and source_category != "全部":
+                records = [record for record in records if record.source_category == source_category]
+            loaded = perf_counter()
+            # A reference image with a style code can still use archive search text.
+            # Keep that behavior; only skip the archive when no candidate has a code.
+            index = load_index(conn=conn, include_facets=False) if any(record.style_code for record in records) else FactoryIndex()
+            indexed = perf_counter()
+        token = prime_search(index)
+        try:
+            records = library_records(records)
+            if exclude_samples:
+                records = [r for r in records if r.source.source_type != "sample"]
+            if review_status:
+                records = [r for r in records if r.review_status == review_status]
+            if tag_origin:
+                records = [r for r in records if bool(r.human_overrides) == (tag_origin == "manual")]
+            if batch:
+                records = [r for r in records if r.source.batch_id == batch]
+            basis_filters, basis_factory = _without_color(filters, factory_filters, source_category)
+            basis = _narrow(records, filters=basis_filters, group=group, q=q, source_category=source_category,
+                            factory_filters=basis_factory, index=index)
+            counts = color_tally(basis, index, source_category)
+            records = _narrow(records, filters=filters, group=group, q=q, source_category=source_category,
+                              factory_filters=factory_filters, index=index)
+            statistics = order_statistics_index(index, **factory_filters)
+            if sort == "sales":
+                records.sort(key=lambda record: (
+                    -(statistics.sales_totals(record.style_code)[0] if record.source_category == "本厂产品" else 0),
+                    record.style_code, record.id,
+                ))
+            elif sort == "amount":
+                records.sort(key=lambda record: (
+                    -(statistics.sales_totals(record.style_code)[1] if record.source_category == "本厂产品" else 0),
+                    record.style_code, record.id,
+                ))
+            elif sort == "ordered":
+                records.sort(key=lambda record: (
+                    style_activity(statistics, record.style_code)["last_order_date"] if record.source_category == "本厂产品" else "",
+                    record.style_code, record.id,
+                ), reverse=True)
+            elif sort == "replenishment":
+                records.sort(key=lambda record: (
+                    -(style_activity(statistics, record.style_code)["replenishment_count"] if record.source_category == "本厂产品" else 0),
+                    record.style_code, record.id,
+                ))
+            elif sort == "imported":
+                records.sort(key=lambda record: (imported_at(record), record.id), reverse=True)
+            filtered = perf_counter()
+            items = [_serialize(record, index=index, defer_oss_images=True, order_index=statistics) for record in records]
+            serialized = perf_counter()
+            response.headers["Server-Timing"] = ", ".join(
+                f"{name};dur={(end - begin) * 1000:.2f}" for name, begin, end in (
+                    ("db_setup", started, connected), ("records", connected, loaded),
+                    ("factory", loaded, indexed), ("filter", indexed, filtered),
+                    ("serialize", filtered, serialized), ("catalog", started, serialized),
+                )
+            )
+            return {"count": len(records), "items": items, "color_counts": counts}
+        finally:
+            reset_search_blobs(token)
 
 
 @app.get("/api/search/text")
@@ -467,14 +557,24 @@ def search_image(
 
 @app.get("/api/import/jobs")
 def import_job_list():
-    return {"items": [import_jobs.public_job(job) for job in import_jobs.list_jobs()]}
+    items = [import_jobs.public_job(job) for job in import_jobs.list_jobs(include_active=True)]
+    active = [job for job in items if job['status'] in import_jobs.ACTIVE]
+    return {"items": items, "queue": {
+        "concurrency": import_jobs.AI_CONCURRENCY,
+        "running": sum(job['running'] for job in active),
+        "pending": sum(job['pending'] for job in active),
+        "batches": len(active),
+        "preparing": sum(job['status'] in {'queued', 'extracting'} for job in active),
+        "processed": sum(job['processed'] for job in active),
+        "total": sum(job['total'] for job in active),
+    }}
 
 
 def _safe_relative(filename: str) -> str:
     raw = (filename or "upload.bin").replace("\\", "/")
-    parts = [part for part in Path(raw).parts if part not in {"", ".", ".."}]
-    if not parts:
-        raise HTTPException(status_code=422, detail="文件名无效")
+    parts = raw.split("/")
+    if raw.startswith("/") or any(part in {"", ".", ".."} or ":" in part or "\x00" in part for part in parts):
+        raise HTTPException(status_code=422, detail="文件路径无效，请使用文件名或文件夹内的相对路径上传")
     return "/".join(parts)
 
 
@@ -483,6 +583,7 @@ def start_import_job(
     files: list[UploadFile] = File(...),
     backend: Literal["openai", "mock", "deepseek", "deferred"] = "openai",
     source_categories: list[str] | None = Form(default=None),
+    style_codes: list[str] | None = Form(default=None),
 ):
     if backend == "openai" and not has_openai_key():
         raise HTTPException(status_code=400, detail="请先在本地配置 OPENAI_API_KEY")
@@ -504,17 +605,36 @@ def start_import_job(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
     else:
         categories = [UNCLASSIFIED_SOURCE] * len(files)
+    codes = [""] * len(files)
+    if style_codes is not None:
+        if len(style_codes) != len(files):
+            raise HTTPException(422, "每张图片都要有对应的关联款号")
+        for index, (name, category, code) in enumerate(zip(names, categories, style_codes)):
+            if category != "本厂产品" or Path(name).suffix.lower() not in IMAGE_SUFFIXES:
+                continue
+            parsed = parse_style_code(code)
+            if not parsed or parsed.suffix:
+                raise HTTPException(422, "请填写有效的关联款号，例如 516083 或 581188*6")
+            codes[index] = parsed.base
     job_id = uuid4().hex
     folder = catalog_store.RAW_DIR / "batches" / job_id
     folder.mkdir(parents=True, exist_ok=True)
     paths = []
     for upload, name in zip(files, names):
-        dest = folder / name
+        if "*" in name:
+            # Retain the display name while storing a Windows-compatible file.
+            dest = Path(tempfile.mkdtemp(dir=folder)) / ("upload" + Path(name).suffix)
+        else:
+            dest = folder / name
+        dest = dest.resolve()
+        if not dest.is_relative_to(folder.resolve()):
+            raise HTTPException(status_code=422, detail="文件路径超出本批上传目录")
         dest.parent.mkdir(parents=True, exist_ok=True)
         with dest.open("wb") as out:
             shutil.copyfileobj(upload.file, out)
         paths.append(dest)
-    job = import_jobs.create_import(paths, backend, job_id, source_categories=categories, display_names=names)
+    job = import_jobs.create_import(paths, backend, job_id, source_categories=categories,
+                                    display_names=names, style_codes=codes)
     import_jobs.submit_job(job_id)
     return import_jobs.public_job(job)
 
@@ -573,13 +693,45 @@ def import_job_detail(job_id: str):
 
 
 @app.post("/api/import/jobs/{job_id}/retry", status_code=202)
-def retry_import_job(job_id: str):
+def retry_import_job(job_id: str, backend: Literal["openai", "deepseek", "mock"] | None = None):
+    if backend in {"openai", "deepseek"} and not provider_ready(backend):
+        raise HTTPException(status_code=400, detail="请先配置所选 AI 服务的有效密钥")
     try:
-        job = import_jobs.retry_job(job_id)
+        job = import_jobs.retry_job(job_id, backend=backend)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="任务不存在") from exc
     import_jobs.submit_job(job_id)
     return import_jobs.public_job(job)
+
+
+@app.get("/api/import/jobs/{job_id}/files/{file_index}")
+def preview_import_file_deletion(job_id: str, file_index: int):
+    try:
+        return media_deletion.preview_source(job_id, file_index)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="未找到导入文件") from exc
+
+
+@app.delete("/api/import/jobs/{job_id}/files/{file_index}")
+def delete_import_file(job_id: str, file_index: int, expected_count: int = Query(ge=0), expected_source: bool = Query()):
+    try:
+        return media_deletion.delete_source(job_id, file_index, expected_count, expected_source)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="未找到导入文件") from exc
+
+
+class ImageDeletion(BaseModel):
+    ids: list[str] = Field(min_length=1)
+
+
+@app.post("/api/records/bulk-delete")
+def delete_gallery_images(body: ImageDeletion):
+    return media_deletion.delete_images(body.ids)
+
+
+@app.post("/api/media/deletions/retry")
+def retry_media_cleanup():
+    return {"cleanup_pending": media_deletion.retry_cleanup()}
 
 
 @app.get("/api/reviews")
@@ -620,6 +772,27 @@ def review_queue(
     start = (page - 1) * page_size
     return {"count": len(selected), "counts": counts, "page": page, "facets": facets,
             "items": [_serialize(r) for r in selected[start:start + page_size]]}
+
+
+class TagEdits(BaseModel):
+    model_config = {"extra": "forbid"}
+    expected_revision: int = Field(ge=1)
+    changes: dict[str, str | list[str]] = Field(default_factory=dict)
+    reset_fields: list[str] = Field(default_factory=list, max_length=12)
+    note: str = Field(default="", max_length=2000)
+
+
+@app.patch("/api/records/{record_id}/tags")
+def edit_tags(record_id: str, body: TagEdits) -> dict[str, Any]:
+    try:
+        record = catalog_store.update_tags(record_id, **body.model_dump())
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="记录不存在") from exc
+    except CatalogConflict:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _serialize(record)
 
 
 class ReviewDecision(BaseModel):
@@ -665,9 +838,11 @@ def rebuild_index() -> dict[str, Any]:
 def record_image(record_id: str, download: bool = False,
                  variant: Literal["original", "thumbnail", "cover", "pending", "history"] = "original",
                  index: int = 0, v: str | None = None):
-    record = get_by_id(load_catalog(), record_id)
-    if record is None:
+    with catalog_store._database() as conn:
+        row = conn.execute("SELECT payload FROM records WHERE id=?", (record_id,)).fetchone()
+    if row is None:
         raise HTTPException(status_code=404, detail="图片不存在")
+    record = ImageRecord.model_validate_json(row[0])
     if variant == "pending":
         pending = record.pending_image_path or ""
         if not storage.is_file(pending):
@@ -682,13 +857,20 @@ def record_image(record_id: str, download: bool = False,
         return FileResponse(storage.local_file(stored), headers={"Cache-Control": "no-cache"})
     if not storage.is_file(record.image_path):
         raise HTTPException(status_code=404, detail="图片不存在")
-    original = storage.local_file(record.image_path)
     if variant == "cover" and not download:
         path = cover_path(record)
+    elif variant == "thumbnail" and not download:
+        path = thumbnail_path(record.id, record.image_path)
     else:
-        path = thumbnail_path(record.id, record.image_path) if variant == "thumbnail" and not download else original
-    expected_version = cover_version(record) if variant == "cover" and not download else image_version(record.image_path)
-    cache = "private, max-age=31536000, immutable" if v == expected_version else "no-cache"
+        path = storage.local_file(record.image_path)
+    cache = "no-cache"
+    if v == f"r{record.revision}":
+        # A revision tracks edits through the app. Recheck OSS after a short cache period.
+        cache = "private, max-age=300"
+    elif v:
+        expected_version = cover_version(record) if variant == "cover" and not download else image_version(record.image_path)
+        if v == expected_version:
+            cache = "private, max-age=31536000, immutable"
     return FileResponse(
         path, filename=storage.file_name(record.image_path) if download else None, headers={"Cache-Control": cache},
     )
@@ -805,12 +987,16 @@ def source_document(record_id: str):
 
 
 @app.get("/api/records/{record_id}/similar")
-def similar_records(record_id: str, include_pending: bool = False):
+def similar_records(record_id: str, include_pending: bool = False, source_category: str | None = None,
+                    filters: dict = Depends(tag_filters), factory_filters: dict = Depends(_factory_filters)):
     records = load_catalog()
     record = get_by_id(records, record_id)
-    if record is None or not storage.is_file(record.image_path):
+    if record is None or not record.ready or not storage.is_file(record.image_path):
         raise HTTPException(status_code=404, detail="款式图片不存在")
+    index = load_index()
+    candidates = [r for r in records if r.id != record_id and r.source.source_type != "sample"]
+    filtered = _narrow(candidates, filters=filters, group=None, q=None, source_category=source_category,
+                       factory_filters=factory_filters, index=index)
     hits = search_by_image(records, record.image_path, top_k=24,
-                           filtered=[r for r in records if r.id != record_id and r.source.source_type != "sample"],
-                           include_pending=include_pending)
-    return {"count": len(hits), "items": [_serialize(r, score) for r, score in hits]}
+                           filtered=filtered, include_pending=include_pending, reference=record)
+    return {"count": len(hits), "items": [_serialize(r, score, index) for r, score in hits]}

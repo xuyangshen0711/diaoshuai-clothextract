@@ -1,4 +1,14 @@
 /* The import workbench follows the existing ivory / ink / brass library palette. */
+.upload-advice { margin: 16px 0; padding: 14px 18px; border: 1px solid var(--line); border-radius: 5px; background: var(--panel); }
+.upload-advice.warning { background: #fff6e8; border-color: #c4a56d; color: #704716; }
+.upload-advice p:last-child, .upload-progress p:last-child { margin-bottom: 0; }
+.upload-progress progress { display: block; width: 100%; height: 8px; accent-color: #9b8054; }
+.current-upload { overflow-wrap: anywhere; }
+.sales-import-impact { margin: 20px 0; padding: 18px 20px; background: #f8f4ec; border: 1px solid var(--line); border-radius: 6px; }
+.impact-values { display: flex; flex-wrap: wrap; gap: 12px 36px; }
+.impact-values span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+.impact-values strong { font-size: 20px; font-weight: 600; overflow-wrap: anywhere; }
+.sales-import-impact details { font-size: 13px; }
 .import-workspace { max-width: 1180px; margin: 0 auto; padding: 38px 28px 72px; font-size: 14px; }
 .import-workspace h2 { font-family: var(--font); font-size: 28px; margin: 0 0 8px; letter-spacing: .02em; }
 .import-workspace h3 { font-family: var(--font); font-size: 18px; margin: 0; }
@@ -94,7 +104,13 @@
 .workspace-table caption { text-align: left; padding: 0 0 12px; color: var(--muted); font-size: 12px; }
 .workspace-table th:first-child, .workspace-table td:first-child { padding-left: 10px; }
 .import-workspace .issue-details { color: #914517; margin: 18px 0; font-size: 13px; }
+.issue-details summary { cursor: pointer; }
+.issue-list { max-height: 320px; overflow-y: auto; overscroll-behavior: contain; border: 1px solid var(--line); border-radius: 5px; padding: 0 14px; }
+.issue-list ul { margin: 12px 0; padding-left: 20px; }
 .issue-details li { margin: 8px 0; }
+.issue-list li { overflow-wrap: anywhere; line-height: 1.7; }
+.issue-pagination { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
+.issue-page-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
 .import-success { border: 1px solid #c3d1c1; background: #f1f6ee; padding: 20px; margin-top: 24px; border-radius: 5px; }
 .table-history-section, .workspace-jobs { margin-top: 35px; }
 .section-heading { padding-bottom: 16px; border-bottom: 1px solid #cec2ae; }
@@ -145,3 +161,15 @@
   .summary-policy { padding: 15px; }
 }
 @media (prefers-reduced-motion: reduce) { .import-workspace * { scroll-behavior: auto !important; } }
+.job-source-files { margin-top: 12px; }
+.job-source-files ul { margin: 8px 0 0; padding: 0; list-style: none; }
+.job-source-files li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--divider);
+  overflow-wrap: anywhere;
+}

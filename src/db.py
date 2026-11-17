@@ -9,19 +9,35 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
+_environment_loaded: ContextVar[bool] = ContextVar("environment_loaded", default=False)
 
 
 def _load_env() -> None:
+    if _environment_loaded.get():
+        return
     try:
         from dotenv import load_dotenv
 
         load_dotenv(ROOT / ".env")
     except Exception:
         return
+
+
+@contextmanager
+def loaded_environment():
+    """Load .env once within this request; later requests still reload it."""
+    _load_env()
+    token = _environment_loaded.set(True)
+    try:
+        yield
+    finally:
+        _environment_loaded.reset(token)
 
 
 def parse_database_url(url: str) -> dict:
@@ -224,8 +240,13 @@ class MySQLConnection:
     def in_transaction(self) -> bool:
         return self._in_txn
 
-    def begin(self) -> None:
-        self._conn.begin()
+    def begin(self, *, read_only: bool = False) -> None:
+        if read_only:
+            with self._conn.cursor() as cursor:
+                cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                cursor.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
+        else:
+            self._conn.begin()
         self._in_txn = True
 
     def commit(self) -> None:
@@ -333,6 +354,10 @@ CREATE TABLE IF NOT EXISTS review_events (
 CREATE TABLE IF NOT EXISTS migrations (
     name VARCHAR(128) NOT NULL,
     PRIMARY KEY (name)
+) {TABLE_OPTIONS};
+CREATE TABLE IF NOT EXISTS media_cleanup (
+    id CHAR(64) PRIMARY KEY,
+    payload TEXT NOT NULL
 ) {TABLE_OPTIONS};
 """
 

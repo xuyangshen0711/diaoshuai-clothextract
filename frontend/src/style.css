@@ -472,6 +472,9 @@ a {
   margin: 14px 0;
 }
 
+.btn.media-delete { color: #9a403a; border-color: #d8b4ac; }
+.btn.media-delete:not(:disabled):hover { background: #fbefeb; }
+
 .btn {
   border: 1px solid var(--line);
   background: var(--surface);

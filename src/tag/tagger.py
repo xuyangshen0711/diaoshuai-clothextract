@@ -82,7 +82,7 @@ class MockTagger:
         description = (
             f"{fit}{neckline}{color}{category}，{style}感"
             if category != "其他"
-            else f"{color}女装款式（待人工确认）"
+            else f"{color}女装款式（模拟分类）"
         )
         return FashionTags(
             品类=category,
@@ -113,30 +113,29 @@ def get_tagger(backend: str | None = None):
 
 
 def apply_suggestion(record: ImageRecord, suggestion: FashionTags, backend_name: str) -> None:
+    from src.tag.openai_tagger import validate_suggestion
+
+    validate_suggestion(suggestion)
     phrase = getattr(suggestion, "_category_phrase", "")
     normalized = suggestion.normalized()
     phrase = phrase or getattr(normalized, "_category_phrase", "")
+    # Freeze old overrides before replacing the AI snapshot (legacy records too).
+    record.tag_overrides = dict(record.human_overrides)
     record.ai_tags = normalized.model_copy(deep=True)
     record.ai_tags_source = backend_name
-    record.proposed_tags = normalized.model_copy(deep=True)
-    record.review_status = "pending"
-    # Keep the last human classification even when explicitly re-tagging all.
-    if record.reviewed_at is None and not record.manually_edited:
-        record.tags = normalized.model_copy(deep=True)
-        record.tags_source = backend_name
+    record.proposed_tags = None
+    # A previously rejected record stays excluded until explicitly restored.
+    if record.review_status != "rejected":
+        record.review_status = "approved"
+    record.sync_effective_tags()
     if phrase:
         record.category_raw = phrase
-    if normalized.袖长:
-        record.sleeve_length = normalized.袖长
-    if normalized.面料:
-        record.fabric = normalized.面料
     record.touch()
 
 
 def needs_tagging(record: ImageRecord, overwrite: bool = False) -> bool:
-    # Without overwrite, only fill untagged / mock placeholders still awaiting review.
-    return overwrite or (not record.manually_edited and record.review_status == "pending"
-                         and record.tags_source in {"untagged", "mock", "deferred"})
+    return record.review_status != "rejected" and (overwrite or not record.has_ai_suggestion
+                                                   or record.ai_tags_source == "mock")
 
 
 def tag_records(records: list[ImageRecord], backend: str | None = None, overwrite: bool = False) -> list[ImageRecord]:

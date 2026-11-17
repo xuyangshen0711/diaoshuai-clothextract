@@ -11,7 +11,8 @@ import {
 } from '../api'
 import ReferenceRecordSummary from '../components/ReferenceRecordSummary.vue'
 import RecordExtras from '../components/RecordExtras.vue'
-import { referenceTitle } from '../utils/recordPresentation'
+import TagEditor from '../components/TagEditor.vue'
+import { orderedSizeLabels, referenceTitle, tagStatus } from '../utils/recordPresentation'
 import SalesAnalysis from '../components/SalesAnalysis.vue'
 import CoverEditor from '../components/CoverEditor.vue'
 import {
@@ -32,7 +33,18 @@ const libraryMeta = ref<LibraryMeta>({
   unclassified: '未分类',
   factory: {},
 })
-const labels = { pending: '待审核', approved: '已审核', rejected: '已驳回' }
+const editingTags = ref(false)
+const editMessage = ref('')
+function tagsSaved(updated: CatalogItem) {
+  item.value = { ...item.value, ...updated }; editMessage.value = '标签已保存，筛选与搜索已更新。'
+}
+watch(() => [item.value?.id, route.query.edit], () => {
+  if (item.value && route.query.edit === 'tags') editingTags.value = true
+})
+function closeTags() {
+  editingTags.value = false
+  if (route.query.edit) void router.replace({ query: { ...route.query, edit: undefined } })
+}
 const back = computed(() => {
   const path = typeof route.query.from === 'string' ? route.query.from : '/'
   return path.startsWith('/') && !path.startsWith('//') && !path.startsWith('/records/')
@@ -50,12 +62,8 @@ const unique = (values: (string | undefined)[]) => {
   for (const value of values) if (value && !seen.includes(value)) seen.push(value)
   return seen
 }
-const seasons = computed(() =>
-  unique([
-    ...(item.value?.variants || []).map((row) => row.season),
-    ...(item.value?.seasons || []),
-  ]),
-)
+const orderSeasons = computed(() => unique(item.value?.order_seasons || []))
+const archiveSeasons = computed(() => unique(item.value?.archive_seasons || []))
 const needles = computed(() => unique((item.value?.variants || []).map((row) => row.needle)))
 const materials = computed(() => unique((item.value?.variants || []).map((row) => row.material)))
 const seriesNames = computed(() => unique((item.value?.variants || []).map((row) => row.series)))
@@ -92,15 +100,11 @@ function unitText(value?: number) {
   if (!value) return '—'
   return value.toLocaleString('zh-CN', { maximumFractionDigits: 2 })
 }
-const sizeLabels = computed(() => {
-  const labels: string[] = []
-  for (const variant of item.value?.variants || []) {
-    for (const size of variant.sizes) if (!labels.includes(size.label)) labels.push(size.label)
-  }
-  return labels
-})
+const sizeLabels = computed(() => orderedSizeLabels(
+  (item.value?.variants || []).flatMap((variant) => variant.sizes.map((size) => size.label)),
+))
 const tabs = [
-  { key: 'sales', label: '销售分析' },
+  { key: 'sales', label: '订单分析' },
   { key: 'versions', label: '客户版本' },
   { key: 'orders', label: '订单明细' },
   { key: 'archive', label: '款式档案' },
@@ -137,8 +141,9 @@ watch([orderQuery, orderKind], () => {
   orderPage.value = 1
 })
 const productName = computed(() => item.value && !ownFactory.value ? referenceTitle(item.value) :
-  subcategories.value[0] || item.value?.library_category || tags.value?.品类 || '款式详情')
+  (Object.hasOwn(item.value?.tag_overrides || {}, '品类') ? item.value?.library_category : subcategories.value[0]) || item.value?.library_category || tags.value?.品类 || '款式详情')
 const summaryColors = computed(() => {
+  if (Object.hasOwn(item.value?.tag_overrides || {}, '颜色主色调')) return tags.value?.颜色主色调 ? [{ name: tags.value.颜色主色调, family: tags.value.颜色主色调 }] : []
   const result = new Map<string, string>()
   for (const variant of item.value?.variants || [])
     for (const color of variant.colors) result.set(color.name, color.family)
@@ -181,6 +186,7 @@ watch(
     loading.value = true
     error.value = ''
     item.value = null
+    editingTags.value = false; editMessage.value = ''
     categoryMessage.value = ''
     orderQuery.value = ''
     orderKind.value = '全部'
@@ -228,7 +234,7 @@ async function changeCategory(event: Event) {
     <nav v-if="!ownFactory && neighborIds.length > 1" class="record-neighbors" aria-label="同批资料浏览"><button type="button" aria-label="同批资料，上一款" :disabled="neighborPosition <= 0" @click="navigateNeighbor(-1)"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m12 4-6 6 6 6" /></svg></button><button type="button" aria-label="同批资料，下一款" :disabled="neighborPosition < 0 || neighborPosition >= neighborIds.length - 1" @click="navigateNeighbor(1)"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m8 4 6 6-6 6" /></svg></button></nav>
     </div>
     <p v-if="error" class="error" role="alert">{{ error }}</p>
-    <ReferenceRecordSummary v-if="!ownFactory" :key="item.id" :item="item" :category-choices="categoryChoices" @updated="item = $event" @image="imageDialog?.showModal()" @tags="extrasPanel?.showTags()" />
+    <ReferenceRecordSummary v-if="!ownFactory" :key="item.id" :item="item" :category-choices="categoryChoices" @updated="item = $event" @image="imageDialog?.showModal()" @tags="extrasPanel?.showTags()" @edit="editingTags = true" />
     <section v-else class="product-summary" aria-label="款式概览">
       <div class="product-preview">
         <button
@@ -249,7 +255,7 @@ async function changeCategory(event: Event) {
           ><button type="button" @click="imageDialog?.showModal()">点击查看完整图片</button>
         </div>
         <p v-if="item.has_pending_image" class="preview-notice">
-          有新图片待审核，通过后替换当前原图。
+          新图片正在识别，成功后替换当前原图并保留人工标签。
         </p>
         <p
           v-if="
@@ -270,13 +276,13 @@ async function changeCategory(event: Event) {
             >{{ productName }}
           </h1>
           <span class="review-badge" :class="item.review_status">{{
-            labels[item.review_status]
+            tagStatus(item)
           }}</span>
         </div>
         <p class="product-subtitle">
           {{
             [
-              ownFactory ? seasons.join(' / ') : tags.季节,
+              ownFactory ? (orderSeasons.length ? `订单季节：${orderSeasons.join(' / ')}` : '订单季节未提供') : tags.季节,
               item.fabric,
               item.sleeve_length,
               item.source_category,
@@ -285,13 +291,13 @@ async function changeCategory(event: Event) {
               .join(' · ')
           }}
         </p>
-        <dl v-if="ownFactory && item.sales" class="product-metrics" aria-label="累计销售指标">
+        <dl v-if="ownFactory && item.sales" class="product-metrics" aria-label="累计订单指标">
           <div>
-            <dt>累计件数</dt>
+            <dt>累计订单件数</dt>
             <dd>{{ money(item.sales.total_quantity) }}<small> 件</small></dd>
           </div>
           <div>
-            <dt>累计金额</dt>
+            <dt>累计订单金额</dt>
             <dd><small>¥</small>{{ money(item.sales.total_amount) }}</dd>
           </div>
           <div>
@@ -304,12 +310,15 @@ async function changeCategory(event: Event) {
           </div>
         </dl>
         <p v-else-if="ownFactory" class="product-no-sales">
-          这款还没有销量数据，导入销量表后可查看销售分析。
+          这款还没有订单数据，导入订单表后可查看订单分析。
         </p>
         <p v-else class="product-description">
           {{ visibleDescription(tags.一句话描述, item.review_status) || '暂无款式描述' }}
         </p>
+        <p v-if="ownFactory" class="meta">本页统计该款全部订单季节和下单时间的累计数据，含补单及已计入的历史汇总，不代表已发货或已回款；图库的季节筛选不带入本页。</p>
         <dl v-if="ownFactory" class="product-specs">
+          <div v-if="archiveSeasons.length"><dt>档案季节</dt><dd>{{ archiveSeasons.join('、') }}</dd></div>
+          <div v-if="tags.季节"><dt>适穿季节</dt><dd>{{ tags.季节 }}（{{ Object.hasOwn(item.tag_overrides || {}, '季节') ? '人工标签' : 'AI 建议' }}）</dd></div>
           <div v-if="summaryColors.length" class="summary-colors">
             <dt>颜色</dt>
             <dd>
@@ -339,10 +348,7 @@ async function changeCategory(event: Event) {
         <div class="product-actions">
           <CoverEditor :item="item" @updated="item = $event" />
           <RouterLink :to="{ name: 'search', query: { record: item.id } }">找相似款</RouterLink
-          ><RouterLink
-            :to="{ path: '/review', query: { status: item.review_status, selected: item.id } }"
-            >{{ item.review_status === 'pending' ? '审核此款' : '查看审核结果' }}</RouterLink
-          ><a :href="item.download_url || item.image_url" download>下载原图</a>
+          ><button class="btn" type="button" :disabled="!item.entry_ready" @click="editingTags = true">修改标签</button><a :href="item.download_url || item.image_url" download>下载原图</a>
         </div>
       </div>
     </section>
@@ -367,7 +373,7 @@ async function changeCategory(event: Event) {
             ><span v-if="tab.key === 'orders'">{{ item.sales?.orders?.length || 0 }}</span>
           </button>
         </div>
-        <span v-if="activeTab === 'sales'" class="analysis-scope">累计销售 · 按件数分析</span>
+        <span v-if="activeTab === 'sales'" class="analysis-scope">累计订单 · 按件数分析</span>
       </div>
       <section
         v-show="activeTab === 'sales'"
@@ -377,11 +383,11 @@ async function changeCategory(event: Event) {
         aria-labelledby="record-tab-sales"
         tabindex="0"
       >
-        <h2 class="visually-hidden">销售分析</h2>
+        <h2 class="visually-hidden">订单分析</h2>
         <SalesAnalysis v-if="item.sales" :sales="item.sales" @orders="selectTab('orders')" />
         <div v-else class="record-empty">
-          <h2>还没有这款的销量数据</h2>
-          <p>上传销量表，查看月度走势、颜色占比和客户排名。</p>
+          <h2>还没有这款的订单数据</h2>
+          <p>上传订单表，查看月度走势、颜色占比和客户排名。</p>
           <RouterLink class="btn" to="/import">前往导入</RouterLink>
         </div>
       </section>
@@ -403,7 +409,7 @@ async function changeCategory(event: Event) {
         <div v-else class="record-table-scroll" tabindex="0" aria-label="客户版本表，可横向滚动">
           <table class="archive-table variants-table">
             <caption class="visually-hidden">
-              该款式的客户版本及累计销量
+              该款式的客户版本及累计订单件数
             </caption>
             <thead>
               <tr>
@@ -470,7 +476,7 @@ async function changeCategory(event: Event) {
                         <dd>{{ variant.customer_style_code || '—' }}</dd>
                       </div>
                       <div>
-                        <dt>季节</dt>
+                        <dt>档案季节</dt>
                         <dd>{{ variant.season || '—' }}</dd>
                       </div>
                       <div>
@@ -586,7 +592,7 @@ async function changeCategory(event: Event) {
           {{
             item.sales?.orders?.length
               ? '没有符合筛选的订单，试试其他关键词或分类。'
-              : '暂无订单明细，可在导入页上传销量表。'
+              : '暂无订单明细，可在导入页上传订单表。'
           }}
         </p>
         <div v-if="visibleOrders.length" class="order-pagination">
@@ -641,14 +647,14 @@ async function changeCategory(event: Event) {
           </div>
         </dl>
         <p v-if="item.library_category" class="meta">
-          图库按固定品类显示为「{{ item.library_category }}」，原始档案品类保留，AI 分类仅作参考。
+          图库按固定品类显示为「{{ item.library_category }}」，原始档案品类保留；人工修改的标签优先用于图库和检索。
         </p>
       </details>
       <details v-if="ownFactory" class="detail-fold" open>
         <summary>来源与操作</summary>
-        <p v-if="item.tags_source === 'deferred' && item.review_status === 'pending'" class="meta">图片已保存，尚未自动分类。可在导入页继续本批分类，或直接人工审核。</p>
+        <p v-if="item.tags_source === 'deferred' && item.review_status === 'pending'" class="meta">图片已保存，尚未自动分类。可在导入页继续本批分类，获得有效 AI 建议后自动入库。</p>
         <p v-else-if="item.review_status === 'pending'" class="meta">
-          当前分类已在主页展示，尚待人工审核确认。搜索时可选择是否包含未审核图片。
+          尚未取得有效 AI 建议，请在导入任务中继续识别。
         </p>
         <p v-else-if="item.review_status === 'rejected'" class="meta">
           此图片已驳回，不在主页或搜索结果中展示。
@@ -711,15 +717,13 @@ async function changeCategory(event: Event) {
           <RouterLink class="btn" :to="{ name: 'search', query: { record: item.id } }"
             >找相似款</RouterLink
           >
-          <RouterLink
-            class="btn"
-            :to="{ path: '/review', query: { status: item.review_status, selected: item.id } }"
-            >{{ item.review_status === 'pending' ? '前往审核此款' : '查看审核结果' }}</RouterLink
-          >
+          <button class="btn" type="button" :disabled="!item.entry_ready" @click="editingTags = true">修改标签</button>
         </div>
       </details>
-      <RecordExtras ref="extrasPanel" :key="item.id" :item="item" :reference="!ownFactory" />
+      <RecordExtras ref="extrasPanel" :key="`${item.id}:${item.revision}`" :item="item" :reference="!ownFactory" />
     </section>
+    <p v-if="editMessage" class="meta" role="status">{{ editMessage }}</p>
+    <TagEditor v-if="editingTags" :key="item.id" :item="item" @close="closeTags" @saved="tagsSaved" />
     <dialog
       ref="imageDialog"
       class="record-image-dialog"

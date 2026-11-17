@@ -21,6 +21,7 @@ from src.factory.excel_io import (
 from src.factory.periods import iso_date
 from src.db import on_conflict_update
 from src.factory.tables import gap_report, now
+from src.factory.sales_deletion import mutation_lock
 
 SALES_COLUMNS = ("款号", "颜色", "尺码", "订单数量", "订单金额")
 _LINE_ASSIGNMENTS = [
@@ -56,8 +57,8 @@ def is_total_row(row, indexes) -> bool:
                     for name in ("订单数量", "订单金额")))
 
 
-def parse_sales_rows(path: Path) -> tuple[list[dict], dict]:
-    rows = load_sheet_rows(path)
+def parse_sales_rows(path: Path, *, sheet_rows=None) -> tuple[list[dict], dict]:
+    rows = load_sheet_rows(path) if sheet_rows is None else sheet_rows
     if table_kind_from_headers(sheet_headers(rows)) == "archive":
         raise ValueError("可能传错了表，这像是款式档案，请用款式档案入口。")
     header_index, headers = find_header(rows, "款号")
@@ -247,7 +248,7 @@ def import_sales(path: Path, source_name: str | None = None) -> dict:
     sales_rows, meta = parse_sales_rows(path)
     source_name = source_name or Path(path).name
     imported = updated = 0
-    with catalog._database() as conn:
+    with mutation_lock, catalog._database() as conn:
         if meta["format"] == "sales_lines":
             imported, updated = _write_lines(conn, sales_rows, source_name)
         else:
@@ -280,58 +281,53 @@ def import_sales(path: Path, source_name: str | None = None) -> dict:
 
 
 def _write_summary(conn, sales_rows, source_name: str) -> tuple[int, int]:
-    imported = updated = 0
-    for item in sales_rows:
-        existed = conn.execute(
-            "SELECT 1 FROM style_sales WHERE variant_code=? AND color=? AND size_label=? AND `year`=? AND period=?",
-            (item["variant_code"], item["color"], item["size_label"], item["year"], item["period"]),
-        ).fetchone()
-        conn.execute(
-            """
-            INSERT INTO style_sales (
-                variant_code, color, size_label, quantity, amount, style_code, customer,
-                `year`, period, source_file, extra_json, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?)
-            """ + on_conflict_update(
-                "variant_code, color, size_label, `year`, period",
-                ["quantity", "amount", "style_code", "customer", "source_file", "updated_at"],
-            ),
-            (
-                item["variant_code"], item["color"], item["size_label"], item["quantity"], item["amount"],
-                item["style_code"], item["customer"], item["year"], item["period"], source_name, now(),
-            ),
-        )
-        if existed:
-            updated += 1
-        else:
-            imported += 1
-    return imported, updated
+    return _write_sales_rows(conn, sales_rows, source_name, "style_sales",
+        ["variant_code", "color", "size_label", "year", "period"],
+        ["variant_code", "color", "size_label", "quantity", "amount", "style_code", "customer",
+         "year", "period", "source_file", "extra_json", "updated_at"],
+        ["quantity", "amount", "style_code", "customer", "source_file", "updated_at"])
 
 
 def _write_lines(conn, sales_rows, source_name: str) -> tuple[int, int]:
+    return _write_sales_rows(conn, sales_rows, source_name, "style_order_lines",
+        ["order_no", "variant_code", "color", "size_label"],
+        ["order_no", "variant_code", "color", "size_label", "quantity", "amount", "style_code", "customer",
+         "customer_raw", "customer_style_code", "order_kind", "order_date", "salesperson", "garment_type",
+         "season", "source_file", "updated_at"], _LINE_ASSIGNMENTS)
+
+
+def _write_sales_rows(conn, rows, source_name, table, keys, columns, assignments):
+    """Preserve upsert semantics while bounding SQL size and RDS round trips.
+
+    The caller owns the transaction and mutation lock. No batch commits here:
+    failure or an impact mismatch still rolls the entire import back.
+    """
+    if not rows:
+        return 0, 0
+    batch_size = 500
+    identities = list(dict.fromkeys(item[keys[0]] for item in rows))
+    existing = set()
+    key_sql = ", ".join(f"`{key}`" for key in keys)
+    for offset in range(0, len(identities), batch_size):
+        values = identities[offset:offset + batch_size]
+        marks = ", ".join("?" for _ in values)
+        existing.update(tuple(row[key] for key in keys) for row in conn.execute(
+            f"SELECT {key_sql} FROM {table} WHERE `{keys[0]}` IN ({marks})", values))
+    column_sql = ", ".join(f"`{column}`" for column in columns)
+    sql = (f"INSERT INTO {table} ({column_sql}) VALUES ({', '.join('?' for _ in columns)})"
+           + on_conflict_update(key_sql, assignments))
+    timestamp = now()
     imported = updated = 0
-    for item in sales_rows:
-        existed = conn.execute(
-            "SELECT 1 FROM style_order_lines WHERE order_no=? AND variant_code=? AND color=? AND size_label=?",
-            (item["order_no"], item["variant_code"], item["color"], item["size_label"]),
-        ).fetchone()
-        conn.execute(
-            """
-            INSERT INTO style_order_lines (
-                order_no, variant_code, color, size_label, quantity, amount, style_code, customer,
-                customer_raw, customer_style_code, order_kind, order_date, salesperson, garment_type,
-                season, source_file, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """ + on_conflict_update("order_no, variant_code, color, size_label", _LINE_ASSIGNMENTS),
-            (
-                item["order_no"], item["variant_code"], item["color"], item["size_label"], item["quantity"],
-                item["amount"], item["style_code"], item["customer"], item["customer_raw"],
-                item["customer_style_code"], item["order_kind"], item["order_date"], item["salesperson"],
-                item["garment_type"], item["season"], source_name, now(),
-            ),
-        )
-        if existed:
-            updated += 1
-        else:
-            imported += 1
+    for offset in range(0, len(rows), batch_size):
+        values = []
+        for item in rows[offset:offset + batch_size]:
+            key = tuple(item[name] for name in keys)
+            if key in existing:
+                updated += 1
+            else:
+                imported += 1
+                existing.add(key)
+            data = {**item, "source_file": source_name, "extra_json": "{}", "updated_at": timestamp}
+            values.append(tuple(data[column] for column in columns))
+        conn.executemany(sql, values)
     return imported, updated

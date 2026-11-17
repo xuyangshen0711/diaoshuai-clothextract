@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   assignSourceCategory,
+  deleteGalleryImages,
   getCatalog,
   getFilters,
   getLibraryMeta,
@@ -13,8 +14,13 @@ import {
   type LibraryMeta,
   type Taxonomy,
 } from '../api'
+import TagEditor from '../components/TagEditor.vue'
+import { tagStatus } from '../utils/recordPresentation'
 import { swatchColor, swatchLight } from '../utils/source'
 
+const editing = ref<CatalogItem | null>(null)
+const editMessage = ref('')
+async function tagsSaved() { editMessage.value = '标签已保存，筛选与搜索已更新。'; await load() }
 const route = useRoute()
 const router = useRouter()
 const items = ref<CatalogItem[]>([])
@@ -22,6 +28,7 @@ const count = ref(0)
 const colorCounts = ref<Record<string, number>>({})
 const loading = ref(false)
 const error = ref('')
+const metadataError = ref('')
 const meta = ref<FilterMeta>({ fields: {}, detail_groups: {} })
 const libraryMeta = ref<LibraryMeta>({
   source_categories: ['本厂产品', '网图趋势', '品牌资料包', '市调拍照'],
@@ -37,6 +44,11 @@ const taxonomy = ref<Taxonomy>({
 })
 const bulkCategory = ref('本厂产品')
 const bulkMessage = ref('')
+const selectionMode = ref(false)
+const selected = ref(new Set<string>())
+const deleting = ref(false)
+const deletionMessage = ref('')
+const cleanupPending = ref(0)
 const queryDraft = ref('')
 let searchTimer = 0
 
@@ -57,6 +69,12 @@ const FACTORY_COLORS = [
 ]
 const queryText = (key: string) =>
   typeof route.query[key] === 'string' ? (route.query[key] as string) : '全部'
+const orderSeasons = computed(() => {
+  const value = route.query.order_season ?? route.query.archive_season
+  const values = Array.isArray(value) ? value : [value]
+  return [...new Set(values.filter((item): item is string => typeof item === 'string')
+    .map(item => item.trim()).filter(item => item && item !== '全部'))]
+})
 const filters = computed(() => ({
   category: queryText('category'),
   subcategory: queryText('subcategory'),
@@ -69,7 +87,6 @@ const filters = computed(() => ({
   neckline: queryText('neckline'),
   sleeve: queryText('sleeve'),
   pattern: queryText('pattern'),
-  archive_season: queryText('archive_season'),
   color_family: queryText('color_family'),
   ordered_from: queryText('ordered_from'),
   ordered_to: queryText('ordered_to'),
@@ -77,12 +94,13 @@ const filters = computed(() => ({
 function setFilter(key: string, value: string) {
   const next = { ...route.query, [key]: value === '全部' ? undefined : value }
   if (key === 'category') delete next.subcategory
+  if (key === 'order_season') delete next.archive_season
   router.replace({ query: next })
 }
 const q = computed(() => (typeof route.query.q === 'string' ? route.query.q : ''))
-const reviewStatus = computed(() =>
-  ['pending', 'approved'].includes(String(route.query.review_status))
-    ? String(route.query.review_status)
+const tagOrigin = computed(() =>
+  ['ai', 'manual'].includes(String(route.query.tag_origin))
+    ? String(route.query.tag_origin)
     : '',
 )
 const sourceCategory = computed(() =>
@@ -96,15 +114,22 @@ const sort = computed(() =>
 const periodOptions = computed(() => libraryMeta.value.factory['下单'] || [])
 const ownFactory = computed(() => sourceCategory.value === '本厂产品')
 const pendingFactory = ref(0)
-watch(ownFactory, async value => {
-  if (!value) return
-  try { const data = await getFactoryWorkspace(); pendingFactory.value = data.counts.missing_images }
-  catch { /* Import workspace has a visible retry state if the service is unavailable. */ }
-}, { immediate: true })
+let factoryRequest: ReturnType<typeof getFactoryWorkspace> | undefined
+watch(ownFactory, () => { factoryRequest = undefined })
+function loadPendingFactory() {
+  if (!ownFactory.value || factoryRequest) return
+  const request = getFactoryWorkspace()
+  factoryRequest = request
+  void request.then(data => {
+    if (factoryRequest === request) pendingFactory.value = data.counts.missing_images
+  }, () => {
+    if (factoryRequest === request) factoryRequest = undefined
+  })
+}
 const statusOptions = [
   { value: '', label: '全部' },
-  { value: 'pending', label: '未审核' },
-  { value: 'approved', label: '已审核' },
+  { value: 'ai', label: 'AI 识别' },
+  { value: 'manual', label: '人工已修改' },
 ]
 const sourceTabs = computed(() => [
   '全部',
@@ -120,13 +145,28 @@ const subcategoryOptions = computed(() => {
   const node = taxonomy.value.tree.find((item) => item.level1 === filters.value.category)
   return node?.children.length ? ['全部', ...node.children] : []
 })
-const seasonKey = computed(() => (ownFactory.value ? 'archive_season' : 'season'))
-const seasonValue = computed(() =>
-  ownFactory.value ? filters.value.archive_season : filters.value.season,
-)
+function seasonSelected(value: string) {
+  if (!ownFactory.value) return filters.value.season === value
+  return value === '全部' ? !orderSeasons.value.length : orderSeasons.value.includes(value)
+}
+function toggleSeason(value: string) {
+  if (!ownFactory.value) return setFilter('season', value)
+  const seasons = value === '全部' ? [] : orderSeasons.value.includes(value)
+    ? orderSeasons.value.filter(season => season !== value)
+    : [...orderSeasons.value, value]
+  const next = { ...route.query }
+  if (seasons.length) next.order_season = seasons
+  else delete next.order_season
+  delete next.archive_season
+  router.replace({ query: next })
+}
+function removeChip(chip: { key: string; label: string }) {
+  if (chip.key === 'order_season') toggleSeason(chip.label)
+  else setFilter(chip.key, '全部')
+}
 const seasonOptions = computed(() => [
   '全部',
-  ...(ownFactory.value ? libraryMeta.value.factory['季节'] || [] : meta.value.fields['季节'] || []),
+  ...(ownFactory.value ? libraryMeta.value.factory['订单年度/季节'] || [] : meta.value.fields['季节'] || []),
 ])
 const colorKey = computed(() => (ownFactory.value ? 'color_family' : 'color'))
 const activeColor = computed(() =>
@@ -160,7 +200,9 @@ const selectedChips = computed(() => {
     chips.push({ key: 'sleeve_length', label: filters.value.sleeve_length })
   if (ownFactory.value && filters.value.fabric !== '全部')
     chips.push({ key: 'fabric', label: filters.value.fabric })
-  if (seasonValue.value !== '全部') chips.push({ key: seasonKey.value, label: seasonValue.value })
+  if (ownFactory.value) {
+    for (const season of orderSeasons.value) chips.push({ key: 'order_season', label: season })
+  } else if (filters.value.season !== '全部') chips.push({ key: 'season', label: filters.value.season })
   if (ownFactory.value && filters.value.ordered_from !== '全部')
     chips.push({ key: 'ordered_from', label: `从 ${filters.value.ordered_from}` })
   if (ownFactory.value && filters.value.ordered_to !== '全部')
@@ -190,6 +232,7 @@ const facetQueryKeys = [
   'sleeve',
   'pattern',
   'archive_season',
+  'order_season',
   'color_family',
   'size',
   'series',
@@ -225,16 +268,24 @@ function cardTitle(item: CatalogItem) {
   )
 }
 function cardSeason(item: CatalogItem) {
-  const values = item.seasons?.length ? item.seasons : [item.display_tags.季节]
-  const order = ['春', '夏', '秋', '冬', '四季']
-  return [...new Set(values.filter(Boolean).map((value) => value.replace(/^\d{4}\s*/, '')))]
-    .sort(
-      (a, b) =>
-        (order.indexOf(a) < 0 ? 99 : order.indexOf(a)) -
-        (order.indexOf(b) < 0 ? 99 : order.indexOf(b)),
-    )
-    .join(' / ')
+  if (item.source_category === '本厂产品')
+    return item.order_seasons?.length ? `订单：${item.order_seasons.join(' / ')}` : '订单季节未提供'
+  return item.display_tags.季节 ? `适穿：${item.display_tags.季节}` : ''
 }
+const orderScopeText = computed(() => {
+  const parts = []
+  if (orderSeasons.value.length) parts.push(orderSeasons.value.join('、'))
+  let start = filters.value.ordered_from
+  let end = filters.value.ordered_to
+  const periodKey = (value: string) => {
+    const match = value.match(/^(\d{4})年(\d{1,2})月(上旬|中旬|下旬)$/)
+    return match ? `${match[1]}-${match[2]!.padStart(2, '0')}-${['上旬', '中旬', '下旬'].indexOf(match[3]!) + 1}` : value
+  }
+  if (start !== '全部' && end !== '全部' && periodKey(start) > periodKey(end)) [start, end] = [end, start]
+  if (start !== '全部' || end !== '全部')
+    parts.push(`下单时间 ${start === '全部' ? '不限' : start} 至 ${end === '全部' ? '不限' : end}（含起止旬）`)
+  return parts.length ? parts.join(' · ') : '全部订单季节、全部下单时间（含已计入的历史汇总）'
+})
 function cardSubtitle(item: CatalogItem) {
   if (item.source_category === '本厂产品') return categoryLine(item).replace(' · ', ' / ')
   const group = (item.library_category || item.display_tags.品类).split('>')[0]
@@ -277,19 +328,21 @@ async function load() {
       neckline: ownFactory.value ? '' : filters.value.neckline,
       sleeve: ownFactory.value ? '' : filters.value.sleeve,
       pattern: filters.value.pattern,
-      archive_season: ownFactory.value ? filters.value.archive_season : '',
+      order_season: ownFactory.value ? orderSeasons.value : '',
       color_family: ownFactory.value ? filters.value.color_family : '',
       ordered_from: ownFactory.value ? filters.value.ordered_from : '',
       ordered_to: ownFactory.value ? filters.value.ordered_to : '',
       source_category: sourceCategory.value,
       sort: sort.value,
       exclude_samples: true,
-      review_status: reviewStatus.value,
+      tag_origin: tagOrigin.value,
+      batch: typeof route.query.batch === 'string' ? route.query.batch : '',
     })
     if (sequence !== latest) return
     items.value = data.items
     count.value = data.count
     colorCounts.value = data.color_counts || {}
+    loadPendingFactory()
   } catch (reason) {
     if (sequence === latest) error.value = reason instanceof Error ? reason.message : String(reason)
   } finally {
@@ -316,18 +369,63 @@ async function bulkAssign() {
   }
 }
 
-onUnmounted(() => window.clearTimeout(searchTimer))
+function toggleSelectionMode() {
+  selectionMode.value = !selectionMode.value
+  selected.value.clear()
+}
+
+function toggleImage(id: string) {
+  if (loading.value || deleting.value) return
+  if (selected.value.has(id)) selected.value.delete(id)
+  else selected.value.add(id)
+}
+
+function onCardClick(event: MouseEvent, id: string) {
+  if (!selectionMode.value) return
+  event.preventDefault()
+  toggleImage(id)
+}
+
+async function deleteSelected() {
+  const ids = items.value.filter(item => selected.value.has(item.id)).map(item => item.id)
+  if (!ids.length || deleting.value || loading.value) return
+  if (!window.confirm(`删除已选的 ${ids.length} 张图片？删除后无法在图库内恢复。`)) return
+  deleting.value = true
+  error.value = ''
+  deletionMessage.value = ''
+  cleanupPending.value = 0
+  try {
+    const result = await deleteGalleryImages(ids)
+    selected.value.clear()
+    selectionMode.value = false
+    deletionMessage.value = `已删除 ${result.deleted} 张图片。`
+    cleanupPending.value = result.cleanup_pending
+    await load()
+  } catch (reason) {
+    error.value = reason instanceof Error ? reason.message : String(reason)
+  } finally {
+    deleting.value = false
+  }
+}
+
+onUnmounted(() => {
+  window.clearTimeout(searchTimer)
+  latest++
+  factoryRequest = undefined
+})
 
 onMounted(async () => {
   queryDraft.value = q.value
+  void load()
   try {
-    meta.value = await getFilters()
-    libraryMeta.value = await getLibraryMeta()
-    taxonomy.value = await getTaxonomy()
+    await Promise.all([
+      getFilters().then(data => { meta.value = data }),
+      getLibraryMeta().then(data => { libraryMeta.value = data }),
+      getTaxonomy().then(data => { taxonomy.value = data }),
+    ])
   } catch (reason) {
-    error.value = reason instanceof Error ? reason.message : String(reason)
+    metadataError.value = reason instanceof Error ? reason.message : String(reason)
   }
-  await load()
 })
 watch(
   () => route.query.q,
@@ -336,7 +434,10 @@ watch(
     if (text !== queryDraft.value) queryDraft.value = text
   },
 )
-watch(() => route.query, load, { deep: true })
+watch(() => route.query, () => {
+  selected.value.clear()
+  void load()
+}, { deep: true })
 </script>
 
 <template>
@@ -367,10 +468,23 @@ watch(() => route.query, load, { deep: true })
           {{ item }}
         </button>
       </div>
+      <RouterLink
+        class="gallery-analytics-link"
+        :to="ownFactory
+          ? { name: 'analytics' }
+          : { name: 'analytics', query: { tab: 'questions', source: sourceCategory } }"
+      >{{ ownFactory ? '数据分析' : '问数据' }}</RouterLink>
     </div>
     <div v-if="ownFactory" class="factory-library-tools">
       <RouterLink :to="{ path: '/import', query: { mode: 'factory' } }">管理本厂资料与导入</RouterLink>
       <span v-if="pendingFactory">{{ pendingFactory }} 个款号已导入数据，待补图片</span>
+    </div>
+    <div v-if="ownFactory" class="gallery-order-note">
+      <p><strong>订单统计范围：</strong>{{ orderScopeText }}</p>
+      <details><summary>统计说明</summary>
+        <p>卡片件数、金额及订单排序随订单季节和下单时间变化；品类、颜色等条件仅筛选款式。限定季节或时间时，仅统计对应订单明细，不计入无法对应范围的历史汇总。</p>
+        <p>订单包含补单，不代表已发货或已回款。春夏、秋冬为独立季节，不自动合并春、夏或秋、冬。</p>
+      </details>
     </div>
     <div class="library-filters">
       <div class="filter-row">
@@ -406,15 +520,15 @@ watch(() => route.query, load, { deep: true })
 
       <div class="season-color-row">
         <div class="filter-row">
-          <span class="filter-row-label">季节</span>
-          <div class="filter-scroll" role="group" aria-label="季节">
+          <span class="filter-row-label season-filter-label">{{ ownFactory ? '订单年度 / 季节（可多选）' : '适穿季节' }}</span>
+          <div class="filter-scroll" role="group" :aria-label="ownFactory ? '订单年度 / 季节' : '适穿季节'">
             <button
               v-for="opt in seasonOptions"
               :key="`s-${opt}`"
               type="button"
               class="chip"
-              :aria-pressed="seasonValue === opt"
-              @click="setFilter(seasonKey, opt)"
+              :aria-pressed="seasonSelected(opt)"
+              @click="toggleSeason(opt)"
             >
               {{ opt }}
             </button>
@@ -555,10 +669,10 @@ watch(() => route.query, load, { deep: true })
       <div class="selected-chips">
         <button
           v-for="chip in selectedChips"
-          :key="chip.key"
+          :key="`${chip.key}-${chip.label}`"
           type="button"
           class="selected-chip"
-          @click="setFilter(chip.key, '全部')"
+          @click="removeChip(chip)"
         >
           {{ chip.label }} <span aria-hidden="true">×</span
           ><span class="visually-hidden">移除</span>
@@ -577,13 +691,13 @@ watch(() => route.query, load, { deep: true })
     <div class="gallery-results-toolbar">
       <p class="gallery-count" role="status">共 {{ loading ? '…' : count }} 款</p>
       <div class="library-selected-side">
-        <div class="library-status-filter" role="group" aria-label="按审核状态筛选">
+        <div class="library-status-filter" role="group" aria-label="按标签来源筛选">
           <button
             v-for="option in statusOptions"
             :key="option.value || 'all'"
             type="button"
-            :aria-pressed="reviewStatus === option.value"
-            @click="setFilter('review_status', option.value || '全部')"
+            :aria-pressed="tagOrigin === option.value"
+            @click="setFilter('tag_origin', option.value || '全部')"
           >
             {{ option.label }}
           </button>
@@ -610,6 +724,9 @@ watch(() => route.query, load, { deep: true })
             <option value="replenishment">补单次数</option>
           </select>
         </label>
+        <button type="button" class="btn small" :aria-pressed="selectionMode" :disabled="deleting || (!items.length && !selectionMode)" @click="toggleSelectionMode">
+          {{ selectionMode ? '退出选择' : '批量删除' }}
+        </button>
         <details class="quiet-more">
           <summary>更多</summary>
           <div class="quiet-more-body">
@@ -637,17 +754,34 @@ watch(() => route.query, load, { deep: true })
       </div>
     </div>
 
-    <div v-if="error" class="error">{{ error }}</div>
+    <div v-if="selectionMode" class="gallery-selection-toolbar" aria-label="批量选择">
+      <span role="status">已选 {{ selected.size }} 张</span>
+      <button type="button" class="btn small" :disabled="loading || deleting || !items.length || selected.size === items.length" @click="selected = new Set(items.map(item => item.id))">全选当前结果</button>
+      <button type="button" class="btn small" :disabled="deleting || !selected.size" @click="selected.clear()">清空选择</button>
+      <button type="button" class="btn small media-delete" :disabled="loading || deleting || !selected.size" @click="deleteSelected">{{ deleting ? '正在删除…' : '删除已选图片' }}</button>
+    </div>
+    <p v-if="deletionMessage" class="gallery-delete-result" role="status">
+      {{ deletionMessage }}
+      <template v-if="cleanupPending">还有 {{ cleanupPending }} 项文件待清理。<RouterLink to="/import">到导入页重试清理</RouterLink></template>
+    </p>
+    <p v-if="editMessage" class="meta" role="status">{{ editMessage }}</p>
+    <p v-if="route.query.batch" class="meta">当前显示本批导入的图片。<RouterLink :to="{ path: '/', query: { ...route.query, batch: undefined } }">查看全部批次</RouterLink></p>
+    <div v-if="error || metadataError" class="error">{{ error || metadataError }}</div>
     <div v-if="!items.length && !loading && !error" class="empty">
       暂无匹配款式。可调整筛选，或<RouterLink to="/import" class="review-text-link"
         >导入新资料</RouterLink
       >。
     </div>
     <div v-else class="gallery-grid" :aria-busy="loading">
-      <article v-for="item in items" :key="item.id" class="gallery-card">
+      <article v-for="item in items" :key="item.id" class="gallery-card" :class="{ 'is-selected': selected.has(item.id) }">
+        <label v-if="selectionMode" class="gallery-card-select">
+          <input type="checkbox" :aria-label="`选择 ${cardTitle(item)} · ${item.source.source_file} ${item.source.location}`" :checked="selected.has(item.id)" :disabled="deleting || loading" @change="toggleImage(item.id)" />
+        </label>
         <RouterLink
           class="gallery-card-link"
           :to="{ name: 'record', params: { id: item.id }, query: { from: route.fullPath } }"
+          :tabindex="selectionMode ? -1 : undefined"
+          @click.capture="onCardClick($event, item.id)"
         >
           <div class="gallery-card-image" :class="{ 'has-cover-crop': item.cover_crop }">
             <img
@@ -658,7 +792,7 @@ watch(() => route.query, load, { deep: true })
               height="640"
             />
             <span class="gallery-review-badge" :class="item.review_status">{{
-              item.review_status === 'approved' ? '已审核' : item.tags_source === 'deferred' ? '待分类' : '未审核'
+              tagStatus(item)
             }}</span>
             <span v-if="item.source_category === '本厂产品'" class="gallery-factory-badge"
               >本厂产品</span
@@ -669,7 +803,7 @@ watch(() => route.query, load, { deep: true })
               <h2 :title="cardTitle(item)" :translate="item.style_code ? 'no' : undefined">
                 {{ cardTitle(item) }}
               </h2>
-              <span :title="item.seasons?.join('、') || item.display_tags.季节">{{
+              <span :title="cardSeason(item)">{{
                 cardSeason(item)
               }}</span>
             </div>
@@ -703,9 +837,9 @@ watch(() => route.query, load, { deep: true })
                 >{{ item.variant_count }} 个版本</span
               >
             </div>
-            <div class="gallery-card-footer">
+            <div class="gallery-card-footer" :title="item.source_category === '本厂产品' ? `订单件数与订单金额 · ${ownFactory ? orderScopeText : '全部季节、全部下单时间累计'}` : undefined">
               <template v-if="item.source_category === '本厂产品'"
-                ><strong>{{ item.sales_quantity.toLocaleString('zh-CN') }}<small> 件</small></strong
+                ><strong><small>订单 </small>{{ item.sales_quantity.toLocaleString('zh-CN') }}<small> 件</small></strong
                 ><span v-if="item.sales_amount" class="gallery-sales-amount">{{
                   formatWan(item.sales_amount)
                 }}</span
@@ -716,8 +850,10 @@ watch(() => route.query, load, { deep: true })
             </div>
           </div>
         </RouterLink>
+        <button v-if="!selectionMode" type="button" class="gallery-edit-tags" :aria-label="`修改标签：${cardTitle(item)}`" @click="editing = item">修改标签</button>
       </article>
     </div>
+    <TagEditor v-if="editing" :key="editing.id" :item="editing" @close="editing = null" @saved="tagsSaved" />
   </main>
 </template>
 <style src="../library-gallery.css"></style>
