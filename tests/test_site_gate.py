@@ -76,3 +76,59 @@ def test_a_tampered_or_expired_cookie_is_rejected(store, monkeypatch):
     assert client.get("/api/meta/library").status_code == 401
     client.cookies.set(COOKIE_NAME, issue_token())
     assert client.get("/api/meta/library").status_code == 200
+
+
+def test_site_gate_preserves_zero_copy_pathsend_for_images(store, monkeypatch):
+    import asyncio
+    from PIL import Image
+    from src import catalog
+    from src.schema import FashionTags, ImageRecord, SourceMeta
+
+    monkeypatch.setenv("SITE_PASSWORD", GATE_SECRET)
+    img_path = store / "extracted" / "pathsend_check.jpg"
+    img_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (180, 240), "navy").save(img_path, format="JPEG")
+    tags = FashionTags(品类="外套>大衣", 风格="通勤", 季节="冬", 版型="宽松", 颜色主色调="黑色", 图案="纯色/无明显图案", 一句话描述="极简通勤羊毛外套")
+    rec = ImageRecord(
+        image_path=str(img_path),
+        source=SourceMeta(source_file="pathsend_check.jpg", source_type="image", location="上传图片"),
+        source_category="网图趋势",
+        tags=tags,
+        ai_tags=tags.model_copy(deep=True),
+        tags_source="deepseek",
+    )
+    catalog.save_catalog([rec])
+
+    sent_messages = []
+
+    async def run_asgi():
+        token = issue_token()
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": f"/api/records/{rec.id}/image",
+            "raw_path": f"/api/records/{rec.id}/image".encode(),
+            "query_string": b"variant=thumbnail",
+            "headers": [(b"cookie", f"{COOKIE_NAME}={token}".encode()), (b"origin", b"http://localhost")],
+            "client": ("127.0.0.1", 50000),
+            "server": ("127.0.0.1", 8520),
+            "extensions": {"http.response.pathsend": {}},
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent_messages.append(message)
+
+        await api.app(scope, receive, send)
+
+    asyncio.run(run_asgi())
+    types = [m["type"] for m in sent_messages]
+    assert types[0] == "http.response.start"
+    assert sent_messages[0]["status"] == 200
+    assert "http.response.pathsend" in types or sum(len(m.get("body", b"")) for m in sent_messages) > 500
+

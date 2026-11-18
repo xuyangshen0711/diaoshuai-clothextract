@@ -616,7 +616,7 @@ def search_text(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {
             "count": len(hits),
-            "items": [_serialize(record, score, index) for record, score in hits],
+            "items": [_serialize(record, score, index, defer_oss_images=True) for record, score in hits],
             "search_info": {"engine": backend.name, "local_only": True, "include_pending": include_pending,
                             "concepts": parse_inspiration(q).labels},
         }
@@ -653,7 +653,7 @@ def search_image(
         reset_search_blobs(token)
     return {
         "count": len(hits),
-        "items": [_serialize(record, score, index) for record, score in hits],
+        "items": [_serialize(record, score, index, defer_oss_images=True) for record, score in hits],
     }
 
 
@@ -1130,4 +1130,4 @@ def similar_records(record_id: str, include_pending: bool = False, source_catego
                        factory_filters=factory_filters, index=index)
     hits = search_by_image(records, record.image_path, top_k=24,
                            filtered=filtered, include_pending=include_pending, reference=record)
-    return {"count": len(hits), "items": [_serialize(r, score, index) for r, score in hits]}
+    return {"count": len(hits), "items": [_serialize(r, score, index, defer_oss_images=True) for r, score in hits]}

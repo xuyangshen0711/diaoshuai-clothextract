@@ -12,7 +12,6 @@ import hmac
 import os
 import time
 
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -86,8 +85,19 @@ def request_is_allowed(request: Request) -> bool:
     return token_is_valid(request.cookies.get(COOKIE_NAME))
 
 
-class SiteGateMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
+class SiteGateMiddleware:
+    """Pure ASGI middleware so FileResponse zero-copy pathsend streams without BaseHTTPMiddleware buffering."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope, receive=receive)
         if request_is_allowed(request):
-            return await call_next(request)
-        return JSONResponse({"detail": "请先登录"}, status_code=401)
+            await self.app(scope, receive, send)
+            return
+        response = JSONResponse({"detail": "请先登录"}, status_code=401)
+        await response(scope, receive, send)
