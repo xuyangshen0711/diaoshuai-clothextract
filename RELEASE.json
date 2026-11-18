@@ -1,14 +1,15 @@
 {
-  "release": "20261117-vision-speed",
-  "base_commit": "e3c1b6fdb8904776a887baddf3c18bbf85199893",
-  "base_code_sha256": "1b170a7a6cbe15539ca4ae4f03f1e6c9a5e9c73b927ce5c6bd580f5bde1acd7e",
-  "previous_release": "20261117-speed-optimization-v2",
+  "release": "20261118-batch-manage",
+  "base_commit": "5191abf15a69890ead84e5bc0b8f68dc85135730",
+  "base_code_sha256": "0c8707bdc939996c4252850a06548a76ee44db45fd1bdb1d29b41b487beb64b8",
+  "previous_release": "20261117-vision-speed",
   "includes_local_changes": true,
   "prebuilt_frontend": true,
   "business_data_included": false,
   "local_configuration_included": false,
   "database_schema_changes": false,
   "preserved_features": [
+    "fast DeepSeek vision tagging (6x concurrency, 1280px JPEG derivative)",
     "whole-site browsing speed v2",
     "yarn-and-color-report",
     "order-season multiselect",
@@ -16,8 +17,8 @@
     "archive 500-row batch import"
   ],
   "validation": {
-    "regressions": "All vision tagging, response-speed, factory, analytics, yarn-table, image-quality, storage, taxonomy, and site-gate suites passed (62 passed, 0 failed)",
-    "vision_speed": "Disabled redundant chain-of-thought reasoning by default for DeepSeek vision tagging (1.15s single image vs 4.27s+ previously), shrank in-memory vision derivative to 1280px white-composited JPEG while preserving 100% original image bytes in OSS, raised AI_CONCURRENCY from 2 to 6 with pooled Keep-Alive HTTP connections (6 real garment images recognized in 1.39s total), pre-warmed gallery thumbnails directly from local files before OSS cleanup, and eliminated N+1 DB scans/transactions during batch import",
-    "live_rds_and_oss": "Pre-edit online /opt/diaoshuai and local main project verified identical (213 files, 1b170a7a6cbe15539ca4ae4f03f1e6c9a5e9c73b927ce5c6bd580f5bde1acd7e)"
+    "regressions": "All batch-source-category, vision tagging, response-speed, factory, analytics, yarn-table, image-quality, storage, taxonomy, and site-gate suites passed (66 passed, 0 failed)",
+    "batch_manage": "Upgraded gallery selection mode to unified 批量管理 (single/Shift-range/visible/all selection + mandatory formal transfer confirmation dialog + chunked large-batch transfer without 500-item error), removed dangerous unselective bulk move popover, added skip_conflicts non-blocking conflict report when moving into 本厂产品, and automatically released style_code (while preserving notes.款号) when moving out of 本厂产品",
+    "live_rds_and_oss": "Pre-edit online /opt/diaoshuai and local main project verified identical (213 files, 0c8707bdc939996c4252850a06548a76ee44db45fd1bdb1d29b41b487beb64b8)"
   }
 }

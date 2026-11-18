@@ -217,7 +217,17 @@ watch(
 
 async function changeCategory(event: Event) {
   if (!item.value) return
-  const next = (event.target as HTMLSelectElement).value
+  const selectEl = event.target as HTMLSelectElement
+  const currentCat = item.value.source_category || '未分类'
+  const next = selectEl.value
+  if (next === item.value.source_category) return
+  const extraHint = currentCat === '本厂产品' && next !== '本厂产品'
+    ? '\n（移出本厂产品后将自动释放本厂主款号占用，原款号文字仍会保留在备注中）'
+    : ''
+  if (!window.confirm(`确定要将此款从「${currentCat}」正式转移至「${next}」吗？${extraHint}`)) {
+    selectEl.value = item.value.source_category
+    return
+  }
   categoryMessage.value = ''
   error.value = ''
   try {
@@ -226,7 +236,7 @@ async function changeCategory(event: Event) {
     categoryMessage.value = `资料大类已改为${next}`
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
-    ;(event.target as HTMLSelectElement).value = item.value.source_category
+    selectEl.value = item.value.source_category
   }
 }
 </script>

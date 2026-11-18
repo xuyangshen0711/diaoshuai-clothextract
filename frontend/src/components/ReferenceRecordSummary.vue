@@ -47,14 +47,26 @@ async function editCategory() {
 }
 async function changeCategory(event: Event) {
   const id = props.item.id
-  const value = (event.target as HTMLSelectElement).value
+  const selectEl = event.target as HTMLSelectElement
+  const currentCat = props.item.source_category || '未分类'
+  const value = selectEl.value
+  if (value === props.item.source_category) return
+  if (!window.confirm(`确定要将此款从「${currentCat}」正式转移至「${value}」吗？`)) {
+    selectEl.value = props.item.source_category
+    return
+  }
   savingCategory.value = true; categoryError.value = ''; categoryMessage.value = ''
   try {
     await assignSourceCategory([id], value)
     const result = await getRecord(id)
     if (id !== props.item.id) return
     emit('updated', result); editingCategory.value = false; categoryMessage.value = `资料大类已设置为${value}`
-  } catch (e) { if (id === props.item.id) categoryError.value = e instanceof Error ? e.message : String(e) }
+  } catch (e) {
+    if (id === props.item.id) {
+      categoryError.value = e instanceof Error ? e.message : String(e)
+      selectEl.value = props.item.source_category
+    }
+  }
   finally { savingCategory.value = false }
 }
 function closeMore(event: Event) {

@@ -679,30 +679,149 @@ def discard_unreferenced_image(path_str: str, record: ImageRecord) -> None:
     path.unlink(missing_ok=True)
 
 
-def assign_source_category(ids: list[str], category: str) -> list[ImageRecord]:
+def assign_source_category_report(
+    ids: list[str],
+    category: str,
+    *,
+    skip_conflicts: bool = False,
+) -> dict[str, Any]:
     from src.factory.codes import image_style_code, parse_style_code
 
     category = coerce_source_category(category, required=True)
-    if not ids:
+    unique_ids = list(dict.fromkeys(str(item).strip() for item in ids if str(item).strip()))
+    if not unique_ids:
         raise ValueError("请选择要修改的图片")
+
     updated: list[ImageRecord] = []
+    skipped_conflicts: list[dict[str, str]] = []
+    unchanged_count = 0
+
     with _database() as conn:
-        for record_id in ids:
-            row = conn.execute("SELECT payload FROM records WHERE id=?", (record_id,)).fetchone()
-            if not row:
-                raise KeyError(record_id)
-            record = ImageRecord.model_validate_json(row[0])
-            record.source_category = category
-            if category == "本厂产品" and not record.style_code and record.source.source_type == "image":
-                parsed = parse_style_code(image_style_code(record.source.source_file))
-                if parsed and not parsed.suffix:
-                    record.style_code = parsed.base
+        lock = " FOR UPDATE" if is_mysql(conn) else ""
+        found_by_id: dict[str, ImageRecord] = {}
+        for offset in range(0, len(unique_ids), 500):
+            chunk = unique_ids[offset:offset + 500]
+            marks = ", ".join("?" for _ in chunk)
+            for row in conn.execute(f"SELECT id, payload FROM records WHERE id IN ({marks}){lock}", chunk):
+                found_by_id[row["id"]] = ImageRecord.model_validate_json(row["payload"])
+
+        missing = [rid for rid in unique_ids if rid not in found_by_id]
+        if missing:
+            raise KeyError(missing[0])
+
+        occupied_styles: dict[str, str] = {}
+        if category == "本厂产品":
+            for row in conn.execute(
+                f"SELECT id, {json_extract('payload', '$.style_code')} AS sc "
+                f"FROM records WHERE {json_extract('payload', '$.source_category')} = '本厂产品'"
+            ):
+                sc = (row["sc"] or "").strip()
+                if sc:
+                    occupied_styles[sc] = row["id"]
+
+        mutations: list[tuple[ImageRecord, dict[str, Any], str]] = []
+        for record_id in unique_ids:
+            record = found_by_id[record_id]
+            if category == "本厂产品":
+                candidate_code = (record.style_code or "").strip()
+                if not candidate_code and record.source.source_type == "image":
+                    parsed = parse_style_code(image_style_code(record.source.source_file))
+                    if parsed and not parsed.suffix:
+                        candidate_code = parsed.base
+                if not candidate_code and record.notes.款号:
+                    parsed_note = parse_style_code(record.notes.款号)
+                    if parsed_note and not parsed_note.suffix:
+                        candidate_code = parsed_note.base
+
+                if record.source_category == "本厂产品" and record.style_code == candidate_code:
+                    if candidate_code:
+                        occupied_styles[candidate_code] = record.id
+                    unchanged_count += 1
+                    updated.append(record)
+                    continue
+
+                holder = occupied_styles.get(candidate_code) if candidate_code else None
+                if holder is not None and holder != record.id:
+                    if not skip_conflicts:
+                        raise CatalogConflict(f"款号 {candidate_code} 已有图片")
+                    skipped_conflicts.append({
+                        "id": record.id,
+                        "style_code": candidate_code,
+                        "source_file": record.source.source_file,
+                        "reason": f"款号 {candidate_code} 在本厂产品中已有图片",
+                    })
+                    continue
+
+                before = record.model_dump()
+                record.source_category = "本厂产品"
+                if candidate_code:
+                    record.style_code = candidate_code
                     if not record.notes.款号:
-                        record.notes.款号 = parsed.base
-            record.touch()
-            record.revision = _save(conn, record, "source_category_changed", note=f"资料大类改为{category}")
-            updated.append(record)
-    return updated
+                        record.notes.款号 = candidate_code
+                    occupied_styles[candidate_code] = record.id
+                record.touch()
+                publish_record(record)
+                record.revision += 1
+                mutations.append((record, before, f"资料大类改为{category}"))
+                updated.append(record)
+            else:
+                old_code = (record.style_code or "").strip()
+                if record.source_category == category and not old_code:
+                    unchanged_count += 1
+                    updated.append(record)
+                    continue
+                before = record.model_dump()
+                if old_code:
+                    if not record.notes.款号:
+                        record.notes.款号 = old_code
+                    record.style_code = ""
+                record.source_category = category
+                record.touch()
+                publish_record(record)
+                record.revision += 1
+                note = f"资料大类改为{category}（原款号 {old_code} 已保留至备注）" if old_code else f"资料大类改为{category}"
+                mutations.append((record, before, note))
+                updated.append(record)
+
+        if mutations:
+            upsert_sql = (
+                "INSERT INTO records (id, image_path, review_status, revision, payload) VALUES (?, ?, ?, ?, ?) "
+                + on_conflict_update("id", ["image_path", "review_status", "revision", "payload"])
+            )
+            event_sql = (
+                "INSERT INTO review_events(record_id, action, actor, note, created_at, before_json, after_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)"
+            )
+            created_ts = datetime.now(timezone.utc).isoformat()
+            for offset in range(0, len(mutations), 500):
+                batch = mutations[offset:offset + 500]
+                rec_params = []
+                evt_params = []
+                for rec, before_dict, note_text in batch:
+                    after_json = rec.model_dump_json()
+                    rec_params.append((rec.id, rec.image_path, rec.review_status, rec.revision, after_json))
+                    evt_params.append((
+                        rec.id,
+                        "source_category_changed",
+                        "人工修改",
+                        note_text,
+                        created_ts,
+                        json.dumps(before_dict, ensure_ascii=False),
+                        after_json,
+                    ))
+                conn.executemany(upsert_sql, rec_params)
+                conn.executemany(event_sql, evt_params)
+
+    return {
+        "updated": updated,
+        "moved_count": len(mutations),
+        "unchanged_count": unchanged_count,
+        "skipped_conflicts": skipped_conflicts,
+    }
+
+
+def assign_source_category(ids: list[str], category: str, *, skip_conflicts: bool = False) -> list[ImageRecord]:
+    return assign_source_category_report(ids, category, skip_conflicts=skip_conflicts)["updated"]
 
 
 def review_history(record_id: str) -> list[dict]:

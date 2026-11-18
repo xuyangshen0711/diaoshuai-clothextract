@@ -263,7 +263,20 @@ export async function requestResponse(url: string, init?: RequestInit): Promise<
     let detail = res.statusText
     try {
       const body = await res.json()
-      detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail || body)
+      if (typeof body.detail === 'string') {
+        detail = body.detail
+      } else if (Array.isArray(body.detail) && body.detail.length) {
+        const first = body.detail[0]
+        if (first?.type === 'too_long' && Array.isArray(first?.loc) && first.loc.includes('ids')) {
+          detail = `单次提交数量超出限制（最多 ${first?.ctx?.max_length ?? ''} 条），请分批操作或刷新页面重试。`
+        } else if (typeof first?.msg === 'string') {
+          detail = `请求参数格式有误：${first.msg}`
+        } else {
+          detail = '请求参数未通过校验，请核对后重试。'
+        }
+      } else {
+        detail = JSON.stringify(body.detail || body)
+      }
     } catch {
       /* ignore */
     }
@@ -562,12 +575,67 @@ export async function importSalesSheet(file: File) {
   return request<TableReport>('/api/import/sales', { method: 'POST', body })
 }
 
-export function assignSourceCategory(ids: string[], sourceCategory: string) {
-  return request<{ count: number; items: CatalogItem[] }>('/api/records/source-category', {
+export type SkippedCategoryConflict = {
+  id: string
+  style_code: string
+  source_file: string
+  reason: string
+}
+
+export type SourceCategoryUpdateResult = {
+  count: number
+  moved_count: number
+  unchanged_count: number
+  skipped_conflicts: SkippedCategoryConflict[]
+  items: CatalogItem[]
+}
+
+export function assignSourceCategory(
+  ids: string[],
+  sourceCategory: string,
+  options?: { skipConflicts?: boolean; returnItems?: boolean },
+) {
+  return request<SourceCategoryUpdateResult>('/api/records/source-category', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ids, source_category: sourceCategory }),
+    body: JSON.stringify({
+      ids,
+      source_category: sourceCategory,
+      skip_conflicts: Boolean(options?.skipConflicts),
+      return_items: options?.returnItems ?? true,
+    }),
   })
+}
+
+export async function batchMoveSourceCategory(
+  ids: string[],
+  sourceCategory: string,
+  onProgress?: (done: number, total: number) => void,
+): Promise<Omit<SourceCategoryUpdateResult, 'items'>> {
+  const chunkSize = 500
+  let count = 0
+  let movedCount = 0
+  let unchangedCount = 0
+  const skippedConflicts: SkippedCategoryConflict[] = []
+  const total = ids.length
+  for (let offset = 0; offset < total; offset += chunkSize) {
+    const chunk = ids.slice(offset, offset + chunkSize)
+    const res = await assignSourceCategory(chunk, sourceCategory, {
+      skipConflicts: true,
+      returnItems: false,
+    })
+    count += res.count
+    movedCount += res.moved_count ?? res.count
+    unchangedCount += res.unchanged_count ?? 0
+    if (res.skipped_conflicts?.length) skippedConflicts.push(...res.skipped_conflicts)
+    onProgress?.(Math.min(total, offset + chunk.length), total)
+  }
+  return {
+    count,
+    moved_count: movedCount,
+    unchanged_count: unchangedCount,
+    skipped_conflicts: skippedConflicts,
+  }
 }
 
 export function retag(backend: string, overwrite: boolean) {

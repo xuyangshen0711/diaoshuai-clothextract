@@ -975,21 +975,35 @@ def _source_path(record: ImageRecord) -> Path | None:
 
 class SourceCategoryUpdate(BaseModel):
     source_category: str
-    ids: list[str] = Field(min_length=1, max_length=500)
+    ids: list[str] = Field(min_length=1, max_length=10000)
+    skip_conflicts: bool = False
+    return_items: bool = True
 
 
 @app.post("/api/records/source-category")
 def update_source_category(body: SourceCategoryUpdate):
     try:
-        records = assign_source_category(body.ids, body.source_category)
+        report = catalog_store.assign_source_category_report(
+            body.ids, body.source_category, skip_conflicts=body.skip_conflicts
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="记录不存在") from exc
     except CatalogConflict:
         raise
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    index = load_index()
-    return {"count": len(records), "items": [_serialize(record, index=index) for record in records]}
+    records = report["updated"]
+    items = []
+    if body.return_items and records:
+        index = load_index()
+        items = [_serialize(record, index=index, defer_oss_images=True) for record in records]
+    return {
+        "count": len(records),
+        "moved_count": report["moved_count"],
+        "unchanged_count": report["unchanged_count"],
+        "skipped_conflicts": report["skipped_conflicts"],
+        "items": items,
+    }
 
 
 @app.get("/api/records/{record_id}")

@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
-  assignSourceCategory,
+  batchMoveSourceCategory,
   deleteGalleryImages,
   getCatalog,
   getFilters,
@@ -13,6 +13,7 @@ import {
   type CatalogItem,
   type FilterMeta,
   type LibraryMeta,
+  type SkippedCategoryConflict,
   type Taxonomy,
 } from '../api'
 import TagEditor from '../components/TagEditor.vue'
@@ -43,10 +44,17 @@ const taxonomy = ref<Taxonomy>({
   tree: [],
   labels: [],
 })
-const bulkCategory = ref('本厂产品')
+const bulkCategory = ref('品牌资料包')
 const bulkMessage = ref('')
+const movedTargetCategory = ref('')
+const skippedConflicts = ref<SkippedCategoryConflict[]>([])
 const selectionMode = ref(false)
 const selected = ref(new Set<string>())
+const lastSelectedId = ref('')
+const moving = ref(false)
+const moveProgress = ref('')
+const moveConfirmOpen = ref(false)
+const moveConfirmDialog = ref<HTMLDialogElement | null>(null)
 const deleting = ref(false)
 const deletionMessage = ref('')
 const cleanupPending = ref(0)
@@ -389,53 +397,175 @@ async function load() {
   }
 }
 
-async function bulkAssign() {
-  bulkMessage.value = ''
-  if (!items.value.length) return
-  if (
-    !window.confirm(`将当前 ${items.value.length} 条结果的资料大类改为「${bulkCategory.value}」？`)
-  )
-    return
-  try {
-    await assignSourceCategory(
-      items.value.map((item) => item.id),
-      bulkCategory.value,
+const targetCategoryChoices = computed(() => sourceTabs.value.filter(item => item !== '全部'))
+const selectedItems = computed(() => items.value.filter(item => selected.value.has(item.id)))
+const movableItems = computed(() =>
+  selectedItems.value.filter(item => (item.source_category || '未分类') !== bulkCategory.value),
+)
+const alreadyInTargetCount = computed(() => selectedItems.value.length - movableItems.value.length)
+const leavingFactoryCount = computed(() =>
+  bulkCategory.value === '本厂产品'
+    ? 0
+    : movableItems.value.filter(item => item.source_category === '本厂产品').length,
+)
+const moveSourceSummary = computed(() => {
+  const counts = new Map<string, number>()
+  for (const item of movableItems.value) {
+    const src = item.source_category || '未分类'
+    counts.set(src, (counts.get(src) || 0) + 1)
+  }
+  return [...counts.entries()].map(([name, cnt]) => `${name} ${cnt} 款`).join('、')
+})
+
+function pickDefaultTargetCategory() {
+  const choices = targetCategoryChoices.value
+  if (!choices.length) return
+  if (bulkCategory.value === sourceCategory.value || !choices.includes(bulkCategory.value)) {
+    const preferred = ['品牌资料包', '网图趋势', '市调拍照', '本厂产品', '未分类'].find(
+      c => c !== sourceCategory.value && choices.includes(c),
     )
-    bulkMessage.value = `已将 ${items.value.length} 条结果改为${bulkCategory.value}`
-    await load()
-  } catch (reason) {
-    error.value = reason instanceof Error ? reason.message : String(reason)
+    if (preferred) bulkCategory.value = preferred
   }
 }
+
+watch(sourceCategory, () => {
+  pickDefaultTargetCategory()
+})
 
 function toggleSelectionMode() {
   selectionMode.value = !selectionMode.value
   selected.value.clear()
+  lastSelectedId.value = ''
+  if (selectionMode.value) pickDefaultTargetCategory()
 }
 
-function toggleImage(id: string) {
-  if (loading.value || deleting.value) return
-  if (selected.value.has(id)) selected.value.delete(id)
-  else selected.value.add(id)
+function selectVisibleItems() {
+  if (loading.value || deleting.value || moving.value) return
+  const next = new Set(selected.value)
+  for (const item of visibleItems.value) next.add(item.id)
+  selected.value = next
+}
+
+function selectAllFilteredItems() {
+  if (loading.value || deleting.value || moving.value) return
+  selected.value = new Set(items.value.map(item => item.id))
+}
+
+function clearSelection() {
+  selected.value.clear()
+  lastSelectedId.value = ''
+}
+
+function toggleImage(id: string, shiftKey = false) {
+  if (loading.value || deleting.value || moving.value) return
+  const shouldSelect = !selected.value.has(id)
+  if (shiftKey && lastSelectedId.value && lastSelectedId.value !== id) {
+    const startIdx = items.value.findIndex(item => item.id === lastSelectedId.value)
+    const endIdx = items.value.findIndex(item => item.id === id)
+    if (startIdx >= 0 && endIdx >= 0) {
+      const [lo, hi] = startIdx < endIdx ? [startIdx, endIdx] : [endIdx, startIdx]
+      const next = new Set(selected.value)
+      for (let i = lo; i <= hi; i++) {
+        const row = items.value[i]
+        if (!row) continue
+        if (shouldSelect) next.add(row.id)
+        else next.delete(row.id)
+      }
+      selected.value = next
+      lastSelectedId.value = id
+      return
+    }
+  }
+  if (shouldSelect) selected.value.add(id)
+  else selected.value.delete(id)
+  lastSelectedId.value = id
+}
+
+function onCheckboxClick(event: MouseEvent, id: string) {
+  event.stopPropagation()
+  toggleImage(id, event.shiftKey)
 }
 
 function onCardClick(event: MouseEvent, id: string) {
   if (!selectionMode.value) return
   event.preventDefault()
-  toggleImage(id)
+  toggleImage(id, event.shiftKey)
+}
+
+async function openMoveConfirm() {
+  error.value = ''
+  bulkMessage.value = ''
+  movedTargetCategory.value = ''
+  skippedConflicts.value = []
+  if (!selectedItems.value.length || loading.value || moving.value || deleting.value) return
+  if (!movableItems.value.length) {
+    bulkMessage.value = `已选的 ${selectedItems.value.length} 款原本就在「${bulkCategory.value}」板块中，无需重复转移。`
+    return
+  }
+  moveConfirmOpen.value = true
+  await nextTick()
+  moveConfirmDialog.value?.showModal()
+}
+
+function closeMoveConfirm() {
+  if (moving.value) return
+  moveConfirmDialog.value?.close()
+  moveConfirmOpen.value = false
+}
+
+async function confirmBatchMove() {
+  if (!movableItems.value.length || moving.value) return
+  const target = bulkCategory.value
+  const ids = movableItems.value.map(item => item.id)
+  moving.value = true
+  moveProgress.value = `0 / ${ids.length}`
+  error.value = ''
+  deletionMessage.value = ''
+  try {
+    const result = await batchMoveSourceCategory(ids, target, (done, total) => {
+      moveProgress.value = `${done} / ${total}`
+    })
+    moveConfirmDialog.value?.close()
+    moveConfirmOpen.value = false
+    skippedConflicts.value = result.skipped_conflicts || []
+    if (skippedConflicts.value.length) {
+      const skippedIds = new Set(skippedConflicts.value.map(c => c.id))
+      selected.value = skippedIds
+    } else {
+      selected.value.clear()
+      selectionMode.value = false
+    }
+    lastSelectedId.value = ''
+    movedTargetCategory.value = result.moved_count > 0 ? target : ''
+    bulkMessage.value = result.moved_count > 0
+      ? `已将 ${result.moved_count} 款正式转移至「${target}」。`
+      : `没有可转移的款式。`
+    await load()
+  } catch (reason) {
+    moveConfirmDialog.value?.close()
+    moveConfirmOpen.value = false
+    error.value = reason instanceof Error ? reason.message : String(reason)
+  } finally {
+    moving.value = false
+    moveProgress.value = ''
+  }
 }
 
 async function deleteSelected() {
-  const ids = items.value.filter(item => selected.value.has(item.id)).map(item => item.id)
-  if (!ids.length || deleting.value || loading.value) return
+  const ids = selectedItems.value.map(item => item.id)
+  if (!ids.length || deleting.value || moving.value || loading.value) return
   if (!window.confirm(`删除已选的 ${ids.length} 张图片？删除后无法在图库内恢复。`)) return
   deleting.value = true
   error.value = ''
+  bulkMessage.value = ''
+  movedTargetCategory.value = ''
+  skippedConflicts.value = []
   deletionMessage.value = ''
   cleanupPending.value = 0
   try {
     const result = await deleteGalleryImages(ids)
     selected.value.clear()
+    lastSelectedId.value = ''
     selectionMode.value = false
     deletionMessage.value = `已删除 ${result.deleted} 张图片。`
     cleanupPending.value = result.cleanup_pending
@@ -765,41 +895,104 @@ watch(() => route.query, () => {
             <option value="replenishment">补单次数</option>
           </select>
         </label>
-        <button type="button" class="btn small" :aria-pressed="selectionMode" :disabled="deleting || (!items.length && !selectionMode)" @click="toggleSelectionMode">
-          {{ selectionMode ? '退出选择' : '批量删除' }}
+        <button
+          type="button"
+          class="btn small"
+          :class="{ 'is-active-mode': selectionMode }"
+          :aria-pressed="selectionMode"
+          :disabled="deleting || moving || (!items.length && !selectionMode)"
+          @click="toggleSelectionMode"
+        >
+          {{ selectionMode ? '退出批量管理' : '批量管理' }}
         </button>
-        <details class="quiet-more">
-          <summary>更多</summary>
-          <div class="quiet-more-body">
-            <label for="bulk-category">将当前结果的资料大类改为</label>
-            <select id="bulk-category" v-model="bulkCategory">
-              <option
-                v-for="item in sourceTabs.filter((item) => item !== '全部')"
-                :key="item"
-                :value="item"
-              >
-                {{ item }}
-              </option>
-            </select>
-            <button
-              class="btn"
-              type="button"
-              :disabled="!items.length || loading"
-              @click="bulkAssign"
-            >
-              应用到当前结果
-            </button>
-            <span v-if="bulkMessage" class="meta">{{ bulkMessage }}</span>
-          </div>
-        </details>
       </div>
     </div>
 
-    <div v-if="selectionMode" class="gallery-selection-toolbar" aria-label="批量选择">
-      <span role="status">已选 {{ selected.size }} 张</span>
-      <button type="button" class="btn small" :disabled="loading || deleting || !items.length || selected.size === items.length" @click="selected = new Set(items.map(item => item.id))">全选当前结果</button>
-      <button type="button" class="btn small" :disabled="deleting || !selected.size" @click="selected.clear()">清空选择</button>
-      <button type="button" class="btn small media-delete" :disabled="loading || deleting || !selected.size" @click="deleteSelected">{{ deleting ? '正在删除…' : '删除已选图片' }}</button>
+    <div v-if="selectionMode" class="gallery-selection-toolbar" aria-label="批量管理">
+      <div class="selection-toolbar-group">
+        <strong class="selection-count-badge" role="status">已选 {{ selectedItems.length }} 款</strong>
+        <button
+          v-if="visibleItems.length < items.length"
+          type="button"
+          class="btn small"
+          :disabled="loading || deleting || moving || !visibleItems.length"
+          @click="selectVisibleItems"
+        >
+          全选已展示（{{ visibleItems.length }}）
+        </button>
+        <button
+          type="button"
+          class="btn small"
+          :disabled="loading || deleting || moving || !items.length || selectedItems.length === items.length"
+          @click="selectAllFilteredItems"
+        >
+          全选当前结果（{{ items.length }}）
+        </button>
+        <button
+          type="button"
+          class="btn small"
+          :disabled="deleting || moving || !selectedItems.length"
+          @click="clearSelection"
+        >
+          清空选择
+        </button>
+        <span class="selection-shift-tip">提示：按住 Shift 点击卡片可连续多选</span>
+      </div>
+
+      <div class="selection-toolbar-actions">
+        <div class="selection-move-group">
+          <label for="bulk-category">转移至板块</label>
+          <select id="bulk-category" v-model="bulkCategory" :disabled="moving || deleting">
+            <option
+              v-for="opt in targetCategoryChoices"
+              :key="opt"
+              :value="opt"
+            >
+              {{ opt }}{{ opt === sourceCategory ? '（当前板块）' : '' }}
+            </option>
+          </select>
+          <button
+            type="button"
+            class="btn small batch-move-btn"
+            :disabled="loading || deleting || moving || !selectedItems.length"
+            @click="openMoveConfirm"
+          >
+            {{ moving ? `正在转移 ${moveProgress}…` : `正式转移已选（${selectedItems.length}）` }}
+          </button>
+        </div>
+
+        <button
+          type="button"
+          class="btn small media-delete"
+          :disabled="loading || deleting || moving || !selectedItems.length"
+          @click="deleteSelected"
+        >
+          {{ deleting ? '正在删除…' : `删除已选（${selectedItems.length}）` }}
+        </button>
+      </div>
+    </div>
+
+    <div v-if="bulkMessage || skippedConflicts.length" class="gallery-move-feedback" role="status">
+      <p v-if="bulkMessage" class="gallery-move-success">
+        {{ bulkMessage }}
+        <button
+          v-if="movedTargetCategory && movedTargetCategory !== sourceCategory"
+          type="button"
+          class="text-button"
+          @click="setSource(movedTargetCategory); bulkMessage = ''; movedTargetCategory = ''"
+        >
+          去「{{ movedTargetCategory }}」查看 →
+        </button>
+      </p>
+      <div v-if="skippedConflicts.length" class="gallery-move-conflicts" role="alert">
+        <strong>以下 {{ skippedConflicts.length }} 款因「本厂产品」已有同款号主图，已自动跳过未转移：</strong>
+        <ul>
+          <li v-for="c in skippedConflicts.slice(0, 20)" :key="c.id">
+            款号 <code>{{ c.style_code }}</code>（来源文件：{{ c.source_file }}）
+          </li>
+          <li v-if="skippedConflicts.length > 20">…等共 {{ skippedConflicts.length }} 款冲突项</li>
+        </ul>
+      </div>
     </div>
     <p v-if="deletionMessage" class="gallery-delete-result" role="status">
       {{ deletionMessage }}
@@ -816,8 +1009,8 @@ watch(() => route.query, () => {
     <template v-else>
       <div class="gallery-grid" :aria-busy="loading">
         <article v-for="(item, idx) in visibleItems" :key="item.id" class="gallery-card" :class="{ 'is-selected': selected.has(item.id) }">
-          <label v-if="selectionMode" class="gallery-card-select">
-            <input type="checkbox" :aria-label="`选择 ${cardTitle(item)} · ${item.source.source_file} ${item.source.location}`" :checked="selected.has(item.id)" :disabled="deleting || loading" @change="toggleImage(item.id)" />
+          <label v-if="selectionMode" class="gallery-card-select" @click.stop>
+            <input type="checkbox" :aria-label="`选择 ${cardTitle(item)} · ${item.source.source_file} ${item.source.location}`" :checked="selected.has(item.id)" :disabled="deleting || moving || loading" @click="onCheckboxClick($event, item.id)" />
           </label>
           <RouterLink
             class="gallery-card-link"
@@ -902,6 +1095,46 @@ watch(() => route.query, () => {
         </button>
       </div>
     </template>
+    <dialog
+      v-if="moveConfirmOpen"
+      ref="moveConfirmDialog"
+      class="batch-move-dialog"
+      aria-labelledby="batch-move-dialog-title"
+      @cancel.prevent="closeMoveConfirm"
+    >
+      <div class="batch-move-dialog-body">
+        <h2 id="batch-move-dialog-title">确认正式转移板块</h2>
+        <p class="batch-move-summary">
+          确定要将已选的 <strong>{{ movableItems.length }} 款</strong>衣服正式转移至「<strong>{{ bulkCategory }}</strong>」吗？
+        </p>
+        <div class="batch-move-route">
+          <span>来源：{{ moveSourceSummary }}</span>
+          <span aria-hidden="true">→</span>
+          <strong>目标板块：{{ bulkCategory }}</strong>
+        </div>
+        <p v-if="alreadyInTargetCount > 0" class="batch-move-note">
+          （另有 {{ alreadyInTargetCount }} 款原本已在「{{ bulkCategory }}」中，将自动保持不变。）
+        </p>
+        <p v-if="bulkCategory === '本厂产品'" class="batch-move-note">
+          移入「本厂产品」时会自动按文件名或备注识别款号；若本厂已有同款号主图，系统会自动跳过冲突款并在完成后列出清单，不会覆盖现有本厂主图。
+        </p>
+        <p v-if="leavingFactoryCount > 0" class="batch-move-note">
+          其中有 {{ leavingFactoryCount }} 款来自「本厂产品」：移出后将自动释放本厂主款号占用，原款号文字仍会保留在款式备注中。
+        </p>
+        <p
+          v-if="movableItems.length >= 100 || (items.length >= 20 && selectedItems.length === items.length)"
+          class="batch-move-caution"
+        >
+          注意：本次共转移 {{ movableItems.length }} 款，数量较多，请确认目标板块「{{ bulkCategory }}」无误后再执行。
+        </p>
+        <footer class="batch-move-dialog-actions">
+          <button type="button" class="btn" :disabled="moving" @click="closeMoveConfirm">取消</button>
+          <button type="button" class="btn batch-move-confirm-btn" :disabled="moving" @click="confirmBatchMove">
+            {{ moving ? `正在正式转移（${moveProgress}）…` : `确认正式转移（${movableItems.length} 款）` }}
+          </button>
+        </footer>
+      </div>
+    </dialog>
     <TagEditor v-if="editing" :key="editing.id" :item="editing" @close="editing = null" @saved="tagsSaved" />
   </main>
 </template>
