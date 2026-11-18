@@ -131,4 +131,7 @@ def test_site_gate_preserves_zero_copy_pathsend_for_images(store, monkeypatch):
     assert types[0] == "http.response.start"
     assert sent_messages[0]["status"] == 200
     assert "http.response.pathsend" in types or sum(len(m.get("body", b"")) for m in sent_messages) > 500
+    from src.images import thumbnail_path
+    thumb_file = thumbnail_path(rec.id, rec.image_path)
+    assert (thumb_file.stat().st_mode & 0o777) == 0o644
 

@@ -70,6 +70,7 @@ def _render_thumbnail_file(local: Path, target: Path, crop: CoverCrop | None = N
             with tempfile.NamedTemporaryFile(dir=folder, suffix=".jpg", delete=False) as temp:
                 temp_path = Path(temp.name)
                 image.save(temp, format="JPEG", quality=88, subsampling=0)
+            os.chmod(temp_path, 0o644)
             os.replace(temp_path, target)
         finally:
             if temp_path is not None:
