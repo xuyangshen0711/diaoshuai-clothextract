@@ -616,13 +616,13 @@ watch(() => route.query, () => {
     <div class="gallery-page-heading">
       <h1>款式图库</h1>
       <form class="library-search" @submit.prevent="applySearch(queryDraft)">
-        <label class="visually-hidden" for="library-search">搜索款号、客户、颜色名</label
+        <label class="visually-hidden" for="library-search">搜索款号、品类、图案、颜色、客户</label
         ><input
           id="library-search"
           :value="queryDraft"
           type="search"
           name="library-search"
-          placeholder="搜索款号、客户、颜色名…"
+          placeholder="搜索款号、品类、图案、颜色、客户…"
           @input="onSearchInput"
         />
       </form>
@@ -888,7 +888,7 @@ watch(() => route.query, () => {
               )
             "
           >
-            <option value="imported">最新导入</option>
+            <option value="imported">{{ q ? '相关度优先' : '最新导入' }}</option>
             <option value="sales">按订单件数</option>
             <option value="amount">按订单金额</option>
             <option value="ordered">最近下单</option>

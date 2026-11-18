@@ -74,6 +74,7 @@ from src.schema import (  # noqa: E402
     ReviewStatus,
     coerce_source_category,
 )
+from src.search.gallery_query import filter_and_rank_gallery  # noqa: E402
 from src.search.query import filter_records, search_by_image, search_by_text  # noqa: E402
 from src.search.inspiration import parse_inspiration  # noqa: E402
 from src.tag.tagger import (  # noqa: E402
@@ -288,8 +289,16 @@ def _factory_filters(
                 ordered_from=ordered_from, ordered_to=ordered_to)
 
 
-def _narrow(records: list[ImageRecord], *, filters: dict, group: str | None, q: str | None,
-            source_category: str | None, factory_filters: dict, index) -> list[ImageRecord]:
+def _narrow_with_scores(
+    records: list[ImageRecord],
+    *,
+    filters: dict,
+    group: str | None,
+    q: str | None,
+    source_category: str | None,
+    factory_filters: dict,
+    index,
+) -> tuple[list[ImageRecord], dict[str, float]]:
     if source_category and source_category not in {"", "全部"}:
         records = [record for record in records if record.source_category == source_category]
     category = filters.get("category")
@@ -322,8 +331,21 @@ def _narrow(records: list[ImageRecord], *, filters: dict, group: str | None, q: 
     chosen = [record for record in projected
               if matches_factory(record, index, **factory_filters)]
     if q and q.strip():
-        needle = q.strip().lower()
-        chosen = [record for record in chosen if needle in record.search_text().lower()]
+        return filter_and_rank_gallery(chosen, q, index=index)
+    return chosen, {}
+
+
+def _narrow(records: list[ImageRecord], *, filters: dict, group: str | None, q: str | None,
+            source_category: str | None, factory_filters: dict, index) -> list[ImageRecord]:
+    chosen, _scores = _narrow_with_scores(
+        records,
+        filters=filters,
+        group=group,
+        q=q,
+        source_category=source_category,
+        factory_filters=factory_filters,
+        index=index,
+    )
     return chosen
 
 
@@ -504,15 +526,30 @@ def catalog(
             if batch:
                 records = [r for r in records if r.source.batch_id == batch]
             basis_filters, basis_factory = _without_color(filters, factory_filters, source_category)
-            basis = _narrow(records, filters=basis_filters, group=group, q=q, source_category=source_category,
-                            factory_filters=basis_factory, index=index)
+            basis, scores = _narrow_with_scores(
+                records,
+                filters=basis_filters,
+                group=group,
+                q=q,
+                source_category=source_category,
+                factory_filters=basis_factory,
+                index=index,
+            )
             counts = color_tally(basis, index, source_category)
             if basis_filters == filters and basis_factory == factory_filters:
                 records = list(basis)
             else:
-                records = _narrow(records, filters=filters, group=group, q=q, source_category=source_category,
-                                  factory_filters=factory_filters, index=index)
+                records, scores = _narrow_with_scores(
+                    records,
+                    filters=filters,
+                    group=group,
+                    q=q,
+                    source_category=source_category,
+                    factory_filters=factory_filters,
+                    index=index,
+                )
             statistics = order_statistics_index(index, **factory_filters)
+            has_query = bool(q and q.strip())
             if sort == "sales":
                 records.sort(key=lambda record: (
                     -(statistics.sales_totals(record.style_code)[0] if record.source_category == "本厂产品" else 0),
@@ -533,6 +570,11 @@ def catalog(
                     -(style_activity(statistics, record.style_code)["replenishment_count"] if record.source_category == "本厂产品" else 0),
                     record.style_code, record.id,
                 ))
+            elif has_query and sort in {None, "", "imported", "relevance"}:
+                records.sort(
+                    key=lambda record: (scores.get(record.id, 0.0), imported_at(record), record.id),
+                    reverse=True,
+                )
             elif sort == "imported":
                 records.sort(key=lambda record: (imported_at(record), record.id), reverse=True)
             filtered = perf_counter()

@@ -1,14 +1,15 @@
 {
-  "release": "20261118-batch-manage",
-  "base_commit": "5191abf15a69890ead84e5bc0b8f68dc85135730",
-  "base_code_sha256": "0c8707bdc939996c4252850a06548a76ee44db45fd1bdb1d29b41b487beb64b8",
-  "previous_release": "20261117-vision-speed",
+  "release": "20261118-search-precision",
+  "base_commit": "3e0fae048cfadcbf070f706b6a0ccdba92a48575",
+  "base_code_sha256": "a91940a627eae290889c751f4025f8b0b3fda1ecc663e77205084ae8a2170ee2",
+  "previous_release": "20261118-batch-manage",
   "includes_local_changes": true,
   "prebuilt_frontend": true,
   "business_data_included": false,
   "local_configuration_included": false,
   "database_schema_changes": false,
   "preserved_features": [
+    "unified gallery 批量管理 with confirmation dialog and conflict skip",
     "fast DeepSeek vision tagging (6x concurrency, 1280px JPEG derivative)",
     "whole-site browsing speed v2",
     "yarn-and-color-report",
@@ -17,8 +18,8 @@
     "archive 500-row batch import"
   ],
   "validation": {
-    "regressions": "All batch-source-category, vision tagging, response-speed, factory, analytics, yarn-table, image-quality, storage, taxonomy, and site-gate suites passed (66 passed, 0 failed)",
-    "batch_manage": "Upgraded gallery selection mode to unified 批量管理 (single/Shift-range/visible/all selection + mandatory formal transfer confirmation dialog + chunked large-batch transfer without 500-item error), removed dangerous unselective bulk move popover, added skip_conflicts non-blocking conflict report when moving into 本厂产品, and automatically released style_code (while preserving notes.款号) when moving out of 本厂产品",
-    "live_rds_and_oss": "Pre-edit online /opt/diaoshuai and local main project verified identical (213 files, 0c8707bdc939996c4252850a06548a76ee44db45fd1bdb1d29b41b487beb64b8)"
+    "regressions": "All gallery-search-precision, batch-source-category, design-notes, vision tagging, response-speed, factory, analytics, yarn-table, image-quality, storage, taxonomy, and site-gate suites passed (82+ passed, 0 new failures)",
+    "search_precision": "Visual/tag terms match visual fields + factory archive only (never PDF small-print notes or source_file), pattern terms exclude AI-confirmed 纯色/无明显图案 garments unless human-overridden or factory colorway, compound queries (条纹上衣, 条纹毛衣, 蓝色条纹开衫) filter all structured tokens simultaneously, and non-empty search defaults to relevance-first ranking",
+    "live_rds_and_oss": "Pre-edit online /opt/diaoshuai and local main project verified identical (216 files, a91940a627eae290889c751f4025f8b0b3fda1ecc663e77205084ae8a2170ee2)"
   }
 }
