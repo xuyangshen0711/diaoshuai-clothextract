@@ -86,7 +86,50 @@ CREATE TABLE IF NOT EXISTS style_order_lines (
     PRIMARY KEY (order_no, variant_code, color, size_label)
 );
 CREATE INDEX IF NOT EXISTS style_order_lines_style ON style_order_lines(style_code);
+CREATE TABLE IF NOT EXISTS style_stock_lines (
+    order_no TEXT NOT NULL,
+    variant_code TEXT NOT NULL,
+    color TEXT NOT NULL,
+    size_label TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    style_code TEXT NOT NULL,
+    customer_raw TEXT NOT NULL DEFAULT '',
+    order_date TEXT NOT NULL DEFAULT '',
+    season TEXT NOT NULL DEFAULT '',
+    source_file TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (order_no, variant_code, color, size_label)
+);
+CREATE INDEX IF NOT EXISTS style_stock_lines_style ON style_stock_lines(style_code);
+CREATE TABLE IF NOT EXISTS style_production (
+    variant_code TEXT NOT NULL,
+    color TEXT NOT NULL,
+    size_label TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    style_code TEXT NOT NULL,
+    design_code TEXT NOT NULL DEFAULT '',
+    source_file TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (variant_code, color, size_label)
+);
+CREATE INDEX IF NOT EXISTS style_production_style ON style_production(style_code);
+CREATE TABLE IF NOT EXISTS style_design_guide (
+    variant_code TEXT NOT NULL,
+    season TEXT NOT NULL,
+    style_code TEXT NOT NULL,
+    design_code TEXT NOT NULL DEFAULT '',
+    material TEXT NOT NULL DEFAULT '',
+    designer TEXT NOT NULL DEFAULT '',
+    craftsman TEXT NOT NULL DEFAULT '',
+    colors_json TEXT NOT NULL,
+    source_file TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (variant_code, season)
+);
 """
+
+# 季度款式分析新增的三张表（只新增，不改动已有表）。
+SEASON_TABLES = ("style_stock_lines", "style_production", "style_design_guide")
 
 
 def _column_names(conn, table: str) -> set[str]:

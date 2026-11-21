@@ -8,11 +8,12 @@ import {
 import AnalyticsChat from '../components/AnalyticsChat.vue'
 import AnalyticsReport from '../components/AnalyticsReport.vue'
 import AnalyticsYarnTable from '../components/AnalyticsYarnTable.vue'
+import AnalyticsSeason from '../components/AnalyticsSeason.vue'
 import '../styles/analytics.css'
 
 const route = useRoute()
 const tab = ref(
-  route.query.tab === 'questions' ? 'questions' : route.query.tab === 'yarn' ? 'yarn' : 'report',
+  route.query.tab === 'questions' ? 'questions' : route.query.tab === 'yarn' ? 'yarn' : route.query.tab === 'season' ? 'season' : 'report',
 )
 const session = ref<AnalysisSession | null>(null)
 const options = ref<AnalysisOptions | null>(null)
@@ -26,6 +27,7 @@ const downloading = ref(false)
 const useDeepseek = ref(false)
 const asking = ref(false)
 const yarnBusy = ref(false)
+const seasonBusy = ref(false)
 const yarnRef = ref<InstanceType<typeof AnalyticsYarnTable> | null>(null)
 const returnToLibrary = computed(() => typeof route.query.source === 'string' && route.query.source !== '全部'
   ? { name: 'library', query: { source_category: route.query.source } } : '/')
@@ -187,6 +189,7 @@ async function download() {
       <nav class="analytics-tabs" aria-label="分析方式">
         <button type="button" :aria-pressed="tab === 'report'" @click="switchTab('report')">生成报告</button>
         <button type="button" :aria-pressed="tab === 'yarn'" @click="switchTab('yarn')">纱线与色卡表</button>
+        <button type="button" :aria-pressed="tab === 'season'" @click="switchTab('season')">季度款式分析</button>
         <button type="button" :aria-pressed="tab === 'questions'" @click="switchTab('questions')">问数据</button>
       </nav>
 
@@ -244,6 +247,8 @@ async function download() {
       </div>
 
       <AnalyticsYarnTable v-show="tab === 'yarn'" ref="yarnRef" v-model:busy="yarnBusy" :active="tab === 'yarn'" />
+
+      <AnalyticsSeason v-show="tab === 'season'" v-model:busy="seasonBusy" :active="tab === 'season'" />
 
       <AnalyticsChat v-show="tab === 'questions'" v-model:busy="asking" :deepseek-configured="session.deepseek_configured" />
     </template>

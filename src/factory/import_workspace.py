@@ -13,9 +13,12 @@ from src.factory.archive import parse_archive_rows, write_archive
 from src.factory.codes import parse_style_code
 from src.factory.excel_io import (cell_at, column_index, find_header, load_sheet_rows, parse_number,
                                  plain_text, sheet_headers, table_kind_from_headers)
-from src.factory.sales import _stored_totals, _write_lines, _write_summary, is_total_row, parse_sales_rows
+from src.factory import season_sources
+from src.factory.sales import (
+    _stored_totals, _write_lines, _write_summary, classify_line, is_total_row, parse_sales_rows, write_stock_lines,
+)
 from src.factory.sales_policy import historical_range, policy_summary
-from src.factory.sales_deletion import capture_batch, mutation_lock, public_report, read_rows, row_id
+from src.factory.sales_deletion import KEYS as SALES_KEYS, _json, capture_batch, mutation_lock, public_report, read_rows, row_id
 from src.factory.tables import gap_report, now, own_factory_images
 from src.factory.import_impact import import_impact, projected_impact
 
@@ -172,6 +175,8 @@ def _issues(path, kind, fmt, *, sheet_rows=None) -> tuple[list, int]:
         if code is None:
             message = "款号为空或格式无效"
         elif kind == "sales":
+            if fmt == "sales_lines" and classify_line(row, idx) != "order":
+                continue  # 备单、1 件小备单、无金额发样：按规则不计销量，不算异常
             missing = [name for name in ("颜色", "尺码") if not plain_text(cell_at(row, idx.get(name)))]
             missing += [name for name in ("订单数量", "订单金额") if parse_number(cell_at(row, idx.get(name))) is None]
             if fmt == "sales_lines" and not plain_text(cell_at(row, idx.get("订单号", idx.get("订单")))):
@@ -192,16 +197,26 @@ def _folder() -> Path:
 def preview_table(path: Path, filename: str, requested_kind: str) -> dict:
     sheet_rows = load_sheet_rows(path)
     kind = table_kind_from_headers(sheet_headers(sheet_rows))
+    if kind in season_sources.TABLES:
+        return _preview_season_source(path, filename, requested_kind, kind, sheet_rows)
     if kind not in {"archive", "sales"}:
-        raise ValueError("未识别到款式档案或销量表，请检查表头。")
+        raise ValueError("未识别到商品资料表、订单数据、生产数据或款式指示书，请检查表头。")
+    stock_lines: list[dict] = []
     if kind == "archive":
         rows, skipped, warnings, recognized = parse_archive_rows(path, sheet_rows=sheet_rows)
         meta = {**recognized, "skipped_rows": skipped, "warnings": warnings}
+        missing_fields = [r["variant_code"] for r in rows if not r["category"] or not r["material"]]
+        if missing_fields:
+            meta["warnings"] = [*warnings, f"{len(missing_fields)} 款缺少一级品类或原料名称（"
+                                + "、".join(missing_fields[:8]) + ("等" if len(missing_fields) > 8 else "")
+                                + "），季度款式分析会单列为「未填品类 / 其他原料」，建议补填后重新导入。"]
     else:
         rows, meta = parse_sales_rows(path, sheet_rows=sheet_rows)
+        stock_lines = meta.pop("stock_lines", [])
     issues, ignored = _issues(path, kind, meta["format"], sheet_rows=sheet_rows)
     del sheet_rows
     token = uuid4().hex
+    season_replace = None
     with catalog.read_database() as conn:
         tables_data = {
             t: [dict(r) for r in conn.execute(f"SELECT * FROM {t}")]
@@ -236,6 +251,8 @@ def preview_table(path: Path, filename: str, requested_kind: str) -> dict:
             impact = projected_impact(
                 before_sales, plan, "orders" if meta["format"] == "sales_lines" else "summary", rows,
             )
+            if meta["format"] == "sales_lines":
+                season_replace = _season_replace_preview(conn, before_sales, plan, rows, stock_lines)
         else:
             impact = None
     collisions = sorted({r["variant_code"] for r in rows} & (summarized if meta["format"] == "sales_lines" else ordered)) if kind == "sales" else []
@@ -250,12 +267,18 @@ def preview_table(path: Path, filename: str, requested_kind: str) -> dict:
                 "can_confirm": bool(rows)}
     if impact is not None:
         response["impact"] = impact
-    manifest = {"response": response, "rows": rows, "base_rows": rows, "fingerprint": state, "created_at": now()}
+    if kind == "sales" and meta["format"] == "sales_lines":
+        response["season_replace"] = season_replace
+        response["exclusions"] = {name: meta.get(name, 0) for name in (
+            "sample_rows", "sample_quantity", "stock_rows", "stock_quantity", "tiny_stock_rows", "tiny_stock_quantity")}
+        response["exclusions"]["stock_style_count"] = len({r["variant_code"] for r in stock_lines})
+    manifest = {"response": response, "rows": rows, "base_rows": rows, "fingerprint": state, "created_at": now(),
+                "stock_lines": stock_lines}
     (_folder() / f"{token}.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
     return response
 
 
-def confirm_table(token: str, acknowledge=False, historical_start="", historical_end="") -> dict:
+def confirm_table(token: str, acknowledge=False, historical_start="", historical_end="", replace_season=False) -> dict:
     if not re.fullmatch(r"[a-f0-9]{32}", token):
         raise ValueError("预览编号无效，请重新选择文件。")
     with mutation_lock, catalog._database() as conn:
@@ -269,9 +292,12 @@ def confirm_table(token: str, acknowledge=False, historical_start="", historical
         age = datetime.now(timezone.utc) - datetime.fromisoformat(manifest["created_at"])
         if age.total_seconds() > 86400:
             raise ValueError("预览已超过 24 小时，请重新选择文件。")
+        preview = manifest["response"]
+        if preview["kind"] in season_sources.TABLES:
+            report = _confirm_season_source(conn, token, manifest, acknowledge)
+            return public_report(report)
         if manifest["fingerprint"] != _fingerprint(conn):
             raise catalog.CatalogConflict("资料在预览后有更新，请重新预览再导入。")
-        preview = manifest["response"]
         if "historical_start" in preview and (preview["historical_start"], preview["historical_end"]) != (historical_start, historical_end):
             raise ValueError("日期范围与预览不一致，请重新预览范围。")
         if not preview["can_confirm"]:
@@ -288,15 +314,30 @@ def confirm_table(token: str, acknowledge=False, historical_start="", historical
         changed = [p["row"] for p in plan if p["action"] != "unchanged"]
         before_sales = read_rows(conn) if kind == "sales" else {}
         row_kind = "orders" if fmt == "sales_lines" else "summary"
+        stock_lines = manifest.get("stock_lines", [])
+        removed: dict = {}
+        seasons: list[str] = []
+        if replace_season:
+            info = preview.get("season_replace") or {}
+            if kind != "sales" or fmt != "sales_lines" or not info.get("available"):
+                raise ValueError("只有带年度、季节列的订单明细可以整季替换。")
+            seasons, removed = _season_removals(before_sales, rows, stock_lines)
+            if seasons != info["seasons"] or len(removed) != info["removed_rows"]:
+                raise catalog.CatalogConflict("订单数据在预览后有变化，请重新预览再导入。")
         if kind == "sales":
-            expected_impact = projected_impact(before_sales, plan, row_kind, rows, historical_start, historical_end)
+            expected_impact = projected_impact(before_sales, plan, row_kind, rows, historical_start, historical_end,
+                                               removed=removed.keys())
             # Old API callers could supply a historical range at confirmation. Keep that
             # route compatible; the UI still requires re-previewing every range change.
             same_range = (preview.get("historical_start", ""), preview.get("historical_end", "")) == (historical_start, historical_end)
-            if preview.get("impact") is not None and same_range and preview["impact"] != expected_impact:
+            shown = preview["season_replace"]["impact"] if replace_season else preview.get("impact")
+            if shown is not None and same_range and shown != expected_impact:
                 raise catalog.CatalogConflict("导入影响已变化，请重新预览后再确认。")
+        replaced = _delete_replaced(conn, token, preview, seasons, removed) if removed else None
         writer = write_archive if kind == "archive" else _write_lines if fmt == "sales_lines" else _write_summary
         imported, updated = writer(conn, changed, preview["source_file"])
+        if kind == "sales" and fmt == "sales_lines":
+            write_stock_lines(conn, stock_lines, preview["source_file"], replace_seasons=seasons or None)
         if historical_start:
             extra = json.dumps({"historical": {"start": historical_start, "end": historical_end}})
             for r in rows:
@@ -309,6 +350,10 @@ def confirm_table(token: str, acknowledge=False, historical_start="", historical
                   "style_codes": preview["style_codes"], "issue_count": preview["issue_count"],
                   "stored_quantity": quantity, "stored_amount": round(amount, 2), **gap_report(conn),
                   "sales_policy": policy_summary(conn)}
+        if kind == "sales" and fmt == "sales_lines":
+            report["exclusions"] = preview.get("exclusions", {})
+            report["season_replace"] = {"enabled": bool(replace_season), "seasons": seasons,
+                                        "removed_rows": len(removed), **(replaced or {})}
         if kind == "sales":
             after_sales = read_rows(conn)
             actual_impact = import_impact(before_sales, after_sales, row_kind, rows)
@@ -374,3 +419,136 @@ def replan_table(token: str, historical_start="", historical_end="") -> dict:
     manifest["rows"] = rows
     (_folder() / f"{new_token}.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
     return preview
+
+
+# ---------------------------------------------------------------- 整季替换（订单明细）
+def _season_removals(before_sales, rows, stock_lines) -> tuple[list[str], dict]:
+    """同季节、但新表里已经没有的旧订单明细（ERP 里已删除或改单）。"""
+    seasons = sorted({r.get("season", "") for r in rows if r.get("season")}
+                     | {s["season"] for s in stock_lines if s.get("season")})
+    incoming = {row_id("orders", r) for r in rows}
+    removed = {key: entry for key, entry in before_sales.items()
+               if entry["kind"] == "orders" and entry["row"].get("season") in seasons and key not in incoming}
+    return seasons, removed
+
+
+def _season_replace_preview(conn, before_sales, plan, rows, stock_lines) -> dict:
+    seasons, removed = _season_removals(before_sales, rows, stock_lines)
+    stock_removed = 0
+    if seasons:
+        incoming = {(s["order_no"], s["variant_code"], s["color"], s["size_label"]) for s in stock_lines}
+        marks = ", ".join("?" for _ in seasons)
+        stock_removed = sum(
+            (r["order_no"], r["variant_code"], r["color"], r["size_label"]) not in incoming
+            for r in conn.execute("SELECT order_no, variant_code, color, size_label FROM style_stock_lines "
+                                  f"WHERE season IN ({marks})", seasons))
+    old = sorted((entry["row"] for entry in removed.values()),
+                 key=lambda r: (r.get("order_date", ""), r.get("order_no", ""), r.get("variant_code", "")))
+    return {
+        "available": bool(seasons), "default": bool(seasons), "seasons": seasons,
+        "blank_season_rows": sum(1 for r in rows if not r.get("season")),
+        "removed_rows": len(removed),
+        "removed_quantity": sum(int(r["quantity"]) for r in old),
+        "removed_amount": round(sum(float(r["amount"]) for r in old), 2),
+        "removed_style_count": len({r["style_code"] for r in old}),
+        "removed_samples": [{k: r.get(k, "") for k in ("order_no", "variant_code", "color", "size_label",
+                                                       "quantity", "order_date")} for r in old[:10]],
+        "stock_removed_rows": stock_removed,
+        "impact": projected_impact(before_sales, plan, "orders", rows, removed=removed.keys()),
+    }
+
+
+def _delete_replaced(conn, token, preview, seasons, removed) -> dict:
+    """整季替换移除的旧明细先完整备份到「销量删除记录」，可以在「管理订单数据」里恢复。"""
+    audit_id = uuid4().hex
+    created = now()
+    rows = [removed[key]["row"] for key in sorted(removed)]
+    quantity = sum(int(r["quantity"]) for r in rows)
+    amount = round(sum(float(r["amount"]) for r in rows), 2)
+    audit = {"id": audit_id, "created_at": created, "scope": "season_replace", "batch_id": token,
+             "preview": {"row_count": len(rows), "order_rows": len(rows), "summary_rows": 0,
+                         "style_codes": sorted({r["style_code"] for r in rows}),
+                         "batch": {"name": f"整季替换移除的旧明细：{preview['source_file']}（{'、'.join(seasons)}）",
+                                   "protected": 0, "legacy": False},
+                         "removed_quantity": quantity, "removed_amount": amount},
+             "rows": {key: removed[key] for key in sorted(removed)}}
+    conn.execute("INSERT INTO sales_deletions (id, payload, created_at) VALUES (?, ?, ?)", (audit_id, _json(audit), created))
+    fields = SALES_KEYS["orders"]
+    names = ", ".join(f"`{f}`" for f in fields)
+    one = "(" + ", ".join("?" for _ in fields) + ")"
+    for offset in range(0, len(rows), 100):
+        chunk = rows[offset:offset + 100]
+        conn.execute(f"DELETE FROM style_order_lines WHERE ({names}) IN (" + ", ".join(one for _ in chunk) + ")",
+                     tuple(r[f] for r in chunk for f in fields))
+    return {"backup_id": audit_id, "removed_quantity": quantity, "removed_amount": amount}
+
+
+# ---------------------------------------------------------------- 生产数据 / 款式指示书
+def _season_fingerprint(conn, kind) -> str:
+    state = {"rows": sorted(json.dumps(r, sort_keys=True, default=str) for r in season_sources.read_table(conn, kind))}
+    if kind == "production":
+        state["archive"] = sorted(f"{r['variant_code']}\0{r['season']}"
+                                  for r in conn.execute("SELECT variant_code, season FROM style_variants"))
+    return hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
+
+
+def _preview_season_source(path, filename, requested_kind, kind, sheet_rows) -> dict:
+    rows, meta, issues, ignored = season_sources.parse(kind, path, sheet_rows=sheet_rows)
+    token = uuid4().hex
+    with catalog.read_database() as conn:
+        planned = season_sources.plan(conn, kind, rows)
+        scope = season_sources.replace_scope(conn, kind, rows)
+        state = _season_fingerprint(conn, kind)
+        archive_codes = {r[0] for r in conn.execute("SELECT variant_code FROM style_variants")}
+    warnings, notes = [], []
+    if kind == "production":
+        if scope["unknown_codes"]:
+            codes = scope["unknown_codes"]
+            warnings.append(f"{len(codes)} 个款号不在商品资料里（{'、'.join(codes[:8])}{'等' if len(codes) > 8 else ''}），"
+                            "无法判断季节；仍会导入，季度分析会提示。")
+        if meta["blank_plan_rows"]:
+            warnings.append(f"{meta['blank_plan_rows']} 行没有填计划数，按 0 件导入；这些款仍算「已生产」。")
+        notes.append("生产数据按季节整体覆盖：同季节旧的生产数据以本表为准，本表没有的旧行会移除。")
+    else:
+        outside = len({r["variant_code"] for r in rows} - archive_codes)
+        notes.append(f"共 {meta['source_rows']} 行版次，合并为 {len(rows)} 个设计款；其中 {outside} 款尚未进入商品资料（未下展厅）。")
+        notes.append("款式指示书按表内季节整体覆盖：同季节旧数据以本表为准。")
+    meta.update(warnings=warnings, notes=notes)
+    removed = scope["removed"]
+    response = {
+        "token": token, "kind": kind, "requested_kind": requested_kind, "source_file": filename,
+        "format": meta["format"], "format_label": meta["format_label"], "meta": meta,
+        "row_count": len(rows), "style_codes": sorted({r["style_code"] for r in rows}),
+        "counts": {action: sum(p["action"] == action for p in planned) for action in ("new", "updated", "unchanged")},
+        "issues": issues, "issue_count": len(issues), "ignored_rows": ignored,
+        "samples": [{**p["row"], "action": p["action"]} for p in planned[:8]],
+        "overlap_variants": [], "missing_images": [], "can_confirm": bool(rows),
+        "season_replace": {"available": True, "default": True, "mandatory": True, "seasons": scope["seasons"],
+                           "removed_rows": len(removed),
+                           "removed_samples": [{k: r.get(k, "") for k in season_sources.KEYS[kind]} for r in removed[:10]]},
+    }
+    manifest = {"response": response, "rows": rows, "base_rows": rows, "fingerprint": state, "created_at": now()}
+    (_folder() / f"{token}.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    return response
+
+
+def _confirm_season_source(conn, token, manifest, acknowledge) -> dict:
+    preview = manifest["response"]
+    kind = preview["kind"]
+    if manifest["fingerprint"] != _season_fingerprint(conn, kind):
+        raise catalog.CatalogConflict("资料在预览后有更新，请重新预览再导入。")
+    if not preview["can_confirm"]:
+        raise ValueError("没有可导入的有效行，请修正表格后重试。")
+    if preview["issue_count"] and not acknowledge:
+        raise ValueError("请先核对异常行，再确认只导入有效行。")
+    rows = manifest["rows"]
+    scope = season_sources.replace_scope(conn, kind, rows)
+    imported, updated, removed = season_sources.write(conn, kind, rows, scope["removed"], preview["source_file"])
+    report = {**preview["meta"], "id": token, "kind": kind, "source_file": preview["source_file"], "created_at": now(),
+              "imported": imported, "updated": updated, "unchanged": len(rows) - imported - updated,
+              "row_count": len(rows), "style_codes": preview["style_codes"], "issue_count": preview["issue_count"],
+              "season_replace": {"enabled": True, "seasons": scope["seasons"], "removed_rows": removed},
+              "archive_without_image": [], "image_without_archive": [], "sales_without_image": []}
+    conn.execute("INSERT INTO factory_import_history (id, payload, created_at) VALUES (?, ?, ?)",
+                 (token, json.dumps(report, ensure_ascii=False), report["created_at"]))
+    return report

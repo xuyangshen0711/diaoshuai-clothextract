@@ -241,3 +241,52 @@ export async function exportYarnTable(
   )
   return response.blob()
 }
+
+// ---------------------------------------------------------------- 季度款式分析
+export type SeasonGrade = 'S' | 'A' | 'B' | 'C' | 'D' | '无产量'
+export type SeasonFilters = { seasons: string[]; cutoff: string | null; compare: string | null }
+export type SeasonOptions = {
+  seasons: { season: string; styles: number; orders: number }[]
+  default_seasons: string[]
+  last_order_date: string | null
+  sources: { production_rows: number; guide_rows: number; stock_rows: number }
+}
+export type SeasonStyle = { code: string; quantity: number; amount: number; image_url: string | null; grade: SeasonGrade }
+export type SeasonHeadline = {
+  sku: number; ordered: number; produced: number; unproduced: number
+  sell_through: number; production_ratio: number; invalid_ratio: number
+}
+export type SeasonGroupRow = SeasonHeadline & {
+  name: string; key?: string; skc: number; sku_share: number; skc_share: number
+  quantity: number; quantity_share: number; amount: number; amount_share: number; unit_price: number
+}
+export type SeasonShareRow = { name: string; sku: number; sku_share: number; quantity_share: number; amount_share: number }
+export type SeasonCheck = { level: 'high' | 'medium' | 'info'; title: string; detail: string; count: number; codes: string[] }
+export type SeasonPerson = {
+  name: string; designed: number; showroom: number; showroom_ratio: number | null
+  ordered: number; sell_through: number | null; produced: number; production_ratio: number | null
+}
+export type SeasonReport = {
+  scope: { seasons: string[]; cutoff: string | null; compare: string | null; first_order_date: string | null; last_order_date: string | null }
+  checks: SeasonCheck[]
+  overview: SeasonHeadline & {
+    skc: number; quantity: number; amount: number; grade_counts: Record<SeasonGrade, number>
+    market_sku: number; brand_sku: number; image_styles: number
+  }
+  materials: { rows: SeasonGroupRow[]; totals: SeasonGroupRow }
+  categories: { rows: SeasonGroupRow[]; totals: SeasonGroupRow }
+  walls: {
+    category: { name: string; headline: SeasonHeadline; rows: { material: string; sku: number; grades: Record<SeasonGrade, SeasonStyle[]> }[]; shares: SeasonShareRow[] }[]
+    material: { name: string; headline: SeasonHeadline; grades: Record<SeasonGrade, SeasonStyle[]>; share: Omit<SeasonShareRow, 'name'> }[]
+  }
+  people: { designer: SeasonPerson[]; craftsman: SeasonPerson[] }
+  grades: { name: string; min: number }[]
+  snapshot: string
+}
+
+export const seasonOptions = () => request<SeasonOptions>(base + '/season/options')
+export const previewSeason = (filters: SeasonFilters) => request<SeasonReport>(base + '/season/preview', jsonPost({ filters }))
+export async function exportSeason(filters: SeasonFilters, snapshot: string) {
+  const response = await requestResponse(base + '/season/xlsx', jsonPost({ filters, snapshot }))
+  return { blob: await response.blob(), images: Number(response.headers.get('X-Season-Images') || 0) }
+}

@@ -555,6 +555,46 @@ CREATE TABLE IF NOT EXISTS style_order_lines (
     PRIMARY KEY (order_no, variant_code, color, size_label),
     KEY style_order_lines_style (style_code)
 ) {TABLE_OPTIONS};
+CREATE TABLE IF NOT EXISTS style_stock_lines (
+    order_no VARCHAR(64) NOT NULL,
+    variant_code VARCHAR(128) NOT NULL,
+    color VARCHAR(128) NOT NULL,
+    size_label VARCHAR(64) NOT NULL,
+    quantity INT NOT NULL,
+    style_code VARCHAR(128) NOT NULL,
+    customer_raw VARCHAR(255) NOT NULL DEFAULT '',
+    order_date VARCHAR(10) NOT NULL DEFAULT '',
+    season VARCHAR(32) NOT NULL DEFAULT '',
+    source_file VARCHAR(512) NOT NULL DEFAULT '',
+    updated_at VARCHAR(40) NOT NULL,
+    PRIMARY KEY (order_no, variant_code, color, size_label),
+    KEY style_stock_lines_style (style_code)
+) {TABLE_OPTIONS};
+CREATE TABLE IF NOT EXISTS style_production (
+    variant_code VARCHAR(128) NOT NULL,
+    color VARCHAR(128) NOT NULL,
+    size_label VARCHAR(64) NOT NULL,
+    quantity INT NOT NULL,
+    style_code VARCHAR(128) NOT NULL,
+    design_code VARCHAR(128) NOT NULL DEFAULT '',
+    source_file VARCHAR(512) NOT NULL DEFAULT '',
+    updated_at VARCHAR(40) NOT NULL,
+    PRIMARY KEY (variant_code, color, size_label),
+    KEY style_production_style (style_code)
+) {TABLE_OPTIONS};
+CREATE TABLE IF NOT EXISTS style_design_guide (
+    variant_code VARCHAR(128) NOT NULL,
+    season VARCHAR(64) NOT NULL,
+    style_code VARCHAR(128) NOT NULL,
+    design_code VARCHAR(128) NOT NULL DEFAULT '',
+    material VARCHAR(255) NOT NULL DEFAULT '',
+    designer VARCHAR(64) NOT NULL DEFAULT '',
+    craftsman VARCHAR(64) NOT NULL DEFAULT '',
+    colors_json LONGTEXT NOT NULL,
+    source_file VARCHAR(512) NOT NULL DEFAULT '',
+    updated_at VARCHAR(40) NOT NULL,
+    PRIMARY KEY (variant_code, season)
+) {TABLE_OPTIONS};
 """
 
 MYSQL_TAXONOMY_SCHEMA = f"""

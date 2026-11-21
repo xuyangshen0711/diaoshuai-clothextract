@@ -121,6 +121,7 @@ class ConfirmBody(BaseModel):
     acknowledge: bool = False
     historical_start: str = ""
     historical_end: str = ""
+    replace_season: bool = False
 
 
 @router.post("/table-confirm")
@@ -170,8 +171,10 @@ def inspect_paths(entries, category):
         item = {"name": name, "kind": "media", "action": "new", "style_code": "", "message": "待抽取图片"}
         try:
             kind = workbook_table_kind(path) if path.suffix in {".xlsx", ".xlsm"} else None
-            if kind in {"archive", "sales"}:
-                item.update(kind=kind, action="route", message="识别为款式档案" if kind == "archive" else "识别为销量表")
+            if kind in {"archive", "sales", "production", "guide"}:
+                labels = {"archive": "识别为款式档案", "sales": "识别为销量表", "production": "识别为生产数据",
+                          "guide": "识别为款式指示书"}
+                item.update(kind=kind, action="route", message=labels[kind])
             elif category == "本厂产品" and path.suffix in {".pdf", ".pptx", ".xlsx", ".xlsm"}:
                 item.update(action="invalid", message="本厂封面请上传以款号命名的图片；档案与销量请使用专用入口")
             elif path.suffix not in {".pdf", ".pptx", ".xlsx", ".xlsm"}:

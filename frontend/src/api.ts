@@ -723,18 +723,35 @@ export type FactoryWorkspace = {
   items: WorkspaceRow[]; total: number; page: number; page_size: number
   sales_policy: { reference_rows: number; reference_quantity: number; note: string }
 }
+export type TableKind = 'archive' | 'sales' | 'production' | 'guide'
+export type SeasonReplacePreview = {
+  available: boolean; default: boolean; mandatory?: boolean; seasons: string[]; removed_rows: number
+  blank_season_rows?: number; removed_quantity?: number; removed_amount?: number; removed_style_count?: number
+  stock_removed_rows?: number; impact?: SalesImportImpact
+  removed_samples: Record<string, string | number>[]
+}
+export type SalesExclusions = {
+  sample_rows: number; sample_quantity: number; stock_rows: number; stock_quantity: number
+  tiny_stock_rows: number; tiny_stock_quantity: number; stock_style_count: number
+}
 export type TablePreview = {
   impact?: SalesImportImpact
+  season_replace?: SeasonReplacePreview
+  exclusions?: SalesExclusions
   historical_start?: string; historical_end?: string
-  token: string; kind: 'archive' | 'sales'; requested_kind: string; source_file: string
+  token: string; kind: TableKind; requested_kind: string; source_file: string
   format: string; format_label: string; row_count: number; style_codes: string[]
   counts: { new: number; updated: number; unchanged: number }
-  meta: { warnings?: string[]; parsed_quantity?: number; parsed_amount?: number; sheet_quantity?: number | null; sheet_amount?: number | null; reconciled?: boolean | null; reconcile_note?: string; evidence_columns?: string[] }
-  samples: { variant_code: string; style_code: string; customer: string; color?: string; size_label?: string; quantity?: number; amount?: number; season?: string; category?: string; subcategory?: string; design_code?: string; action: string }[]
+  meta: { warnings?: string[]; notes?: string[]; parsed_quantity?: number; parsed_amount?: number; sheet_quantity?: number | null; sheet_amount?: number | null; reconciled?: boolean | null; reconcile_note?: string; evidence_columns?: string[] }
+  samples: { variant_code: string; style_code: string; customer?: string; color?: string; size_label?: string; quantity?: number; amount?: number; season?: string; category?: string; subcategory?: string; design_code?: string; designer?: string; craftsman?: string; material?: string; action: string }[]
   issues: { row: number; style_code: string; message: string }[]; issue_count: number; ignored_rows: number
   overlap_variants: string[]; missing_images: string[]; can_confirm: boolean
 }
-export type TableImportResult = TableReport & { id: string; kind: 'archive' | 'sales'; created_at: string; unchanged: number; issue_count: number; sales_policy: FactoryWorkspace['sales_policy'] }
+export type TableImportResult = TableReport & {
+  id: string; kind: TableKind; created_at: string; unchanged: number; issue_count: number; sales_policy: FactoryWorkspace['sales_policy']
+  exclusions?: SalesExclusions
+  season_replace?: { enabled: boolean; seasons: string[]; removed_rows: number; removed_quantity?: number; backup_id?: string }
+}
 export type ImportMetric = { quantity: number; amount: number }
 export type ImportMetricChange = { before: ImportMetric; after: ImportMetric; delta: ImportMetric }
 export type SalesImportImpact = {
@@ -753,8 +770,8 @@ export function previewTable(file: File, kind: string) {
   const body = new FormData(); body.append('file', file); body.append('kind', kind)
   return request<TablePreview>('/api/import/table-preview', { method: 'POST', body })
 }
-export function confirmTable(token: string, acknowledge: boolean, historical_start = '', historical_end = '') {
-  return request<TableImportResult>('/api/import/table-confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, acknowledge, historical_start, historical_end }) })
+export function confirmTable(token: string, acknowledge: boolean, historical_start = '', historical_end = '', replace_season = false) {
+  return request<TableImportResult>('/api/import/table-confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, acknowledge, historical_start, historical_end, replace_season }) })
 }
 export function replanTable(token: string, historical_start = '', historical_end = '') {
   return request<TablePreview>('/api/import/table-replan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, historical_start, historical_end }) })

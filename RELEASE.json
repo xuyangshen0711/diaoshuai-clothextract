@@ -1,14 +1,16 @@
 {
-  "release": "20261118-image-stream-fix",
-  "base_commit": "438b68237b429527d742eee4ef07dac2ea89d7e3",
-  "base_code_sha256": "28384232d67e066c7f3fc354c60534facffb9db314bc0af597efcb04178e7c80",
-  "previous_release": "20261118-search-precision",
+  "release": "20261121-season-analysis",
+  "base_commit": "0094c14ac7edfcd4a655eefd79c3eac0f765a7c1",
+  "base_code_sha256": "494172d91524874467a454abd8b66413b19f62171e8cf38817776a69990c1c76",
+  "previous_release": "20261118-image-stream-fix",
   "includes_local_changes": true,
   "prebuilt_frontend": true,
   "business_data_included": false,
   "local_configuration_included": false,
-  "database_schema_changes": false,
+  "database_schema_changes": true,
+  "database_schema_change_summary": "Additive only (approved by owner): creates 3 empty tables style_stock_lines, style_production, and style_design_guide via CREATE TABLE IF NOT EXISTS; zero modifications to existing tables or business rows.",
   "preserved_features": [
+    "zero-copy thumbnail streaming and SiteGateMiddleware pure ASGI",
     "smart gallery search precision, compound queries, and relevance ranking",
     "unified gallery 批量管理 with confirmation dialog and conflict skip",
     "fast DeepSeek vision tagging (6x concurrency, 1280px JPEG derivative)",
@@ -19,8 +21,8 @@
     "archive 500-row batch import"
   ],
   "validation": {
-    "regressions": "All site-gate pathsend, gallery-search-precision, batch-source-category, design-notes, response-speed, and image-quality suites passed (26 passed, 0 failed)",
-    "image_stream_fix": "Converted SiteGateMiddleware from Starlette BaseHTTPMiddleware to a pure ASGI middleware so Uvicorn 0.54.0 + Starlette 1.10.0 zero-copy http.response.pathsend streams FileResponse image bytes directly without 0-byte Content-Length truncation; enabled defer_oss_images=True on /api/search/text, /api/search/image, and /api/records/{id}/similar",
-    "live_rds_and_oss": "Pre-edit online /opt/diaoshuai and local main project verified identical (219 files, 28384232d67e066c7f3fc354c60534facffb9db314bc0af597efcb04178e7c80)"
+    "regressions": "Full pytest suite vs recorded baseline: 108 passed (baseline 99 + 9 new season-analysis tests), 0 newly failing, 0 previously passing broken; season + yarn suites 13/13 passed; vue-tsc + vite build (--emptyOutDir false) passed with 0 errors",
+    "season_analysis_e2e": "Verified against 4 real 26秋冬 Excel workbooks in isolated SQLite store: SKU 509, ordered 340, produced 287, grades S 7 / A 20 / B 41 / C 116 / D 103 / 无产量 222, 1388 embedded images in 9-sheet workbook + notes, and live browser UI E2E walkthrough with 0 console/network errors",
+    "live_rds_and_oss": "Pre-edit local main project verified identical to baseline (219 files, 494172d91524874467a454abd8b66413b19f62171e8cf38817776a69990c1c76); local data/ 597 files verified unchanged (ac17b370998e09348567a724de99383deaaee6a161c7505b514e78eb5a3202c3)"
   }
 }

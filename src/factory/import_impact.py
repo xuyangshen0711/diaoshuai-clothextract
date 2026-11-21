@@ -41,9 +41,12 @@ def import_impact(before, after, kind, rows):
     return result
 
 
-def projected_impact(before, plan, kind, rows, historical_start="", historical_end=""):
-    # Copy only the changed entries. Existing rows, including omitted rows, stay intact.
+def projected_impact(before, plan, kind, rows, historical_start="", historical_end="", removed=()):
+    # Copy only the changed entries. Existing rows, including omitted rows, stay intact
+    # unless 整季替换 lists them in `removed`.
     after = dict(before)
+    for key in removed:
+        after.pop(key, None)
     for item in plan:
         if item["action"] == "unchanged":
             continue

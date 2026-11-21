@@ -25,6 +25,7 @@ from src.analytics_access import allow_http_analytics
 from src.analytics_pdf import render_report
 from src.analytics_questions import QuestionRequest, answer_question, choose_with_deepseek
 from src.analytics_yarn import YarnReportFilters, build_yarn_preview, render_yarn_workbook, yarn_filter_options
+from src.analytics_season import SeasonFilters, build_season_report, load_thumbnails, render_season_workbook, season_options
 from src.db import _load_env, mysql_config
 from src.site_gate import site_password
 from src.tag.tagger import provider_ready
@@ -150,6 +151,19 @@ class YarnPreviewRequest(BaseModel):
 
     filters: YarnReportFilters
     acknowledge_missing: bool = False
+
+
+class SeasonPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    filters: SeasonFilters
+
+
+class SeasonExportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    filters: SeasonFilters
+    snapshot: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
 class YarnExportRequest(BaseModel):
@@ -292,4 +306,59 @@ def yarn_xlsx(body: YarnExportRequest, request: Request):
         payload,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+SEASON_TABLES_HINT = "分析只读账号还不能读取新增的生产数据 / 款式指示书 / 备单表，请管理员为该账号授予本库的 SELECT 权限。"
+
+
+def _season_call(action):
+    try:
+        return action()
+    except Exception as exc:  # 新表缺读权限时给出明确提示，其他错误照常抛出
+        text = str(exc)
+        if any(t in text for t in ("style_production", "style_design_guide", "style_stock_lines")) and \
+                any(w in text.lower() for w in ("denied", "doesn't exist", "no such table")):
+            raise HTTPException(503, SEASON_TABLES_HINT, headers=NO_STORE) from None
+        raise
+
+
+@router.get("/season/options", dependencies=[Depends(_require_access)])
+def season_report_options():
+    with read_business_data() as conn:
+        return _season_call(lambda: season_options(conn))
+
+
+@router.post("/season/preview", dependencies=[Depends(_require_access)])
+def season_preview(body: SeasonPreviewRequest, request: Request):
+    _throttle(request, "season-report", 40)
+
+    with read_business_data() as conn:
+        return _season_call(lambda: build_season_report(conn, body.filters))
+
+
+@router.post("/season/xlsx", dependencies=[Depends(_require_access)])
+def season_xlsx(body: SeasonExportRequest, request: Request):
+    _throttle(request, "season-xlsx", 10)
+
+    def run():
+        with read_business_data() as conn:
+            def load():
+                report = build_season_report(conn, body.filters, full=True)
+                if not hmac.compare_digest(report["snapshot"], body.snapshot):
+                    raise HTTPException(409, "数据已变化，请重新生成预览再导出。", headers=NO_STORE)
+                thumbnails = load_thumbnails(conn, report)
+                return report, thumbnails
+            return _season_call(load)
+    report, thumbnails = run()
+    payload = render_season_workbook(report, thumbnails)
+    name = "-".join(report["scope"]["seasons"])
+    filename = f"season-style-analysis-{report['scope']['cutoff'] or 'all'}.xlsx"
+    from urllib.parse import quote
+    quoted = quote(f"季度款式分析-{name}-{report['scope']['cutoff'] or ''}.xlsx")
+    return Response(
+        payload,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=\"{filename}\"; filename*=UTF-8''{quoted}",
+                 "X-Season-Images": str(len(thumbnails))},
     )

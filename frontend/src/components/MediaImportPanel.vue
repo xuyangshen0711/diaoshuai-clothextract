@@ -7,7 +7,7 @@ import { fileSizeLabel } from '../utils/source'
 import { batchProblem, fileLimit, fileProblem, MAX_BATCH_BYTES, MB } from '../utils/uploadGuidance'
 import { trackUpload } from '../composables/uploadActivity'
 const props = defineProps<{ factory: boolean; backend: string; targetCode: string }>()
-const emit = defineEmits<{ submitted: [job: ImportJob]; table: [kind: 'archive' | 'sales', file: File] }>()
+const emit = defineEmits<{ submitted: [job: ImportJob]; table: [kind: 'archive' | 'sales' | 'production' | 'guide', file: File] }>()
 type Queued = { key: number; file: File; path: string; code: string; thumbnail: string }
 const files = ref<Queued[]>([])
 const category = ref(props.factory ? '本厂产品' : '网图趋势')
@@ -103,7 +103,7 @@ async function inspect() {
 function routeTable(index: number, kind: string) {
   const item = files.value[index]
   if (!item || !['archive', 'sales'].includes(kind)) return
-  emit('table', kind as 'archive' | 'sales', item.file); remove(index)
+  emit('table', kind as 'archive' | 'sales' | 'production' | 'guide', item.file); remove(index)
 }
 async function submit() {
   if (!inspected.value || !valid.value || (invalid.value && !skipInvalid.value)) return
@@ -159,7 +159,7 @@ onUnmounted(() => {
     <div v-if="files.length" class="media-queue"><div class="queue-heading"><h4>本批资料 <span class="meta">{{ files.length }} 个文件 · {{ fileSizeLabel(totalBytes) }}</span></h4><button class="text-button" :disabled="busy" @click="clear">清空</button></div>
       <ul><li v-for="(item, index) in files" :key="item.key"><img v-if="item.thumbnail" :src="item.thumbnail" alt="" class="queue-thumb" /><span v-else class="queue-file-icon" aria-hidden="true">文档</span><div class="queue-file"><strong>{{ item.path }}</strong><small class="meta">{{ fileSizeLabel(item.file.size) }}</small><p v-if="fileProblems[index]" class="file-verdict gap-text">{{ fileProblems[index] }}</p><p v-if="inspected?.[index]" :class="['file-verdict', { 'gap-text': ['invalid', 'route'].includes(inspected[index]!.action) }]">{{ inspected[index]!.message }}</p></div>
         <label v-if="factory" class="queue-code">关联款号 <input v-model="item.code" :disabled="busy" @input="invalidate" /></label>
-        <button v-if="inspected?.[index]?.action === 'route'" class="btn small" :disabled="busy" @click="routeTable(index, inspected[index]!.kind)">转到{{ inspected[index]!.kind === 'archive' ? '档案' : '订单数据' }}预览</button><button class="text-button" :disabled="busy" :aria-label="`移除 ${item.path}`" @click="remove(index)">移除</button></li></ul>
+        <button v-if="inspected?.[index]?.action === 'route'" class="btn small" :disabled="busy" @click="routeTable(index, inspected[index]!.kind)">转到{{ ({ archive: '档案', sales: '订单数据', production: '生产数据', guide: '款式指示书' } as Record<string, string>)[inspected[index]!.kind] || '表格' }}预览</button><button class="text-button" :disabled="busy" :aria-label="`移除 ${item.path}`" @click="remove(index)">移除</button></li></ul>
       <p v-if="inspected" class="workspace-notice">可导入 {{ valid }} 个，已有相同图片 {{ unchanged }} 个，需处理 {{ invalid }} 个。{{ factory ? '替换图识别成功后生效，原图和人工标签会保留。' : '' }}</p>
       <label v-if="inspected && invalid && valid" class="acknowledge"><input v-model="skipInvalid" type="checkbox" /> 只提交可导入的 {{ valid }} 个，其余保留在清单中</label>
       <div class="toolbar preview-actions"><button v-if="!inspected" class="btn primary" :disabled="busy || blocked || offline" @click="inspect">{{ busy ? phase === 'uploading' ? '正在上传文件…' : '正在检查文件…' : uploadId ? '继续上传并检查' : '上传并检查文件' }}</button><template v-else><button class="btn primary" :disabled="busy || offline || !valid || (!!invalid && !skipInvalid)" @click="submit">{{ busy ? '正在提交…' : backend === 'deferred' ? `确认保存 ${valid} 个文件` : `开始识别 ${valid} 个文件` }}</button><button class="btn" :disabled="busy || offline || blocked" @click="inspect">重新检查</button></template><span class="meta">{{ backend === 'deferred' ? '先保留原图，AI 分类前不进入图库' : '检查文件不调用 AI，确认后才开始识别' }}</span></div>

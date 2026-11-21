@@ -15,9 +15,10 @@ from src import catalog
 from src.factory.aliases import canonical_salesperson, customer_short_name
 from src.factory.codes import parse_style_code
 from src.factory.excel_io import (
-    as_number, cell_at, column_index, describe_headers, find_header, load_sheet_rows, parse_number,
+    KIND_LABELS, as_number, cell_at, column_index, describe_headers, find_header, load_sheet_rows, parse_number,
     plain_text, sheet_headers, table_kind_from_headers,
 )
+from src.factory.season_rules import TINY_STOCK_MAX
 from src.factory.periods import iso_date
 from src.db import on_conflict_update
 from src.factory.tables import gap_report, now
@@ -59,7 +60,10 @@ def is_total_row(row, indexes) -> bool:
 
 def parse_sales_rows(path: Path, *, sheet_rows=None) -> tuple[list[dict], dict]:
     rows = load_sheet_rows(path) if sheet_rows is None else sheet_rows
-    if table_kind_from_headers(sheet_headers(rows)) == "archive":
+    detected = table_kind_from_headers(sheet_headers(rows))
+    if detected in {"guide", "production"}:
+        raise ValueError(f"可能传错了表，这像是{KIND_LABELS[detected]}，请用「{KIND_LABELS[detected]}」入口。")
+    if detected == "archive":
         raise ValueError("可能传错了表，这像是款式档案，请用款式档案入口。")
     header_index, headers = find_header(rows, "款号")
     recognized = describe_headers(headers)
@@ -74,10 +78,23 @@ def parse_sales_rows(path: Path, *, sheet_rows=None) -> tuple[list[dict], dict]:
     else:
         parsed, meta = _parse_summary(rows[header_index + 1:], indexes)
     meta.update(recognized)
+    # 表底合计包含备单、发样等不计销量的行；核对时把这些件数加回去。
+    excluded = meta.get("excluded_quantity", 0)
     meta["reconciled"], meta["reconcile_note"] = _reconcile(
-        meta["parsed_quantity"], meta["parsed_amount"], meta["sheet_quantity"], meta["sheet_amount"],
+        meta["parsed_quantity"] + excluded, meta["parsed_amount"], meta["sheet_quantity"], meta["sheet_amount"],
     )
     return parsed, meta
+
+
+def classify_line(row, indexes) -> str:
+    """订单明细行分类：order 计入销量；stock 备单；tiny_stock 1 件小备单；sample 无金额发样。"""
+    stock = parse_number(cell_at(row, indexes.get("备货数")))
+    if stock is not None and stock > 0:
+        return "tiny_stock" if stock <= TINY_STOCK_MAX else "stock"
+    if parse_number(cell_at(row, indexes.get("订单金额"))) is None and \
+            parse_number(cell_at(row, indexes.get("订单数量"))) is not None:
+        return "sample"
+    return "order"
 
 
 def _parse_summary(rows, indexes) -> tuple[list[dict], dict]:
@@ -152,6 +169,9 @@ def _parse_lines(rows, indexes) -> tuple[list[dict], dict]:
     sheet_amount = None
     orders: set[str] = set()
     customers: set[str] = set()
+    stock: dict[tuple, dict] = {}
+    excluded = {"sample_rows": 0, "sample_quantity": 0, "stock_rows": 0, "stock_quantity": 0,
+                "tiny_stock_rows": 0, "tiny_stock_quantity": 0}
     for row in rows:
         if _blank(row):
             skipped += 1
@@ -169,6 +189,25 @@ def _parse_lines(rows, indexes) -> tuple[list[dict], dict]:
                 if amount is not None:
                     sheet_amount = float(amount)
             skipped += 1
+            continue
+        line_kind = classify_line(row, indexes)
+        if line_kind != "order" and color and size_label and order_no:
+            pieces = int(round(quantity or parse_number(cell_at(row, indexes.get("备货数"))) or 0))
+            excluded[f"{line_kind}_rows"] += 1
+            excluded[f"{line_kind}_quantity"] += pieces
+            if line_kind == "stock":
+                key = (order_no, code.raw, color, size_label)
+                current = stock.get(key)
+                if current is None:
+                    stock[key] = {
+                        "order_no": order_no, "variant_code": code.raw, "style_code": code.base,
+                        "color": color, "size_label": size_label, "quantity": pieces,
+                        "customer_raw": plain_text(cell_at(row, indexes.get("客户"))),
+                        "order_date": iso_date(cell_at(row, indexes.get("订单日期"))),
+                        "season": compose_season(cell_at(row, indexes.get("年度")), cell_at(row, indexes.get("季节"))),
+                    }
+                else:
+                    current["quantity"] += pieces
             continue
         if quantity is None or amount is None or not color or not size_label or not order_no:
             skipped += 1
@@ -214,6 +253,9 @@ def _parse_lines(rows, indexes) -> tuple[list[dict], dict]:
         "sheet_amount": sheet_amount,
         "order_count": len(orders),
         "customer_count": len(customers),
+        **excluded,
+        "excluded_quantity": excluded["sample_quantity"] + excluded["stock_quantity"] + excluded["tiny_stock_quantity"],
+        "stock_lines": list(stock.values()),
     }
 
 
@@ -251,6 +293,7 @@ def import_sales(path: Path, source_name: str | None = None) -> dict:
     with mutation_lock, catalog._database() as conn:
         if meta["format"] == "sales_lines":
             imported, updated = _write_lines(conn, sales_rows, source_name)
+            write_stock_lines(conn, meta.get("stock_lines", []), source_name)
         else:
             imported, updated = _write_summary(conn, sales_rows, source_name)
         gaps = gap_report(conn)
@@ -334,3 +377,27 @@ def _write_sales_rows(conn, rows, source_name, table, keys, columns, assignments
 
     invalidate_factory_snapshot()
     return imported, updated
+
+
+STOCK_COLUMNS = ["order_no", "variant_code", "color", "size_label", "quantity", "style_code", "customer_raw",
+                 "order_date", "season", "source_file", "updated_at"]
+
+
+def write_stock_lines(conn, stock_rows, source_name: str, *, replace_seasons: list[str] | None = None) -> int:
+    """备单明细单独存放，只给「订单与备单的对比」使用；不进入任何销量统计。"""
+    if replace_seasons:
+        for offset in range(0, len(replace_seasons), 200):
+            chunk = replace_seasons[offset:offset + 200]
+            conn.execute("DELETE FROM style_stock_lines WHERE season IN (" + ", ".join("?" for _ in chunk) + ")", chunk)
+    if not stock_rows:
+        return 0
+    keys = "`order_no`, `variant_code`, `color`, `size_label`"
+    sql = (f"INSERT INTO style_stock_lines ({', '.join(f'`{c}`' for c in STOCK_COLUMNS)}) "
+           f"VALUES ({', '.join('?' for _ in STOCK_COLUMNS)})"
+           + on_conflict_update(keys, [c for c in STOCK_COLUMNS if c not in
+                                       {"order_no", "variant_code", "color", "size_label"}]))
+    timestamp = now()
+    for offset in range(0, len(stock_rows), 500):
+        conn.executemany(sql, [tuple({**item, "source_file": source_name, "updated_at": timestamp}[c]
+                                     for c in STOCK_COLUMNS) for item in stock_rows[offset:offset + 500]])
+    return len(stock_rows)

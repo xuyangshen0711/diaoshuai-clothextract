@@ -8,8 +8,8 @@ from src import catalog
 from src.factory.codes import parse_style_code
 from src.factory.colors import split_colors
 from src.factory.excel_io import (
-    ARCHIVE_COLUMNS, cell_at, column_index, describe_headers, find_header, load_sheet_rows, plain_text, sheet_headers,
-    table_kind_from_headers,
+    ARCHIVE_COLUMNS, KIND_LABELS, cell_at, column_index, describe_headers, find_header, load_sheet_rows, plain_text,
+    sheet_headers, table_kind_from_headers,
 )
 from src.factory.sizes import split_sizes
 from src.db import on_conflict_update
@@ -18,7 +18,10 @@ from src.factory.tables import gap_report, now
 
 def parse_archive_rows(path: Path, *, sheet_rows=None) -> tuple[list[dict], int, list[str], dict]:
     rows = load_sheet_rows(path) if sheet_rows is None else sheet_rows
-    if table_kind_from_headers(sheet_headers(rows)) == "sales":
+    detected = table_kind_from_headers(sheet_headers(rows))
+    if detected in {"guide", "production"}:
+        raise ValueError(f"可能传错了表，这像是{KIND_LABELS[detected]}，请用「{KIND_LABELS[detected]}」入口。")
+    if detected == "sales":
         raise ValueError("可能传错了表，这像是销量表，请用下方的销量入口。")
     header_index, headers = find_header(rows, "大货款号")
     recognized = describe_headers(headers)

@@ -20,7 +20,11 @@ const route = useRoute()
 useUploadActivity()
 const router = useRouter()
 const factory = computed(() => route.query.mode === 'factory')
-const task = computed(() => route.query.task === 'archive' ? 'archive' : route.query.task === 'sales' ? 'sales' : 'images')
+type FactoryTask = 'images' | 'archive' | 'sales' | 'production' | 'guide'
+type TableTask = Exclude<FactoryTask, 'images'>
+const TASKS: FactoryTask[] = ['images', 'archive', 'sales', 'production', 'guide']
+const KIND_LABELS: Record<string, string> = { archive: '商品资料表', sales: '订单数据', production: '生产数据', guide: '款式指示书' }
+const task = computed<FactoryTask>(() => TASKS.includes(route.query.task as FactoryTask) ? route.query.task as FactoryTask : 'images')
 const targetCode = computed(() => typeof route.query.style === 'string' ? route.query.style : '')
 const selectedBackend = ref('auto')
 const openai = computed(() => !serviceStatusError.value && Boolean(serviceStatus.value?.providers.find(p => p.provider === 'openai')?.configured))
@@ -51,11 +55,11 @@ function backendLabel(value: string) { return value === 'deferred' ? '保存待�
 function time(value: string) { return new Date(value).toLocaleString('zh-CN', { hour12: false }) }
 function duration(value: number) { return value < 60 ? `${Math.round(value)} 秒` : `${Math.floor(value / 60)} 分 ${Math.round(value % 60)} 秒` }
 function setMode(value: boolean) { router.replace({ path: '/import', query: value ? { mode: 'factory' } : {} }) }
-async function startTask(kind: 'images' | 'archive' | 'sales', code = '') {
+async function startTask(kind: FactoryTask, code = '') {
   await router.replace({ path: '/import', query: { mode: 'factory', task: kind, ...(code ? { style: code } : {}) } })
   await nextTick(); document.getElementById('import-work-area')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
-async function routeTable(kind: 'archive' | 'sales', file: File) { await startTask(kind); await nextTick(); tablePanel.value?.openFile(file) }
+async function routeTable(kind: TableTask, file: File) { await startTask(kind); await nextTick(); tablePanel.value?.openFile(file) }
 async function loadHistory() {
   try { history.value = await getTableHistory(); historyError.value = '' }
   catch (e) { historyError.value = e instanceof Error ? e.message : String(e) }
@@ -115,16 +119,17 @@ onMounted(async () => {
     <div class="import-purpose" role="group" aria-label="资料用途"><button :aria-pressed="!factory" @click="setMode(false)"><span class="purpose-icon" aria-hidden="true">▧</span><span><strong>外部参考资料</strong><small>淘宝 / 网图、品牌资料、市调照片</small></span></button><button :aria-pressed="factory" @click="setMode(true)"><span class="purpose-icon" aria-hidden="true">▤</span><span><strong>本厂产品</strong><small>款式图片、商品资料表与订单数据</small></span></button></div>
     <template v-if="factory"><FactoryCompleteness :refresh-key="refreshKey" @task="startTask" /></template>
     <div id="import-work-area" class="import-work-area">
-      <div v-if="factory" class="factory-task-nav" role="group" aria-label="本厂导入类型"><button :aria-pressed="task === 'images'" @click="startTask('images')"><strong>款式图片</strong><small>补图片、关联款号</small></button><button :aria-pressed="task === 'archive'" @click="startTask('archive')"><strong>商品资料表</strong><small>范本 11 列、一级及二级品类</small></button><button :aria-pressed="task === 'sales'" @click="startTask('sales')"><strong>订单数据</strong><small>订单明细、历史汇总</small></button></div>
+      <div v-if="factory" class="factory-task-nav" role="group" aria-label="本厂导入类型"><button :aria-pressed="task === 'images'" @click="startTask('images')"><strong>款式图片</strong><small>补图片、关联款号</small></button><button :aria-pressed="task === 'archive'" @click="startTask('archive')"><strong>商品资料表</strong><small>范本 11 列、一级及二级品类</small></button><button :aria-pressed="task === 'sales'" @click="startTask('sales')"><strong>订单数据</strong><small>订单明细、备单、历史汇总</small></button><button :aria-pressed="task === 'production'" @click="startTask('production')"><strong>生产数据 <span class="new-badge">新</span></strong><small>季度款式分析的生产数</small></button><button :aria-pressed="task === 'guide'" @click="startTask('guide')"><strong>款式指示书 <span class="new-badge">新</span></strong><small>设计师、工艺师的设计款数</small></button></div>
+      <p v-if="factory && (task === 'production' || task === 'guide')" class="workspace-notice">「生产数据」和「款式指示书」是为<strong>季度款式分析</strong>新增的入口（分析页 → 季度款式分析）。订单数据请继续用「订单数据」入口，新版会自动识别备单和发样。</p>
       <MediaImportPanel v-show="!factory" :factory="false" :backend="backend" target-code="" @table="routeTable" @submitted="refreshNumber++" />
       <MediaImportPanel v-show="factory && task === 'images'" :factory="true" :backend="backend" :target-code="targetCode" @table="routeTable" @submitted="refreshNumber++" />
-      <TableImportPanel ref="tablePanel" v-show="factory && task !== 'images'" :kind="task === 'sales' ? 'sales' : 'archive'" :target-code="targetCode" @completed="tableCompleted" @task="startTask" />
+      <TableImportPanel ref="tablePanel" v-show="factory && task !== 'images'" :kind="task === 'images' ? 'archive' : task" :target-code="targetCode" @completed="tableCompleted" @task="startTask" />
     </div>
     <p v-if="healthReady && backend === 'deferred' && (!factory || task === 'images')" class="workspace-notice">当前未启用自动分类。原图会保存在导入任务中，暂不进入图库。配置 AI 后点击「继续 AI 分类」，生成有效建议后自动入库。</p>
     <p v-if="notice" class="workspace-notice" role="status">{{ notice }}</p><p v-if="error" class="error" role="alert">{{ error }}</p>
     <section v-if="factory" class="table-history-section" aria-label="表格导入记录"><div class="section-heading"><h3>表格导入记录 <span class="meta">最近 {{ history.length }} 批</span></h3><div class="toolbar"><button class="btn small" @click="salesManager?.open()">管理订单数据</button><button class="text-button" @click="loadHistory">刷新记录</button></div></div>
       <p v-if="historyError" class="error" role="alert">{{ historyError }}</p><p v-else-if="!history.length" class="workspace-empty">确认导入后，结果会保存在这里。</p>
-      <details v-for="report in history" :key="report.id" class="table-history-row"><summary><span><strong>{{ report.source_file }}</strong><small>{{ time(report.created_at) }} · {{ report.kind === 'archive' ? '商品资料表' : '订单数据' }}</small></span><span>新增 {{ report.imported }} / 更新 {{ report.updated }} / 无变化 {{ report.unchanged }}</span></summary><div><p>关联款号：{{ report.style_codes.slice(0, 20).join('、') }}{{ report.style_codes.length > 20 ? ` 等 ${report.style_codes.length} 款` : '' }}</p><SalesImportTotals v-if="report.kind === 'sales'" :report="report" historical /><p v-if="report.issue_count" class="meta">跳过 {{ report.issue_count }} 行异常。</p><p class="meta">待补资料请以上方实时清单为准。</p><button v-if="report.kind === 'sales'" class="btn small" @click="salesManager?.open(report.id)">管理本批订单数据</button></div></details>
+      <details v-for="report in history" :key="report.id" class="table-history-row"><summary><span><strong>{{ report.source_file }}</strong><small>{{ time(report.created_at) }} · {{ KIND_LABELS[report.kind] || report.kind }}</small></span><span>新增 {{ report.imported }} / 更新 {{ report.updated }} / 无变化 {{ report.unchanged }}</span></summary><div><p>关联款号：{{ report.style_codes.slice(0, 20).join('、') }}{{ report.style_codes.length > 20 ? ` 等 ${report.style_codes.length} 款` : '' }}</p><SalesImportTotals v-if="report.kind === 'sales'" :report="report" historical /><p v-if="report.issue_count" class="meta">跳过 {{ report.issue_count }} 行异常。</p><p class="meta">待补资料请以上方实时清单为准。</p><button v-if="report.kind === 'sales'" class="btn small" @click="salesManager?.open(report.id)">管理本批订单数据</button></div></details>
     </section>
     <SalesDataManager v-if="factory" ref="salesManager" :history="history" @changed="tableCompleted" />
     <section class="workspace-jobs" aria-label="图片处理任务"><div class="section-heading"><h3>图片处理任务 <span class="meta">{{ visibleJobs.length }} 批</span></h3><button class="text-button" @click="refreshJobs">刷新进度</button></div>
@@ -150,3 +155,7 @@ onMounted(async () => {
     <details class="workspace-advanced"><summary>高级设置与维护</summary><p class="meta">正常导入使用自动分类。模拟分类仅用于测试，不会生成真实识别结果。</p><label>分类方式 <select v-model="selectedBackend"><option value="auto">自动选择可用服务</option><option value="deferred">仅保存，稍后分类</option><option value="openai" :disabled="!openai">OpenAI{{ openai ? '' : '（未配置）' }}</option><option value="deepseek" :disabled="!deepseek">DeepSeek{{ deepseek ? '' : '（未配置）' }}</option><option value="mock">模拟分类（测试）</option></select></label><div class="toolbar"><button class="btn" :disabled="!!busy || backend === 'deferred'" @click="retagAll(false)">补充待分类图片</button><button class="btn" :disabled="!!busy || backend === 'deferred'" @click="retagAll(true)">全量重新分类</button><button class="btn" :disabled="!!busy" @click="run(async () => { await rebuildIndex(); notice = '检索索引已更新。' }, 'index')">刷新检索索引</button><button class="btn" :disabled="!!busy" @click="retryCleanup">重试文件清理</button></div></details>
   </main>
 </template>
+
+<style scoped>
+.new-badge { display: inline-block; margin-left: .25rem; padding: 0 .35rem; border-radius: 999px; background: #c0392b; color: #fff; font-size: .7em; font-weight: 600; vertical-align: middle; }
+</style>

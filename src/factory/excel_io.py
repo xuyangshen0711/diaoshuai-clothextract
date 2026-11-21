@@ -66,7 +66,15 @@ def sheet_headers(rows: list[tuple], limit: int = 8) -> set[str]:
 
 
 def table_kind_from_headers(names: set[str]) -> str:
-    """'archive', 'sales', or '' — used only to choose an error or hint sentence."""
+    """'archive', 'sales', 'production', 'guide', or ''.
+
+    生产数据（款号 + 计划，没有订单数量）和款式指示书（有大货款号和设计师，但没有尺码）
+    先识别，避免款式指示书被当成商品资料写入、生产数据被当成订单。
+    """
+    if "款号" in names and "计划" in names and "订单数量" not in names:
+        return "production"
+    if "大货款号" in names and "尺码" not in names and ({"设计师", "工艺师"} & names) and "订单数量" not in names:
+        return "guide"
     sales = "款号" in names and "订单数量" in names
     archive = "大货款号" in names
     if sales and not archive:
@@ -93,6 +101,9 @@ ARCHIVE_COLUMNS = (
 )
 SALES_SUMMARY_IDENTITY = ("款号", "颜色", "尺码", "订单数量", "订单金额")
 SALES_LINE_MARKERS = ("订单分类", "订单日期", "客户", "业务员", "客户款号")
+PRODUCTION_COLUMNS = ("款号", "设计款号", "颜色", "尺码", "计划")
+GUIDE_COLUMNS = ("季节", "设计款号", "大货款号", "颜色", "原料名称", "设计师", "工艺师")
+KIND_LABELS = {"archive": "商品资料表", "sales": "订单数据", "production": "生产数据", "guide": "款式指示书"}
 
 
 def describe_headers(headers: list[str]) -> dict:
@@ -103,6 +114,12 @@ def describe_headers(headers: list[str]) -> dict:
     present = [name for name in headers if name]
     names = set(present)
     kind = table_kind_from_headers(names)
+    if kind == "production":
+        return {"kind": "production", "format": "production_plan", "format_label": "生产数据",
+                "evidence_columns": [name for name in PRODUCTION_COLUMNS if name in names]}
+    if kind == "guide":
+        return {"kind": "guide", "format": "design_guide", "format_label": "款式指示书",
+                "evidence_columns": [name for name in GUIDE_COLUMNS if name in names]}
     if kind == "archive":
         return {
             "kind": "archive",
