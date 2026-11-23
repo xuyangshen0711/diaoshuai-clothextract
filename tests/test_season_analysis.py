@@ -182,13 +182,27 @@ def test_season_report_rules_and_workbook(store):
     record = make_record(store)
     record.source_category, record.style_code = "本厂产品", "663169"
     catalog.save_catalog([record])
+
+    # Default: exclude brand-suffixed styles (include_brand=False).
+    with catalog.read_database() as conn:
+        market_only = build_season_report(conn, SeasonFilters(seasons=["2026秋", "2026冬"], cutoff="2026-11-19",
+                                                              compare="2026-11-09"), full=True)
+    mov = market_only["overview"]
+    assert market_only["scope"]["include_brand"] is False
+    assert (mov["sku"], mov["ordered"], mov["produced"], mov["quantity"]) == (3, 2, 1, 8550)
+    assert (mov["market_sku"], mov["brand_sku"], mov["excluded_brand_sku"]) == (3, 0, 2)
+    assert mov["grade_counts"] == {"S": 1, "A": 0, "B": 0, "C": 0, "D": 0, "无产量": 2}
+    assert all(r["code"] != "663169索菲娅" for r in market_only["detail"]["orders_table"])
+
+    # Opt-in: include brand-suffixed styles (include_brand=True).
     with catalog.read_database() as conn:
         report = build_season_report(conn, SeasonFilters(seasons=["2026秋", "2026冬"], cutoff="2026-11-19",
-                                                         compare="2026-11-09"), full=True)
+                                                         compare="2026-11-09", include_brand=True), full=True)
     ov = report["overview"]
+    assert report["scope"]["include_brand"] is True
     assert (ov["sku"], ov["ordered"], ov["produced"], ov["quantity"]) == (5, 3, 2, 8870)  # 备单不计
     assert ov["grade_counts"] == {"S": 1, "A": 0, "B": 0, "C": 1, "D": 0, "无产量": 3}
-    assert (ov["market_sku"], ov["brand_sku"]) == (3, 2)
+    assert (ov["market_sku"], ov["brand_sku"], ov["excluded_brand_sku"]) == (3, 2, 0)
     mats = {r["name"]: r for r in report["materials"]["rows"]}
     assert mats["42支50.50/AB"]["sku"] == 2 and mats["42支50.50/AB"]["quantity"] == 8820
     assert "其他原料" in mats
@@ -200,20 +214,29 @@ def test_season_report_rules_and_workbook(store):
     assert designer["sell_through"] == 1.0 and designer["showroom_ratio"] == 1.0
     top = report["detail"]["orders_table"][0]
     assert (top["code"], top["quantity"], top["growth"], top["replenishment"], top["new_replenishment"]) == ("663169", 8500, 500, 500, 500)
-    assert top["image_url"].startswith(f"/api/records/{record.id}/image")
+    assert top["image_url"].startswith(f"/api/records/{record.id}/image?variant=thumbnail")
     stock = report["detail"]["stock"][0]
     assert stock["code"] == "663169" and any(c["label"] == "7.4备单" for c in stock["columns"])
     walls = {w["name"]: w for w in report["walls"]["material"]}
     assert [i["code"] for i in walls["42支50.50/AB"]["grades"]["S"]] == ["663169"]
 
     thumb = BytesIO()
-    Image.new("RGB", (60, 80), "navy").save(thumb, format="JPEG")
-    blob = render_season_workbook(report, {record.id: thumb.getvalue()})
+    Image.new("RGB", (260, 320), "navy").save(thumb, format="JPEG")
+    blob = render_season_workbook(report, {record.id: thumb.getvalue()}, export_scope="all")
     book = load_workbook(BytesIO(blob))
     assert book.sheetnames == ["口径说明", "市场款号订补情况", "单款销售周期", "按品类的款式等级表", "按材质的款式等级表",
                                "按材质的生产销售对比", "按品类的生产销售对比", "按纱线颜色的生产销售", "订单与备单的对比",
                                "设计师工艺师动销统计"]
     assert len(book["按材质的款式等级表"]._images) >= 1 and len(book["市场款号订补情况"]._images) == 2  # 品牌专款共用基础款图
+    assert book["市场款号订补情况"]._images[0].width >= 90
+
+    tracking_book = load_workbook(BytesIO(render_season_workbook(market_only, {record.id: thumb.getvalue()}, export_scope="tracking")))
+    assert tracking_book.sheetnames == ["口径说明", "市场款号订补情况", "单款销售周期", "订单与备单的对比"]
+    assert len(tracking_book["市场款号订补情况"]._images) == 1
+
+    review_book = load_workbook(BytesIO(render_season_workbook(market_only, {record.id: thumb.getvalue()}, export_scope="review")))
+    assert review_book.sheetnames == ["口径说明", "按品类的款式等级表", "按材质的款式等级表", "按材质的生产销售对比",
+                                      "按品类的生产销售对比", "按纱线颜色的生产销售", "设计师工艺师动销统计"]
 
 
 def test_season_endpoints_require_analytics_unlock_and_export(store, monkeypatch):
@@ -227,18 +250,25 @@ def test_season_endpoints_require_analytics_unlock_and_export(store, monkeypatch
     assert client.post("/api/analytics/login", json={"password": ANALYTICS_SECRET}).status_code == 200
     options = client.get("/api/analytics/season/options").json()
     assert options["default_seasons"] == ["2026冬", "2026秋"] and options["sources"]["stock_rows"] == 1
-    filters = {"seasons": options["default_seasons"], "cutoff": None, "compare": None}
+    filters = {"seasons": options["default_seasons"], "cutoff": None, "compare": None, "include_brand": False}
     preview = client.post("/api/analytics/season/preview", json={"filters": filters})
     assert preview.status_code == 200, preview.text
+    assert preview.json()["overview"]["brand_sku"] == 0 and preview.json()["overview"]["excluded_brand_sku"] == 2
     snapshot = preview.json()["snapshot"]
     stale = client.post("/api/analytics/season/xlsx", json={"filters": filters, "snapshot": "0" * 64})
     assert stale.status_code == 409
     # Explicit dates equal to the defaults keep the same snapshot.
     scope = preview.json()["scope"]
     exported = client.post("/api/analytics/season/xlsx", json={
-        "filters": {**filters, "cutoff": scope["cutoff"], "compare": scope["compare"]}, "snapshot": snapshot})
+        "filters": {**filters, "cutoff": scope["cutoff"], "compare": scope["compare"]},
+        "snapshot": snapshot, "export_scope": "tracking"})
     assert exported.status_code == 200, exported.text
-    assert load_workbook(BytesIO(exported.content)).sheetnames[0] == "口径说明"
+    assert load_workbook(BytesIO(exported.content)).sheetnames == ["口径说明", "市场款号订补情况", "单款销售周期", "订单与备单的对比"]
+    review_exp = client.post("/api/analytics/season/xlsx", json={
+        "filters": {**filters, "cutoff": scope["cutoff"], "compare": scope["compare"]},
+        "snapshot": snapshot, "export_scope": "review"})
+    assert review_exp.status_code == 200, review_exp.text
+    assert len(load_workbook(BytesIO(review_exp.content)).sheetnames) == 7
 
 
 @pytest.mark.parametrize("bad", [{"seasons": []}, {"seasons": ["2026秋"], "cutoff": "2026-11-01", "compare": "2026-11-05"}])

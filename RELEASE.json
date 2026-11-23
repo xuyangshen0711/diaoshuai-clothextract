@@ -1,15 +1,15 @@
 {
-  "release": "20261121-season-analysis",
-  "base_commit": "0094c14ac7edfcd4a655eefd79c3eac0f765a7c1",
-  "base_code_sha256": "494172d91524874467a454abd8b66413b19f62171e8cf38817776a69990c1c76",
-  "previous_release": "20261118-image-stream-fix",
+  "release": "20261123-season-analysis-v2",
+  "base_commit": "bc8efc2810e2375efac3ba44c595a0cc19d375b0",
+  "base_code_sha256": "70d28caea76c43d52af761fc1e8bf8e2b2e020051953ebf93f78ab96d9e56cfc",
+  "previous_release": "20261121-season-analysis",
   "includes_local_changes": true,
   "prebuilt_frontend": true,
   "business_data_included": false,
   "local_configuration_included": false,
-  "database_schema_changes": true,
-  "database_schema_change_summary": "Additive only (approved by owner): creates 3 empty tables style_stock_lines, style_production, and style_design_guide via CREATE TABLE IF NOT EXISTS; zero modifications to existing tables or business rows.",
+  "database_schema_changes": false,
   "preserved_features": [
+    "quarterly style analysis, production/guide imports, and order season replace",
     "zero-copy thumbnail streaming and SiteGateMiddleware pure ASGI",
     "smart gallery search precision, compound queries, and relevance ranking",
     "unified gallery 批量管理 with confirmation dialog and conflict skip",
@@ -21,8 +21,8 @@
     "archive 500-row batch import"
   ],
   "validation": {
-    "regressions": "Full pytest suite vs recorded baseline: 108 passed (baseline 99 + 9 new season-analysis tests), 0 newly failing, 0 previously passing broken; season + yarn suites 13/13 passed; vue-tsc + vite build (--emptyOutDir false) passed with 0 errors",
-    "season_analysis_e2e": "Verified against 4 real 26秋冬 Excel workbooks in isolated SQLite store: SKU 509, ordered 340, produced 287, grades S 7 / A 20 / B 41 / C 116 / D 103 / 无产量 222, 1388 embedded images in 9-sheet workbook + notes, and live browser UI E2E walkthrough with 0 console/network errors",
-    "live_rds_and_oss": "Pre-edit local main project verified identical to baseline (219 files, 494172d91524874467a454abd8b66413b19f62171e8cf38817776a69990c1c76); local data/ 597 files verified unchanged (ac17b370998e09348567a724de99383deaaee6a161c7505b514e78eb5a3202c3)"
+    "regressions": "Full pytest suite vs recorded baseline: 108 passed (0 regressions); season + yarn suites 13/13 passed; vue-tsc + vite build (--emptyOutDir false) passed with 0 errors",
+    "feedback_fixes": "1) Enlarged high-res Excel thumbnails (260x320 source, 112x148 grade wall / 96x118 table display); 2) Split export into 日常跟踪(3表) / 季度复盘(6表) / 完整合集(9表); 3) Exclude brand-suffixed styles by default with opt-in 包含品牌专款 checkbox; 4) Switched grade wall images from variant=cover to variant=thumbnail + scoped DOM keys + collapsible 无产量 rows; 5) Displayed 计划总件数 in production preview, confirmation, and import history",
+    "live_rds_and_oss": "Pre-edit baseline verified identical (226 files, 70d28caea76c43d52af761fc1e8bf8e2b2e020051953ebf93f78ab96d9e56cfc); local data/ 597 files verified unchanged (ac17b370998e09348567a724de99383deaaee6a161c7505b514e78eb5a3202c3)"
   }
 }

@@ -25,7 +25,7 @@ from src.analytics_access import allow_http_analytics
 from src.analytics_pdf import render_report
 from src.analytics_questions import QuestionRequest, answer_question, choose_with_deepseek
 from src.analytics_yarn import YarnReportFilters, build_yarn_preview, render_yarn_workbook, yarn_filter_options
-from src.analytics_season import SeasonFilters, build_season_report, load_thumbnails, render_season_workbook, season_options
+from src.analytics_season import ExportScope, SeasonFilters, build_season_report, load_thumbnails, render_season_workbook, season_options
 from src.db import _load_env, mysql_config
 from src.site_gate import site_password
 from src.tag.tagger import provider_ready
@@ -164,6 +164,7 @@ class SeasonExportRequest(BaseModel):
 
     filters: SeasonFilters
     snapshot: str = Field(pattern=r"^[a-f0-9]{64}$")
+    export_scope: ExportScope = "all"
 
 
 class YarnExportRequest(BaseModel):
@@ -347,15 +348,17 @@ def season_xlsx(body: SeasonExportRequest, request: Request):
                 report = build_season_report(conn, body.filters, full=True)
                 if not hmac.compare_digest(report["snapshot"], body.snapshot):
                     raise HTTPException(409, "数据已变化，请重新生成预览再导出。", headers=NO_STORE)
-                thumbnails = load_thumbnails(conn, report)
+                thumbnails = load_thumbnails(conn, report, export_scope=body.export_scope)
                 return report, thumbnails
             return _season_call(load)
     report, thumbnails = run()
-    payload = render_season_workbook(report, thumbnails)
+    payload = render_season_workbook(report, thumbnails, export_scope=body.export_scope)
     name = "-".join(report["scope"]["seasons"])
-    filename = f"season-style-analysis-{report['scope']['cutoff'] or 'all'}.xlsx"
+    prefix_en = {"all": "season-style-analysis", "tracking": "season-order-tracking", "review": "season-style-review"}[body.export_scope]
+    prefix_zh = {"all": "季度款式分析", "tracking": "日常订补跟踪", "review": "季度款式复盘"}[body.export_scope]
+    filename = f"{prefix_en}-{report['scope']['cutoff'] or 'all'}.xlsx"
     from urllib.parse import quote
-    quoted = quote(f"季度款式分析-{name}-{report['scope']['cutoff'] or ''}.xlsx")
+    quoted = quote(f"{prefix_zh}-{name}-{report['scope']['cutoff'] or ''}.xlsx")
     return Response(
         payload,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

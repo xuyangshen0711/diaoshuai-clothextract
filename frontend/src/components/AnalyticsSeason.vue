@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import {
   exportSeason, previewSeason, seasonOptions,
-  type SeasonFilters, type SeasonGrade, type SeasonGroupRow, type SeasonOptions, type SeasonReport,
+  type SeasonExportScope, type SeasonFilters, type SeasonGrade, type SeasonGroupRow, type SeasonOptions, type SeasonReport,
 } from '../analyticsApi'
 
 const props = defineProps<{ active: boolean }>()
@@ -17,25 +17,50 @@ const options = ref<SeasonOptions | null>(null)
 const seasons = ref<string[]>([])
 const cutoff = ref('')
 const compare = ref('')
+const includeBrand = ref(false)
 const report = ref<SeasonReport | null>(null)
 const submitted = ref('')
 const loading = ref(false)
 const preparing = ref(false)
-const downloading = ref(false)
+const downloadingScope = ref<SeasonExportScope | ''>('')
 const error = ref('')
 const notice = ref('')
 const wallMode = ref<'category' | 'material'>('category')
 const wallIndex = ref(0)
+const expandedUnproduced = ref<Record<string, boolean>>({})
 
-const filters = computed<SeasonFilters>(() => ({ seasons: [...seasons.value].sort(), cutoff: cutoff.value || null, compare: compare.value || null }))
+const filters = computed<SeasonFilters>(() => ({
+  seasons: [...seasons.value].sort(),
+  cutoff: cutoff.value || null,
+  compare: compare.value || null,
+  include_brand: includeBrand.value,
+}))
 const signature = computed(() => JSON.stringify(filters.value))
 const changed = computed(() => Boolean(report.value) && submitted.value !== signature.value)
+const downloading = computed(() => Boolean(downloadingScope.value))
 const busy = computed(() => loading.value || preparing.value || downloading.value)
 watch(busy, value => emit('update:busy', value))
 
 const walls = computed(() => report.value ? (wallMode.value === 'category' ? report.value.walls.category : report.value.walls.material) : [])
 const wall = computed(() => walls.value[Math.min(wallIndex.value, Math.max(0, walls.value.length - 1))])
-watch(wallMode, () => { wallIndex.value = 0 })
+const wallBlocks = computed(() => {
+  const current = wall.value
+  if (!current) return []
+  return 'rows' in current
+    ? current.rows
+    : [{ material: '', sku: current.headline.sku, grades: current.grades }]
+})
+watch(wallMode, () => { wallIndex.value = 0; expandedUnproduced.value = {} })
+watch(wallIndex, () => { expandedUnproduced.value = {} })
+
+function blockKey(material: string) {
+  return `${wallMode.value}:${wall.value?.name || ''}:${material}`
+}
+
+function toggleUnproduced(key: string) {
+  expandedUnproduced.value = { ...expandedUnproduced.value, [key]: !expandedUnproduced.value[key] }
+}
+
 const sourceHints = computed(() => {
   const s = options.value?.sources
   if (!s) return []
@@ -66,6 +91,8 @@ async function generate() {
   preparing.value = true; error.value = ''; notice.value = ''
   try {
     report.value = await previewSeason(filters.value)
+    wallIndex.value = 0
+    expandedUnproduced.value = {}
     submitted.value = signature.value
     if (!cutoff.value && report.value.scope.cutoff) cutoff.value = report.value.scope.cutoff
     if (!compare.value && report.value.scope.compare) compare.value = report.value.scope.compare
@@ -74,20 +101,27 @@ async function generate() {
   finally { preparing.value = false }
 }
 
-async function download() {
+const EXPORT_META: Record<SeasonExportScope, { prefix: string; label: string; sheets: string }> = {
+  tracking: { prefix: '日常订补跟踪', label: '日常跟踪（3表）', sheets: '3 张日常跟踪表（市场款号订补情况、单款销售周期、订单与备单的对比）+ 口径说明' },
+  review: { prefix: '季度款式复盘', label: '季度复盘（6表）', sheets: '6 张季度复盘表（按品类/按材质等级表、材质与品类对比、纱线颜色、设计师工艺师）+ 口径说明' },
+  all: { prefix: '季度款式分析', label: '完整合集（9表）', sheets: '全部 9 张表 + 口径说明' },
+}
+
+async function download(scope: SeasonExportScope) {
   if (!report.value || changed.value) return
-  downloading.value = true; error.value = ''; notice.value = ''
+  downloadingScope.value = scope; error.value = ''; notice.value = ''
   try {
-    const { blob, images } = await exportSeason(filters.value, report.value.snapshot)
+    const { blob, images } = await exportSeason(filters.value, report.value.snapshot, scope)
+    const meta = EXPORT_META[scope]
     const url = URL.createObjectURL(blob)
     const link = document.createElement('a')
     link.href = url
-    link.download = `季度款式分析-${report.value.scope.seasons.join('_')}-${report.value.scope.cutoff || ''}.xlsx`
+    link.download = `${meta.prefix}-${report.value.scope.seasons.join('_')}-${report.value.scope.cutoff || ''}.xlsx`
     document.body.appendChild(link); link.click(); link.remove()
     setTimeout(() => URL.revokeObjectURL(url), 2000)
-    notice.value = `已导出 Excel（9 张表 + 口径说明，嵌入 ${images} 张款式图）。`
+    notice.value = `已导出 ${meta.label} Excel（${meta.sheets}，嵌入 ${images} 张高清款式图）。`
   } catch (e) { error.value = e instanceof Error ? e.message : String(e) }
-  finally { downloading.value = false }
+  finally { downloadingScope.value = '' }
 }
 
 function groupCells(row: SeasonGroupRow) {
@@ -108,7 +142,14 @@ function groupCells(row: SeasonGroupRow) {
             @click="toggle(item.season)">{{ item.season }} <small>{{ item.styles }}款</small></button>
         </div>
         <p v-else-if="options" class="analytics-note">还没有商品资料，请先在导入资料里上传商品资料表。</p>
-        <p class="analytics-note">SKU 以所选季节的商品资料为准，市场款与品牌专款一起统计。</p>
+      </fieldset>
+      <fieldset :disabled="preparing || loading">
+        <legend>统计口径</legend>
+        <label class="season-checkbox">
+          <input v-model="includeBrand" type="checkbox" />
+          <span>包含品牌专款</span>
+        </label>
+        <p class="analytics-note">默认只统计市场款，排除带品牌后缀的款号（如 662513风笛、615502佐色）。</p>
       </fieldset>
       <fieldset :disabled="preparing || loading">
         <legend>统计时间 <small>可选</small></legend>
@@ -125,10 +166,17 @@ function groupCells(row: SeasonGroupRow) {
 
     <div class="analytics-workspace">
       <ul v-if="sourceHints.length" class="season-hints" aria-label="数据准备提示"><li v-for="hint in sourceHints" :key="hint">{{ hint }}</li></ul>
-      <div v-if="report" class="analytics-export">
+      <div v-if="report" class="analytics-export season-export-bar">
         <p v-if="changed">筛选条件已调整，请重新点击「生成季度款式分析」后再导出。</p>
-        <p v-else>导出 Excel：订补表、销售周期、按品类 / 按材质等级表（带款式图）、材质与品类对比、纱线颜色、订单与备单对比、设计师工艺师统计，共 9 张表 + 口径说明。款多时需要几十秒，请稍候。</p>
-        <button type="button" class="analytics-primary" :disabled="downloading || preparing || changed" @click="download">{{ downloading ? '正在生成带图 Excel…' : '导出 Excel (.xlsx)' }}</button>
+        <div v-else class="season-export-desc">
+          <p><strong>日常跟踪（3表）</strong>：市场款号订补情况、单款销售周期、订单与备单的对比（高频使用、导出快）。</p>
+          <p><strong>季度复盘（6表）</strong>：按品类/按材质等级表（带高清图）、材质与品类对比、纱线颜色、设计师工艺师。</p>
+        </div>
+        <div class="season-export-actions">
+          <button type="button" class="analytics-primary" :disabled="downloading || preparing || changed" @click="download('tracking')">{{ downloadingScope === 'tracking' ? '正在导出日常跟踪…' : '导出日常跟踪（3表）' }}</button>
+          <button type="button" class="season-btn-secondary" :disabled="downloading || preparing || changed" @click="download('review')">{{ downloadingScope === 'review' ? '正在导出季度复盘…' : '导出季度复盘（6表）' }}</button>
+          <button type="button" class="season-btn-secondary" :disabled="downloading || preparing || changed" @click="download('all')">{{ downloadingScope === 'all' ? '正在导出完整合集…' : '导出完整合集（9表）' }}</button>
+        </div>
       </div>
       <p v-if="error" class="analytics-error" role="alert">{{ error }}</p>
       <p v-if="notice" class="analytics-note" role="status">{{ notice }}</p>
@@ -137,7 +185,8 @@ function groupCells(row: SeasonGroupRow) {
       <article v-if="report" class="analytics-report season-report" aria-label="季度款式分析预览">
         <header class="analytics-report-head">
           <div><h2>季度款式分析</h2><p>{{ report.scope.seasons.join('、') }} · 截止 {{ report.scope.cutoff || '—' }}</p></div>
-          <span>市场款 {{ report.overview.market_sku }} + 品牌专款 {{ report.overview.brand_sku }}</span>
+          <span v-if="report.scope.include_brand">市场款 {{ report.overview.market_sku }} + 品牌专款 {{ report.overview.brand_sku }}</span>
+          <span v-else>仅市场款 {{ report.overview.market_sku }}（已排除 {{ report.overview.excluded_brand_sku }} 款品牌专款）</span>
         </header>
 
         <section v-if="report.checks.length" class="season-checks" aria-label="数据检查">
@@ -198,23 +247,33 @@ function groupCells(row: SeasonGroupRow) {
           <div class="yarn-season-chips season-wall-tabs" role="group" aria-label="选择分组">
             <button v-for="(item, index) in walls" :key="item.name" type="button" class="yarn-chip" :class="{ 'is-active': index === wallIndex }" @click="wallIndex = index">{{ item.name }} <small>{{ item.headline.sku }}</small></button>
           </div>
-          <template v-if="wall">
+          <div v-if="wall" :key="`${wallMode}:${wall.name}`">
             <p class="season-headline">SKU {{ wall.headline.sku }} · 动销率 {{ wall.headline.ordered }}/{{ wall.headline.sku }} = {{ pct(wall.headline.sell_through) }} · 产销率（生产比）{{ wall.headline.produced }}/{{ wall.headline.sku }} = {{ pct(wall.headline.production_ratio) }} · 无效率 {{ pct(wall.headline.invalid_ratio) }}</p>
-            <template v-for="block in ('rows' in wall ? wall.rows : [{ material: '', sku: wall.headline.sku, grades: wall.grades }])" :key="block.material">
+            <div v-for="block in wallBlocks" :key="blockKey(block.material)" class="season-wall-block">
               <h4 v-if="block.material" class="season-wall-material">原料：{{ block.material }}（{{ block.sku }} 款）</h4>
               <div v-for="g in GRADES" :key="g" class="season-grade-row">
                 <div class="season-grade-label" :class="'grade-' + (g === '无产量' ? 'none' : g)">{{ g }}<small>{{ block.grades[g].length }} 款</small></div>
                 <div class="season-grade-items">
-                  <figure v-for="item in block.grades[g]" :key="item.code" class="season-style">
-                    <img v-if="item.image_url" :src="item.image_url" :alt="item.code" loading="lazy" />
-                    <div v-else class="season-noimg">无图</div>
-                    <figcaption><strong>{{ item.code }}</strong><span>{{ intFmt.format(item.quantity) }} 件</span></figcaption>
-                  </figure>
-                  <span v-if="!block.grades[g].length" class="season-empty">—</span>
+                  <template v-if="g === '无产量' && block.grades[g].length && !expandedUnproduced[blockKey(block.material)]">
+                    <button type="button" class="season-unproduced-toggle" @click="toggleUnproduced(blockKey(block.material))">
+                      已折叠 {{ block.grades[g].length }} 款无产量（点击展开查看）
+                    </button>
+                  </template>
+                  <template v-else>
+                    <button v-if="g === '无产量' && block.grades[g].length" type="button" class="season-unproduced-toggle is-open" @click="toggleUnproduced(blockKey(block.material))">
+                      收起无产量（{{ block.grades[g].length }} 款）
+                    </button>
+                    <figure v-for="item in block.grades[g]" :key="item.code" class="season-style">
+                      <img v-if="item.image_url" :src="item.image_url" :alt="item.code" loading="lazy" decoding="async" />
+                      <div v-else class="season-noimg">无图</div>
+                      <figcaption><strong>{{ item.code }}</strong><span>{{ intFmt.format(item.quantity) }} 件</span></figcaption>
+                    </figure>
+                    <span v-if="!block.grades[g].length" class="season-empty">—</span>
+                  </template>
                 </div>
               </div>
-            </template>
-          </template>
+            </div>
+          </div>
         </section>
       </article>
     </div>
@@ -223,6 +282,15 @@ function groupCells(row: SeasonGroupRow) {
 
 <style scoped>
 .season-hints { margin: 0 0 12px; padding: 10px 14px 10px 30px; border: 1px solid #e3c98f; background: #fff8e8; border-radius: 10px; font-size: 13px; }
+.season-checkbox { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 500; cursor: pointer; margin: 4px 0 6px; }
+.season-checkbox input { width: 16px; height: 16px; cursor: pointer; }
+.season-export-bar { flex-direction: column; align-items: stretch; gap: 10px; }
+.season-export-desc p { margin: 2px 0; font-size: 13px; color: var(--muted); }
+.season-export-desc strong { color: var(--ink); }
+.season-export-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.season-btn-secondary { padding: 9px 14px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--ink); font-size: 13px; font-weight: 500; cursor: pointer; }
+.season-btn-secondary:hover:not(:disabled) { border-color: var(--ink); background: #f8f6f0; }
+.season-btn-secondary:disabled { opacity: .55; cursor: not-allowed; }
 .season-rules { margin-top: 14px; }
 .season-rules p { margin: 4px 0; }
 .season-checks h3 small { font-weight: 400; color: var(--muted); font-size: 12px; margin-left: 6px; }
@@ -244,6 +312,9 @@ function groupCells(row: SeasonGroupRow) {
 .season-grade-label { border-radius: 8px; display: flex; flex-direction: column; align-items: center; justify-content: center; font-weight: 700; font-size: 15px; }
 .season-grade-label small { font-weight: 400; font-size: 11px; }
 .season-grade-items { display: flex; flex-wrap: wrap; gap: 8px; min-height: 40px; align-items: flex-start; }
+.season-unproduced-toggle { align-self: center; padding: 6px 12px; border: 1px dashed var(--line); border-radius: 8px; background: #faf8f4; color: var(--muted); font-size: 12px; cursor: pointer; }
+.season-unproduced-toggle:hover { border-color: var(--ink); color: var(--ink); }
+.season-unproduced-toggle.is-open { flex-basis: 100%; text-align: left; margin-bottom: 2px; }
 .season-style { margin: 0; width: 96px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: #fff; }
 .season-style img, .season-noimg { width: 96px; height: 124px; object-fit: cover; display: block; background: #f3f1ec; }
 .season-noimg { display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 12px; }

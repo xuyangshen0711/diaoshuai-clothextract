@@ -94,9 +94,10 @@ defineExpose({ openFile })
       <div class="preview-title"><strong>{{ preview.source_file }}</strong><span class="type-label">{{ preview.format_label }}</span></div>
       <p class="meta">识别依据：{{ preview.meta.evidence_columns?.join('、') }}。共 {{ preview.style_codes.length }} 个本厂款号、{{ preview.row_count }} 条有效记录。</p>
       <p v-if="preview.kind === 'archive'" class="meta">一级、二级品类按表格内容导入，空白单元格保留为空；不会由 AI 猜测或补填。</p>
-      <div v-if="rangeReady" class="preview-counts"><span>新增 <strong>{{ preview.counts.new }}</strong></span><span>更新 <strong>{{ preview.counts.updated }}</strong></span><span>无变化 <strong>{{ preview.counts.unchanged }}</strong></span><span :class="{ 'gap-text': preview.issue_count }">异常行 <strong>{{ preview.issue_count }}</strong></span></div>
+      <div v-if="rangeReady" class="preview-counts"><span>新增 <strong>{{ preview.counts.new }}</strong></span><span>更新 <strong>{{ preview.counts.updated }}</strong></span><span>无变化 <strong>{{ preview.counts.unchanged }}</strong></span><span :class="{ 'gap-text': preview.issue_count }">异常行 <strong>{{ preview.issue_count }}</strong></span><span v-if="preview.kind === 'production' && preview.meta.parsed_quantity != null">计划总件数 <strong>{{ n(preview.meta.parsed_quantity) }}</strong> 件</span></div>
       <p v-if="preview.counts.updated && preview.kind === 'archive'" class="workspace-notice">更新会覆盖表格对应字段，包括空值。请确认该表为要使用的档案版本。</p>
       <p v-if="preview.meta.parsed_quantity != null && preview.kind === 'sales'">本次计入销量 {{ preview.meta.parsed_quantity.toLocaleString() }} 件，金额 ¥{{ preview.meta.parsed_amount?.toLocaleString() }}。</p>
+      <p v-if="preview.meta.parsed_quantity != null && preview.kind === 'production'" class="complete-note">本次计划总件数 <strong>{{ n(preview.meta.parsed_quantity) }}</strong> 件（共 {{ n(preview.meta.style_count) }} 个大货款号<template v-if="preview.meta.blank_plan_rows">，其中 {{ n(preview.meta.blank_plan_rows) }} 行未填计划数按 0 件计</template>）。</p>
       <p v-if="preview.meta.reconcile_note" :class="preview.meta.reconciled === false ? 'error' : 'complete-note'">{{ preview.meta.reconcile_note }}</p>
       <p v-if="preview.meta.warnings?.length" class="workspace-notice">{{ preview.meta.warnings.join('；') }}</p>
       <p v-for="item in preview.meta.notes || []" :key="item" class="meta">{{ item }}</p>
@@ -185,6 +186,7 @@ defineExpose({ openFile })
       <p v-if="!preview.can_confirm" class="error">未找到有效数据，请修正表格后重新选择。</p>
     </div>
     <div v-if="result" class="import-success" role="status"><h4>{{ result.source_file }} 已导入</h4><p>新增 {{ result.imported }} 条，更新 {{ result.updated }} 条，{{ result.unchanged }} 条无变化。</p>
+      <p v-if="result.kind === 'production' && result.parsed_quantity != null">本次计划总件数 <strong>{{ n(result.parsed_quantity) }}</strong> 件<template v-if="result.style_count">（共 {{ n(result.style_count) }} 个大货款号）</template>。</p>
       <p v-if="result.season_replace?.enabled">已整季覆盖 {{ result.season_replace.seasons.join('、') }}<span v-if="result.season_replace.removed_rows">，移除旧行 {{ result.season_replace.removed_rows }} 条{{ result.season_replace.backup_id ? '（已备份，可恢复）' : '' }}</span>。</p>
       <SalesImportTotals v-if="result.kind === 'sales'" :report="result" />
       <div class="toolbar">

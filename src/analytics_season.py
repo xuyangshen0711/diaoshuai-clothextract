@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from io import BytesIO
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -40,11 +41,15 @@ def customer_type(variant_code: str) -> str:
     return MARKET if _MARKET_RE.fullmatch((variant_code or "").strip()) else BRAND
 
 
+ExportScope = Literal["all", "tracking", "review"]
+
+
 class SeasonFilters(BaseModel):
     model_config = ConfigDict(extra="forbid")
     seasons: list[str] = Field(min_length=1, max_length=24)
     cutoff: date | None = None
     compare: date | None = None
+    include_brand: bool = False
 
     @model_validator(mode="after")
     def check(self):
@@ -88,6 +93,8 @@ class _Data:
     compare: date | None
     first_day: date | None
     last_day: date | None
+    include_brand: bool = False
+    excluded_brand_sku: int = 0
     undated_orders: int = 0
     material_ab: dict[str, bool] = field(default_factory=dict)
 
@@ -123,7 +130,7 @@ def own_factory_images(conn) -> dict[str, dict]:
 def image_url(item: dict | None) -> str | None:
     if not item:
         return None
-    return f"/api/records/{item['record_id']}/image?variant=cover&v=r{item['revision']}"
+    return f"/api/records/{item['record_id']}/image?variant=thumbnail&v=r{item['revision']}"
 
 
 def season_options(conn) -> dict:
@@ -155,9 +162,15 @@ def season_options(conn) -> dict:
 
 def _load(conn, filters: SeasonFilters) -> _Data:
     seasons = filters.seasons
+    include_brand = bool(filters.include_brand)
     styles: dict[str, _Style] = {}
     material_ab: dict[str, bool] = {}
+    excluded_brand_sku = 0
     for row in conn.execute(f"SELECT * FROM style_variants WHERE season IN ({_marks(seasons)})", seasons):
+        ctype = customer_type(row["variant_code"])
+        if not include_brand and ctype == BRAND:
+            excluded_brand_sku += 1
+            continue
         group, ab = material_group(row["material"])
         material_ab[group] = material_ab.get(group, False) or ab
         styles[row["variant_code"]] = _Style(
@@ -165,13 +178,15 @@ def _load(conn, filters: SeasonFilters) -> _Data:
             cat1=(row["category"] or "").strip(), cat2=(row["subcategory"] or "").strip(),
             material_raw=(row["material"] or "").strip(), material=group,
             designer=(row["designer"] or "").strip() or "（未填）", craftsman=(row["craftsman"] or "").strip() or "（未填）",
-            colors=_colors(row["colors_json"]), plan=category_plan(row["category"]), ctype=customer_type(row["variant_code"]),
+            colors=_colors(row["colors_json"]), plan=category_plan(row["category"]), ctype=ctype,
         )
     orders, undated = [], 0
     first = last = None
     for row in conn.execute(
             "SELECT variant_code, style_code, color, size_label, quantity, amount, order_kind, order_date, customer, "
             f"customer_raw, season FROM style_order_lines WHERE season IN ({_marks(seasons)})", seasons):
+        if not include_brand and customer_type(row["variant_code"]) == BRAND:
+            continue
         day = parse_order_date(row["order_date"])
         if day is None:
             undated += 1
@@ -188,6 +203,8 @@ def _load(conn, filters: SeasonFilters) -> _Data:
     for row in conn.execute(
             "SELECT variant_code, color, size_label, quantity, order_date FROM style_stock_lines "
             f"WHERE season IN ({_marks(seasons)})", seasons):
+        if not include_brand and customer_type(row["variant_code"]) == BRAND:
+            continue
         day = parse_order_date(row["order_date"])
         if day is None or (filters.cutoff and day > filters.cutoff):
             continue
@@ -196,17 +213,21 @@ def _load(conn, filters: SeasonFilters) -> _Data:
     archive_all = {r["variant_code"] for r in conn.execute("SELECT variant_code FROM style_variants")}
     prod_skc, outside = set(), set()
     for row in conn.execute("SELECT variant_code, color FROM style_production"):
+        if not include_brand and customer_type(row["variant_code"]) == BRAND:
+            continue
         if row["variant_code"] in styles:
             prod_skc.add((row["variant_code"], (row["color"] or "").strip()))
         elif row["variant_code"] not in archive_all:
             outside.add(row["variant_code"])
     guide = [dict(r) for r in conn.execute(
-        f"SELECT variant_code, designer, craftsman FROM style_design_guide WHERE season IN ({_marks(seasons)})", seasons)]
+        f"SELECT variant_code, designer, craftsman FROM style_design_guide WHERE season IN ({_marks(seasons)})", seasons)
+        if include_brand or customer_type(r["variant_code"]) != BRAND]
     cutoff = filters.cutoff or last
     compare = filters.compare or ((cutoff - timedelta(days=10)) if cutoff else None)
     return _Data(seasons=seasons, styles=styles, orders=orders, stock=stock, prod_skc=prod_skc,
                  prod_codes={c for c, _ in prod_skc}, prod_outside=sorted(outside), guide=guide,
                  images=own_factory_images(conn), cutoff=cutoff, compare=compare, first_day=first, last_day=last,
+                 include_brand=include_brand, excluded_brand_sku=excluded_brand_sku,
                  undated_orders=undated, material_ab=material_ab)
 
 
@@ -406,11 +427,12 @@ def build_season_report(conn, filters: SeasonFilters, *, full: bool = False) -> 
                       for m in materials]
 
     snapshot = hashlib.sha256(json.dumps([
-        data.seasons, str(data.cutoff), str(data.compare), len(data.styles), len(data.orders), calc.total_q, round(calc.total_a, 2),
-        len(data.prod_skc), len(data.guide), len(data.stock), len(data.images),
+        data.seasons, data.include_brand, str(data.cutoff), str(data.compare), len(data.styles), len(data.orders),
+        calc.total_q, round(calc.total_a, 2), len(data.prod_skc), len(data.guide), len(data.stock), len(data.images),
     ], default=str).encode()).hexdigest()
     report = {
-        "scope": {"seasons": data.seasons, "cutoff": data.cutoff.isoformat() if data.cutoff else None,
+        "scope": {"seasons": data.seasons, "include_brand": data.include_brand,
+                  "cutoff": data.cutoff.isoformat() if data.cutoff else None,
                   "compare": data.compare.isoformat() if data.compare else None,
                   "first_order_date": data.first_day.isoformat() if data.first_day else None,
                   "last_order_date": data.last_day.isoformat() if data.last_day else None},
@@ -419,6 +441,7 @@ def build_season_report(conn, filters: SeasonFilters, *, full: bool = False) -> 
                      "amount": round(calc.total_a, 2), "grade_counts": grade_counts,
                      "market_sku": sum(1 for s in data.styles.values() if s.ctype == MARKET),
                      "brand_sku": sum(1 for s in data.styles.values() if s.ctype == BRAND),
+                     "excluded_brand_sku": data.excluded_brand_sku,
                      "image_styles": sum(1 for s in data.styles.values() if s.style_code in data.images)},
         "materials": {"rows": material_rows, "totals": totals},
         "categories": {"rows": plan_rows, "totals": totals},
@@ -590,18 +613,20 @@ def _stock_blocks(data: _Data, calc: _Calc) -> list[dict]:
 
 
 # ---------------------------------------------------------------- Excel
-THUMB_BOX = (88, 112)  # 单元格里的图片尺寸（像素）
+THUMB_SOURCE_BOX = (260, 320)  # 内嵌图片源分辨率（2x+ 清晰度，放大不糊）
+GRID_IMG_BOX = (112, 148)      # 等级表单元格内显示尺寸（像素）
+TABLE_IMG_BOX = (96, 118)      # 订补表与订单备单对比表显示尺寸（像素）
 
 
-def load_thumbnails(conn, report: dict, *, workers: int = 8) -> dict[str, bytes]:
-    """图库封面缩略图，按 record id 返回压缩后的 JPEG 字节；取不到的款直接跳过（用款号文字代替）。"""
+def load_thumbnails(conn, report: dict, *, workers: int = 8, export_scope: ExportScope = "all") -> dict[str, bytes]:
+    """图库封面高清缩略图，按 record id 返回压缩后的 JPEG 字节；取不到的款直接跳过（用款号文字代替）。"""
     from PIL import Image
 
     from src.images import cover_path
     from src.schema import ImageRecord
 
     ids = set()
-    for url in _all_image_urls(report):
+    for url in _all_image_urls(report, export_scope=export_scope):
         ids.add(url.split("/api/records/")[1].split("/")[0])
     if not ids:
         return {}
@@ -617,9 +642,9 @@ def load_thumbnails(conn, report: dict, *, workers: int = 8) -> dict[str, bytes]
             path = cover_path(records[record_id])
             with Image.open(path) as image:
                 image = image.convert("RGB")
-                image.thumbnail(THUMB_BOX)
+                image.thumbnail(THUMB_SOURCE_BOX, Image.Resampling.LANCZOS)
                 out = BytesIO()
-                image.save(out, format="JPEG", quality=82)
+                image.save(out, format="JPEG", quality=88)
                 return record_id, out.getvalue()
         except Exception:
             return record_id, None
@@ -628,20 +653,22 @@ def load_thumbnails(conn, report: dict, *, workers: int = 8) -> dict[str, bytes]
         return {rid: blob for rid, blob in pool.map(render, [r for r in id_list if r in records]) if blob}
 
 
-def _all_image_urls(report: dict):
-    for wall in report["walls"]["category"]:
-        for row in wall["rows"]:
-            for items in row["grades"].values():
+def _all_image_urls(report: dict, *, export_scope: ExportScope = "all"):
+    if export_scope in ("all", "review"):
+        for wall in report["walls"]["category"]:
+            for row in wall["rows"]:
+                for items in row["grades"].values():
+                    yield from (i["image_url"] for i in items if i["image_url"])
+        for wall in report["walls"]["material"]:
+            for items in wall["grades"].values():
                 yield from (i["image_url"] for i in items if i["image_url"])
-    for wall in report["walls"]["material"]:
-        for items in wall["grades"].values():
-            yield from (i["image_url"] for i in items if i["image_url"])
-    detail = report.get("detail") or {}
-    yield from (r["image_url"] for r in detail.get("orders_table", []) if r["image_url"])
-    yield from (b["image_url"] for b in detail.get("stock", []) if b["image_url"])
+    if export_scope in ("all", "tracking"):
+        detail = report.get("detail") or {}
+        yield from (r["image_url"] for r in detail.get("orders_table", []) if r["image_url"])
+        yield from (b["image_url"] for b in detail.get("stock", []) if b["image_url"])
 
 
-def render_season_workbook(report: dict, thumbnails: dict[str, bytes]) -> bytes:
+def render_season_workbook(report: dict, thumbnails: dict[str, bytes], *, export_scope: ExportScope = "all") -> bytes:
     from openpyxl import Workbook
     from openpyxl.drawing.image import Image as XLImage
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -656,15 +683,15 @@ def render_season_workbook(report: dict, thumbnails: dict[str, bytes]) -> bytes:
     wb = Workbook()
     wb.remove(wb.active)
 
-    def put_image(ws, url, anchor, box=THUMB_BOX):
+    def put_image(ws, url, anchor, box=GRID_IMG_BOX):
         if not url:
             return False
         blob = thumbnails.get(url.split("/api/records/")[1].split("/")[0])
         if not blob:
             return False
         image = XLImage(BytesIO(blob))
-        scale = min(box[0] / image.width, box[1] / image.height, 1)
-        image.width, image.height = int(image.width * scale), int(image.height * scale)
+        scale = min(box[0] / image.width, box[1] / image.height, 1.0)
+        image.width, image.height = int(round(image.width * scale)), int(round(image.height * scale))
         ws.add_image(image, anchor)
         return True
 
@@ -702,15 +729,15 @@ def render_season_workbook(report: dict, thumbnails: dict[str, bytes]) -> bytes:
             head.fill = PatternFill("solid", fgColor=grade_fill[label])
             ws.merge_cells(start_row=r, start_column=1, end_row=r + lines * 2 - 1, end_column=1)
             for k in range(lines):
-                ws.row_dimensions[r + 2 * k].height = 88
-                ws.row_dimensions[r + 2 * k + 1].height = 26
+                ws.row_dimensions[r + 2 * k].height = 116
+                ws.row_dimensions[r + 2 * k + 1].height = 28
             for i, item in enumerate(items):
                 line, col = divmod(i, per_row)
                 img_row, text_row = r + 2 * line, r + 2 * line + 1
                 cell = ws.cell(img_row, 2 + col)
                 cell.border = border
                 letter = get_column_letter(2 + col)
-                if not put_image(ws, item["image_url"], f"{letter}{img_row}"):
+                if not put_image(ws, item["image_url"], f"{letter}{img_row}", GRID_IMG_BOX):
                     cell.value, cell.alignment = f"{item['code']}\n（无图）", center
                     cell.font = Font(size=9, color="7F7F7F")
                 t = ws.cell(text_row, 2 + col, f"{item['code']}\n{item['quantity']:,}件")
@@ -722,21 +749,33 @@ def render_season_workbook(report: dict, thumbnails: dict[str, bytes]) -> bytes:
     def grid_widths(ws):
         ws.column_dimensions["A"].width = 11
         for j in range(2, 2 + per_row):
-            ws.column_dimensions[get_column_letter(j)].width = 13
+            ws.column_dimensions[get_column_letter(j)].width = 17
 
     scope = report["scope"]
     seasons = "、".join(scope["seasons"])
     detail = report["detail"]
+    scope_titles = {
+        "all": "季度款式分析（完整 9 表）",
+        "tracking": "日常订补与备单跟踪（3 表）",
+        "review": "季度款式复盘汇总（6 表）",
+    }
+    include_tracking = export_scope in ("all", "tracking")
+    include_review = export_scope in ("all", "review")
+    brand_note = (
+        f"市场款 {report['overview']['market_sku']} + 品牌专款 {report['overview']['brand_sku']}"
+        if scope.get("include_brand")
+        else f"仅市场款（已按规则排除 {report['overview'].get('excluded_brand_sku', 0)} 款品牌专款）"
+    )
 
     # 口径说明
     ws = wb.create_sheet("口径说明")
     ov = report["overview"]
     lines = [
-        f"季度款式分析 · {seasons}",
+        f"{scope_titles[export_scope]} · {seasons}",
         f"统计截止：{scope['cutoff'] or '—'}；「增长 / 新增」对比日：{scope['compare'] or '—'}（对比日之后、截止日之前的订单）",
-        f"SKU {ov['sku']}（市场款 {ov['market_sku']}、品牌专款 {ov['brand_sku']}），订货 {ov['ordered']}，生产 {ov['produced']}，"
+        f"统计口径：{brand_note}；SKU {ov['sku']}，订货 {ov['ordered']}，生产 {ov['produced']}，"
         f"SKC {ov['skc']}，订单 {ov['quantity']:,} 件、¥{ov['amount']:,.0f}",
-        "SKU = 商品资料的款数（大货款号，市场款与品牌专款一起算）；订货 SKU = 订单数据中的款数；生产数 = 生产数据中的款数；SKC = 单款单色",
+        "SKU = 商品资料的款数（大货款号）；订货 SKU = 订单数据中的款数；生产数 = 生产数据中的款数；SKC = 单款单色",
         "动销率 = 订货 SKU ÷ SKU；生产比（等级表称产销率）= 生产款数 ÷ SKU；无效率 = 无产量 ÷ SKU；颜色表产销率 = 生产 SKC ÷ SKC",
         "等级按单款累计订单件数（订单 + 补单）：" + "，".join(f"{g['name']} ≥ {g['min']:,}" for g in report["grades"])
         + "；没进生产数据的款归「无产量」",
@@ -754,154 +793,159 @@ def render_season_workbook(report: dict, thumbnails: dict[str, bytes]) -> bytes:
         ws.cell(i, 1, text).font = Font(bold=i == 1, size=13 if i == 1 else 10)
     ws.column_dimensions["A"].width = 150
 
-    # 市场款号订补情况
-    ws = wb.create_sheet("市场款号订补情况")
-    cut = scope["cutoff"] or ""
-    cut_label = f"{int(cut[5:7])}.{int(cut[8:10])}" if cut else ""
-    cmp_label = f"较{int(scope['compare'][5:7])}.{int(scope['compare'][8:10])}" if scope["compare"] else ""
-    rows = [["", r["code"], r["material"], r["type"], r["category"], r["grade"], r["quantity"], round(r["amount"]),
-             r["customers"], r["growth"], r["replenishment"], r["replenishment_customers"], r["new_replenishment"]]
-            for r in detail["orders_table"]]
-    table(ws, 1, ["图片", "款号", "材质", "客户类型", "一级品类", "等级", f"{cut_label}订单数量汇总",
-                  f"{cut_label}订单金额汇总", f"{cut_label}订单客户数量", f"增长数量({cmp_label})", f"{cut_label}补单量",
-                  f"{cut_label}补单客户数", f"新增补单量({cmp_label})"],
-          rows, [None] * 6 + [num, money, num, num, num, num, num], [11, 13, 22, 8, 10, 6, 12, 14, 10, 13, 10, 10, 13])
-    for i, r in enumerate(detail["orders_table"], 2):
-        ws.row_dimensions[i].height = 62
-        put_image(ws, r["image_url"], f"A{i}", (70, 80))
-    ws.freeze_panes = "C2"
+    if include_tracking:
+        # 市场款号订补情况
+        ws = wb.create_sheet("市场款号订补情况")
+        cut = scope["cutoff"] or ""
+        cut_label = f"{int(cut[5:7])}.{int(cut[8:10])}" if cut else ""
+        cmp_label = f"较{int(scope['compare'][5:7])}.{int(scope['compare'][8:10])}" if scope["compare"] else ""
+        rows = [["", r["code"], r["material"], r["type"], r["category"], r["grade"], r["quantity"], round(r["amount"]),
+                 r["customers"], r["growth"], r["replenishment"], r["replenishment_customers"], r["new_replenishment"]]
+                for r in detail["orders_table"]]
+        table(ws, 1, ["图片", "款号", "材质", "客户类型", "一级品类", "等级", f"{cut_label}订单数量汇总",
+                      f"{cut_label}订单金额汇总", f"{cut_label}订单客户数量", f"增长数量({cmp_label})", f"{cut_label}补单量",
+                      f"{cut_label}补单客户数", f"新增补单量({cmp_label})"],
+              rows, [None] * 6 + [num, money, num, num, num, num, num],
+              [15, 13, 22, 8, 10, 6, 12, 14, 10, 13, 10, 10, 13])
+        for i, r in enumerate(detail["orders_table"], 2):
+            ws.row_dimensions[i].height = 92
+            put_image(ws, r["image_url"], f"A{i}", TABLE_IMG_BOX)
+        ws.freeze_panes = "C2"
 
-    # 单款销售周期
-    ws = wb.create_sheet("单款销售周期")
-    cyc = detail["cycle"]
-    has_undated = any(r["undated"] for r in cyc["rows"])
-    rows = [[r["code"], r["type"], r["kind"], r["cat1"], r["cat2"], r["material"], *[v or None for v in r["values"]],
-             *([r["undated"] or None] if has_undated else []), r["total"]] for r in cyc["rows"]]
-    table(ws, 1, ["款号", "客户类型", "订单分类", "一级品类", "二级品类", "材质", *cyc["periods"],
-                  *(["无日期"] if has_undated else []), "总计"],
-          rows, [None] * 6 + [num] * (len(cyc["periods"]) + 1 + has_undated),
-          [12, 8, 8, 10, 14, 20] + [9] * (len(cyc["periods"]) + 1 + has_undated))
-    ws.freeze_panes = "G2"
+        # 单款销售周期
+        ws = wb.create_sheet("单款销售周期")
+        cyc = detail["cycle"]
+        has_undated = any(r["undated"] for r in cyc["rows"])
+        rows = [[r["code"], r["type"], r["kind"], r["cat1"], r["cat2"], r["material"], *[v or None for v in r["values"]],
+                 *([r["undated"] or None] if has_undated else []), r["total"]] for r in cyc["rows"]]
+        table(ws, 1, ["款号", "客户类型", "订单分类", "一级品类", "二级品类", "材质", *cyc["periods"],
+                      *(["无日期"] if has_undated else []), "总计"],
+              rows, [None] * 6 + [num] * (len(cyc["periods"]) + 1 + has_undated),
+              [12, 8, 8, 10, 14, 20] + [9] * (len(cyc["periods"]) + 1 + has_undated))
+        ws.freeze_panes = "G2"
 
-    # 按品类的款式等级表
-    ws = wb.create_sheet("按品类的款式等级表")
-    grid_widths(ws)
-    r = 1
-    for wall in report["walls"]["category"]:
-        ws.cell(r, 1, f"品类：{wall['name']}").font = Font(bold=True, size=13)
-        ws.cell(r + 1, 1, headline_text(wall["headline"]) + "   2027 秋冬需求 SKU 数：（待填）").font = Font(bold=True, color="C00000")
-        r += 2
-        for row in wall["rows"]:
-            ws.cell(r, 1, f"原料：{row['material']}（{row['sku']} 款）").font = Font(bold=True)
-            r = grade_grid(ws, r + 1, row["grades"])
-        r = table(ws, r + 1, ["原料", "SKU", "SKU占比", "销售数量占比", "金额占比"],
-                  [[s["name"], s["sku"], s["sku_share"], s["quantity_share"], s["amount_share"]] for s in wall["shares"]]
-                  + [["合计", wall["headline"]["sku"], 1, 1, 1]], [None, num, pct, pct, pct]) + 2
-    grid_widths(ws)
+    if include_review:
+        # 按品类的款式等级表
+        ws = wb.create_sheet("按品类的款式等级表")
+        grid_widths(ws)
+        r = 1
+        for wall in report["walls"]["category"]:
+            ws.cell(r, 1, f"品类：{wall['name']}").font = Font(bold=True, size=13)
+            ws.cell(r + 1, 1, headline_text(wall["headline"]) + "   2027 秋冬需求 SKU 数：（待填）").font = Font(bold=True, color="C00000")
+            r += 2
+            for row in wall["rows"]:
+                ws.cell(r, 1, f"原料：{row['material']}（{row['sku']} 款）").font = Font(bold=True)
+                r = grade_grid(ws, r + 1, row["grades"])
+            r = table(ws, r + 1, ["原料", "SKU", "SKU占比", "销售数量占比", "金额占比"],
+                      [[s["name"], s["sku"], s["sku_share"], s["quantity_share"], s["amount_share"]] for s in wall["shares"]]
+                      + [["合计", wall["headline"]["sku"], 1, 1, 1]], [None, num, pct, pct, pct]) + 2
+        grid_widths(ws)
 
-    # 按材质的款式等级表
-    ws = wb.create_sheet("按材质的款式等级表")
-    grid_widths(ws)
-    r = 1
-    for wall in report["walls"]["material"]:
-        ws.cell(r, 1, f"原料：{wall['name']}").font = Font(bold=True, size=13)
-        ws.cell(r + 1, 1, headline_text(wall["headline"])).font = Font(bold=True, color="C00000")
-        r = grade_grid(ws, r + 2, wall["grades"])
-        s = wall["share"]
-        r = table(ws, r + 1, ["原料", "SKU", "SKU占比", "销售数量占比", "金额占比"],
-                  [[wall["name"], s["sku"], s["sku_share"], s["quantity_share"], s["amount_share"]]],
-                  [None, num, pct, pct, pct]) + 2
-    grid_widths(ws)
+        # 按材质的款式等级表
+        ws = wb.create_sheet("按材质的款式等级表")
+        grid_widths(ws)
+        r = 1
+        for wall in report["walls"]["material"]:
+            ws.cell(r, 1, f"原料：{wall['name']}").font = Font(bold=True, size=13)
+            ws.cell(r + 1, 1, headline_text(wall["headline"])).font = Font(bold=True, color="C00000")
+            r = grade_grid(ws, r + 2, wall["grades"])
+            s = wall["share"]
+            r = table(ws, r + 1, ["原料", "SKU", "SKU占比", "销售数量占比", "金额占比"],
+                      [[wall["name"], s["sku"], s["sku_share"], s["quantity_share"], s["amount_share"]]],
+                      [None, num, pct, pct, pct]) + 2
+        grid_widths(ws)
 
-    # 按材质的生产销售对比
-    ws = wb.create_sheet("按材质的生产销售对比")
+        # 按材质的生产销售对比
+        ws = wb.create_sheet("按材质的生产销售对比")
 
-    def group_rows(block):
-        out = []
-        for g in [*block["rows"], block["totals"]]:
-            out.append([g["name"], g["sku"], g["ordered"], g["sell_through"], g["produced"], g["production_ratio"],
-                        g["skc"], g["sku_share"], g["skc_share"], g["quantity"], g["quantity_share"], round(g["amount"]),
-                        g["amount_share"]])
-        return out
+        def group_rows(block):
+            out = []
+            for g in [*block["rows"], block["totals"]]:
+                out.append([g["name"], g["sku"], g["ordered"], g["sell_through"], g["produced"], g["production_ratio"],
+                            g["skc"], g["sku_share"], g["skc_share"], g["quantity"], g["quantity_share"], round(g["amount"]),
+                            g["amount_share"]])
+            return out
 
-    end = table(ws, 1, ["原料", "SKU", "订货SKU", "动销率", "生产数", "生产比", "SKC", "SKU占比", "SKC占比", "订单件数",
-                        "订单占比", "订单金额", "金额占比"], group_rows(report["materials"]),
-                [None, num, num, pct, num, pct, num, pct, pct, num, pct, money, pct],
-                [24, 7, 9, 8, 8, 8, 7, 9, 9, 11, 9, 13, 9])
-    note(ws, end + 1, "SKU=商品资料款数；订货SKU=订单数据款数；生产数=生产数据款数；SKC=单款单色（商品资料颜色拆分）。")
+        end = table(ws, 1, ["原料", "SKU", "订货SKU", "动销率", "生产数", "生产比", "SKC", "SKU占比", "SKC占比", "订单件数",
+                            "订单占比", "订单金额", "金额占比"], group_rows(report["materials"]),
+                    [None, num, num, pct, num, pct, num, pct, pct, num, pct, money, pct],
+                    [24, 7, 9, 8, 8, 8, 7, 9, 9, 11, 9, 13, 9])
+        note(ws, end + 1, "SKU=商品资料款数；订货SKU=订单数据款数；生产数=生产数据款数；SKC=单款单色（商品资料颜色拆分）。")
 
-    # 按品类的生产销售对比
-    ws = wb.create_sheet("按品类的生产销售对比")
-    rows = [[g["name"], g["sku"], g["ordered"], g["sell_through"], g["produced"], g["production_ratio"], g["unit_price"],
-             g["sku_share"], g["quantity"], g["quantity_share"], round(g["amount"]), g["amount_share"]]
-            for g in [*report["categories"]["rows"], report["categories"]["totals"]]]
-    end = table(ws, 1, ["品类", "SKU", "订货SKU", "动销率", "生产数", "生产比", "客单价(元/件)", "SKU占比", "销售数量",
-                        "销售数量占比", "订单金额", "金额占比"], rows,
-                [None, num, num, pct, num, pct, "0.0", pct, num, pct, money, pct], [16, 7, 9, 8, 8, 8, 12, 9, 11, 11, 13, 9])
-    note(ws, end + 1, "客单价 = 金额 ÷ 件数（加权平均，总计行不是各品类相加）。")
+        # 按品类的生产销售对比
+        ws = wb.create_sheet("按品类的生产销售对比")
+        rows = [[g["name"], g["sku"], g["ordered"], g["sell_through"], g["produced"], g["production_ratio"], g["unit_price"],
+                 g["sku_share"], g["quantity"], g["quantity_share"], round(g["amount"]), g["amount_share"]]
+                for g in [*report["categories"]["rows"], report["categories"]["totals"]]]
+        end = table(ws, 1, ["品类", "SKU", "订货SKU", "动销率", "生产数", "生产比", "客单价(元/件)", "SKU占比", "销售数量",
+                            "销售数量占比", "订单金额", "金额占比"], rows,
+                    [None, num, num, pct, num, pct, "0.0", pct, num, pct, money, pct], [16, 7, 9, 8, 8, 8, 12, 9, 11, 11, 13, 9])
+        note(ws, end + 1, "客单价 = 金额 ÷ 件数（加权平均，总计行不是各品类相加）。")
 
-    # 按纱线颜色的生产销售
-    ws = wb.create_sheet("按纱线颜色的生产销售")
-    r = 1
-    for block in detail["colors"]:
-        ws.cell(r, 1, f"原料：{block['material']}").font = Font(bold=True, size=12)
-        rows = [[x["color"], x["family"], x["skc"], x["sold"], x["produced"], x["rate"], "，".join(x["merged"])]
-                for x in block["rows"]]
-        tot = [sum(x[k] for x in block["rows"]) for k in ("skc", "sold", "produced")]
-        rows.append(["总计", "", *tot, _ratio(tot[2], tot[0]), ""])
-        r = table(ws, r + 1, ["颜色（含拼色）", "颜色大类", "SKC", "销售数(有订单SKC)", "生产数(生产SKC)", "产销率", "并入的拼色"],
-                  rows, [None, None, num, num, num, pct, None], [16, 9, 7, 15, 15, 8, 40]) + 1
-        r = table(ws, r, ["颜色大类", "SKC", "销售数", "生产数", "产销率"],
-                  [[f["family"], f["skc"], f["sold"], f["produced"], f["rate"]] for f in block["families"]],
-                  [None, num, num, num, pct]) + 2
+        # 按纱线颜色的生产销售
+        ws = wb.create_sheet("按纱线颜色的生产销售")
+        r = 1
+        for block in detail["colors"]:
+            ws.cell(r, 1, f"原料：{block['material']}").font = Font(bold=True, size=12)
+            rows = [[x["color"], x["family"], x["skc"], x["sold"], x["produced"], x["rate"], "，".join(x["merged"])]
+                    for x in block["rows"]]
+            tot = [sum(x[k] for x in block["rows"]) for k in ("skc", "sold", "produced")]
+            rows.append(["总计", "", *tot, _ratio(tot[2], tot[0]), ""])
+            r = table(ws, r + 1, ["颜色（含拼色）", "颜色大类", "SKC", "销售数(有订单SKC)", "生产数(生产SKC)", "产销率", "并入的拼色"],
+                      rows, [None, None, num, num, num, pct, None], [16, 9, 7, 15, 15, 8, 40]) + 1
+            r = table(ws, r, ["颜色大类", "SKC", "销售数", "生产数", "产销率"],
+                      [[f["family"], f["skc"], f["sold"], f["produced"], f["rate"]] for f in block["families"]],
+                      [None, num, num, num, pct]) + 2
 
-    # 订单与备单的对比
-    ws = wb.create_sheet("订单与备单的对比")
-    r = note(ws, 1, "备单 = 订单数据里填了「备货数」的行（1 件的小备单不算）。订单量按上、中、下旬切分，并在备单日期处断开，按时间先后排列。")
-    if not detail["stock"]:
-        note(ws, r, "所选季节暂无备单明细。")
-    for block in detail["stock"]:
-        labels = [c["label"] for c in block["columns"]]
-        is_stock = [c["type"] == "stock" for c in block["columns"]]
-        rows = []
-        grand = [0] * len(labels)
-        colors = list(dict.fromkeys(line["color"] for line in block["lines"]))
-        for color in colors:
-            sub = [0] * len(labels)
-            for line in (x for x in block["lines"] if x["color"] == color):
-                vals = line["values"]
-                rows.append(["", block["code"], block["material"], block["category"], color, line["size"],
-                             *[v or None for v in vals],
-                             sum(v for v, s in zip(vals, is_stock) if not s), sum(v for v, s in zip(vals, is_stock) if s)])
-                sub = [a + b for a, b in zip(sub, vals)]
-            rows.append(["", block["code"], "", "", f"{color} 汇总", "", *[v or None for v in sub],
-                         sum(v for v, s in zip(sub, is_stock) if not s), sum(v for v, s in zip(sub, is_stock) if s)])
-            grand = [a + b for a, b in zip(grand, sub)]
-        rows.insert(0, ["", f"{block['code']} 汇总", block["material"], block["category"], "", "",
-                        *[v or None for v in grand], sum(v for v, s in zip(grand, is_stock) if not s),
-                        sum(v for v, s in zip(grand, is_stock) if s)])
-        top = r
-        r = table(ws, r, ["图片", "款号", "材质", "品类", "颜色", "尺码", *labels, "订单合计", "备单合计"], rows,
-                  [None] * 6 + [num] * (len(labels) + 2))
-        ws.row_dimensions[top + 1].height = 62
-        put_image(ws, block["image_url"], f"A{top + 1}", (70, 80))
-        for j, flag in enumerate(is_stock, 7):
-            if flag:
-                for k in range(top, r):
-                    ws.cell(k, j).fill = PatternFill("solid", fgColor="FFF2CC")
-        r += 1
-    for j, w in enumerate([11, 14, 20, 10, 14, 9], 1):
-        ws.column_dimensions[get_column_letter(j)].width = w
+    if include_tracking:
+        # 订单与备单的对比
+        ws = wb.create_sheet("订单与备单的对比")
+        r = note(ws, 1, "备单 = 订单数据里填了「备货数」的行（1 件的小备单不算）。订单量按上、中、下旬切分，并在备单日期处断开，按时间先后排列。")
+        if not detail["stock"]:
+            note(ws, r, "所选季节暂无备单明细。")
+        for block in detail["stock"]:
+            labels = [c["label"] for c in block["columns"]]
+            is_stock = [c["type"] == "stock" for c in block["columns"]]
+            rows = []
+            grand = [0] * len(labels)
+            colors = list(dict.fromkeys(line["color"] for line in block["lines"]))
+            for color in colors:
+                sub = [0] * len(labels)
+                for line in (x for x in block["lines"] if x["color"] == color):
+                    vals = line["values"]
+                    rows.append(["", block["code"], block["material"], block["category"], color, line["size"],
+                                 *[v or None for v in vals],
+                                 sum(v for v, s in zip(vals, is_stock) if not s), sum(v for v, s in zip(vals, is_stock) if s)])
+                    sub = [a + b for a, b in zip(sub, vals)]
+                rows.append(["", block["code"], "", "", f"{color} 汇总", "", *[v or None for v in sub],
+                             sum(v for v, s in zip(sub, is_stock) if not s), sum(v for v, s in zip(sub, is_stock) if s)])
+                grand = [a + b for a, b in zip(grand, sub)]
+            rows.insert(0, ["", f"{block['code']} 汇总", block["material"], block["category"], "", "",
+                            *[v or None for v in grand], sum(v for v, s in zip(grand, is_stock) if not s),
+                            sum(v for v, s in zip(grand, is_stock) if s)])
+            top = r
+            r = table(ws, r, ["图片", "款号", "材质", "品类", "颜色", "尺码", *labels, "订单合计", "备单合计"], rows,
+                      [None] * 6 + [num] * (len(labels) + 2))
+            ws.row_dimensions[top + 1].height = 92
+            put_image(ws, block["image_url"], f"A{top + 1}", TABLE_IMG_BOX)
+            for j, flag in enumerate(is_stock, 7):
+                if flag:
+                    for k in range(top, r):
+                        ws.cell(k, j).fill = PatternFill("solid", fgColor="FFF2CC")
+            r += 1
+        for j, w in enumerate([15, 14, 20, 10, 14, 9], 1):
+            ws.column_dimensions[get_column_letter(j)].width = w
 
-    # 设计师、工艺师
-    ws = wb.create_sheet("设计师工艺师动销统计")
-    r = 1
-    for role, title in (("designer", "设计师"), ("craftsman", "工艺师")):
-        rows = [[p["name"], p["designed"], p["showroom"], p["showroom_ratio"], p["ordered"], p["sell_through"],
-                 p["produced"], p["production_ratio"]] for p in report["people"][role]]
-        r = table(ws, r, [title, "设计款式数量", "下展厅款式数量", "下展厅比", "订单款式数量", "动销率", "生产款式数量", "生产比"],
-                  rows, [None, num, num, pct, num, pct, num, pct], [12, 12, 14, 10, 12, 9, 12, 9]) + 1
-    note(ws, r, "设计款式数量 = 款式指示书的款数；下展厅 = 进入商品资料的款；下展厅比、动销率、生产比都除以设计款式数量。")
+    if include_review:
+        # 设计师、工艺师
+        ws = wb.create_sheet("设计师工艺师动销统计")
+        r = 1
+        for role, title in (("designer", "设计师"), ("craftsman", "工艺师")):
+            rows = [[p["name"], p["designed"], p["showroom"], p["showroom_ratio"], p["ordered"], p["sell_through"],
+                     p["produced"], p["production_ratio"]] for p in report["people"][role]]
+            r = table(ws, r, [title, "设计款式数量", "下展厅款式数量", "下展厅比", "订单款式数量", "动销率", "生产款式数量", "生产比"],
+                      rows, [None, num, num, pct, num, pct, num, pct], [12, 12, 14, 10, 12, 9, 12, 9]) + 1
+        note(ws, r, "设计款式数量 = 款式指示书的款数；下展厅 = 进入商品资料的款；下展厅比、动销率、生产比都除以设计款式数量。")
 
     out = BytesIO()
     wb.save(out)

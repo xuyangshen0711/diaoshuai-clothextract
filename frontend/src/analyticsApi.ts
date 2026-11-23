@@ -244,7 +244,8 @@ export async function exportYarnTable(
 
 // ---------------------------------------------------------------- 季度款式分析
 export type SeasonGrade = 'S' | 'A' | 'B' | 'C' | 'D' | '无产量'
-export type SeasonFilters = { seasons: string[]; cutoff: string | null; compare: string | null }
+export type SeasonExportScope = 'all' | 'tracking' | 'review'
+export type SeasonFilters = { seasons: string[]; cutoff: string | null; compare: string | null; include_brand: boolean }
 export type SeasonOptions = {
   seasons: { season: string; styles: number; orders: number }[]
   default_seasons: string[]
@@ -267,11 +268,11 @@ export type SeasonPerson = {
   ordered: number; sell_through: number | null; produced: number; production_ratio: number | null
 }
 export type SeasonReport = {
-  scope: { seasons: string[]; cutoff: string | null; compare: string | null; first_order_date: string | null; last_order_date: string | null }
+  scope: { seasons: string[]; include_brand: boolean; cutoff: string | null; compare: string | null; first_order_date: string | null; last_order_date: string | null }
   checks: SeasonCheck[]
   overview: SeasonHeadline & {
     skc: number; quantity: number; amount: number; grade_counts: Record<SeasonGrade, number>
-    market_sku: number; brand_sku: number; image_styles: number
+    market_sku: number; brand_sku: number; excluded_brand_sku: number; image_styles: number
   }
   materials: { rows: SeasonGroupRow[]; totals: SeasonGroupRow }
   categories: { rows: SeasonGroupRow[]; totals: SeasonGroupRow }
@@ -286,7 +287,7 @@ export type SeasonReport = {
 
 export const seasonOptions = () => request<SeasonOptions>(base + '/season/options')
 export const previewSeason = (filters: SeasonFilters) => request<SeasonReport>(base + '/season/preview', jsonPost({ filters }))
-export async function exportSeason(filters: SeasonFilters, snapshot: string) {
-  const response = await requestResponse(base + '/season/xlsx', jsonPost({ filters, snapshot }))
+export async function exportSeason(filters: SeasonFilters, snapshot: string, export_scope: SeasonExportScope = 'all') {
+  const response = await requestResponse(base + '/season/xlsx', jsonPost({ filters, snapshot, export_scope }))
   return { blob: await response.blob(), images: Number(response.headers.get('X-Season-Images') || 0) }
 }

@@ -742,13 +742,14 @@ export type TablePreview = {
   token: string; kind: TableKind; requested_kind: string; source_file: string
   format: string; format_label: string; row_count: number; style_codes: string[]
   counts: { new: number; updated: number; unchanged: number }
-  meta: { warnings?: string[]; notes?: string[]; parsed_quantity?: number; parsed_amount?: number; sheet_quantity?: number | null; sheet_amount?: number | null; reconciled?: boolean | null; reconcile_note?: string; evidence_columns?: string[] }
+  meta: { warnings?: string[]; notes?: string[]; parsed_quantity?: number; parsed_amount?: number; sheet_quantity?: number | null; sheet_amount?: number | null; reconciled?: boolean | null; reconcile_note?: string; evidence_columns?: string[]; style_count?: number; blank_plan_rows?: number }
   samples: { variant_code: string; style_code: string; customer?: string; color?: string; size_label?: string; quantity?: number; amount?: number; season?: string; category?: string; subcategory?: string; design_code?: string; designer?: string; craftsman?: string; material?: string; action: string }[]
   issues: { row: number; style_code: string; message: string }[]; issue_count: number; ignored_rows: number
   overlap_variants: string[]; missing_images: string[]; can_confirm: boolean
 }
 export type TableImportResult = TableReport & {
   id: string; kind: TableKind; created_at: string; unchanged: number; issue_count: number; sales_policy: FactoryWorkspace['sales_policy']
+  parsed_quantity?: number; style_count?: number; blank_plan_rows?: number
   exclusions?: SalesExclusions
   season_replace?: { enabled: boolean; seasons: string[]; removed_rows: number; removed_quantity?: number; backup_id?: string }
 }
