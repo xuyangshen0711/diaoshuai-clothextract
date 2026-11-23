@@ -290,6 +290,22 @@ def test_existing_taxonomy_gains_the_new_category(store):
     assert resolve("假两件套衫").fabric == "针织"
 
 
+def test_existing_taxonomy_gains_accessory_synonyms(store):
+    with catalog._database() as conn:
+        conn.execute("DELETE FROM category_synonyms WHERE phrase IN ('帽子', '针织帽', '围巾', '手套', '披肩')")
+        conn.execute("DELETE FROM migrations WHERE name='accessory_synonyms_v1'")
+    catalog._BOOTSTRAPPED.clear()
+    with catalog._database() as conn:
+        phrases = {
+            row["phrase"]
+            for row in conn.execute("SELECT phrase FROM category_synonyms WHERE level1='配饰'")
+        }
+    assert {"帽子", "针织帽", "围巾", "手套", "披肩"} <= phrases
+    assert resolve("帽子").label == "配饰"
+    assert resolve("针织帽").label == "配饰" and resolve("针织帽").fabric == "针织"
+    assert resolve("围巾").label == "配饰"
+
+
 def test_new_workbooks_dropped_on_the_image_importer_keep_their_bucket(store, monkeypatch):
     client = _client(monkeypatch)
     sales = (FIXTURES / "sales_32k.xlsx").read_bytes()

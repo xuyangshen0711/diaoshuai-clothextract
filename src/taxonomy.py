@@ -66,6 +66,13 @@ SEED_SYNONYMS = (
     ("裤装", "裤装", "", "", ""),
     ("套装", "套装", "", "", ""),
     ("配饰", "配饰", "", "", ""),
+    ("披肩", "配饰", "", "", ""),
+    ("帽子", "配饰", "", "", ""),
+    ("针织帽", "配饰", "", "", "针织"),
+    ("毛线帽", "配饰", "", "", "针织"),
+    ("围巾", "配饰", "", "", ""),
+    ("手套", "配饰", "", "", ""),
+    ("脖套", "配饰", "", "", ""),
     ("其他", UNSORTED, "", "", ""),
     ("待归类", UNSORTED, "", "", ""),
     ("上衣", "上衣", "", "", ""),
@@ -266,10 +273,42 @@ def ensure_taxonomy(conn) -> Taxonomy:
             ],
         )
     _ensure_builtin_category(conn, "上衣", "假两件套衫", "长袖", "针织", "category_jia_liangjian_v1")
+    _ensure_builtin_synonyms(
+        conn,
+        (
+            ("披肩", "配饰", "", "", ""),
+            ("帽子", "配饰", "", "", ""),
+            ("针织帽", "配饰", "", "", "针织"),
+            ("毛线帽", "配饰", "", "", "针织"),
+            ("围巾", "配饰", "", "", ""),
+            ("手套", "配饰", "", "", ""),
+            ("脖套", "配饰", "", "", ""),
+        ),
+        "accessory_synonyms_v1",
+    )
     # Seeding runs before the catalog transaction starts. Close it so BEGIN IMMEDIATE can open.
     if conn.in_transaction:
         conn.commit()
     return _remember(conn, read_taxonomy(conn))
+
+
+def _ensure_builtin_synonyms(
+    conn,
+    synonyms: tuple[tuple[str, str, str, str, str], ...],
+    migration: str,
+) -> None:
+    """Insert new fixed synonyms into databases seeded before they existed."""
+    if conn.execute("SELECT 1 FROM migrations WHERE name=?", (migration,)).fetchone():
+        return
+    for phrase, level1, level2, sleeve, fabric in synonyms:
+        key = phrase_key(phrase)
+        if not conn.execute("SELECT 1 FROM category_synonyms WHERE phrase_key=?", (key,)).fetchone():
+            conn.execute(
+                "INSERT INTO category_synonyms (phrase_key, phrase, level1, level2, sleeve_length, fabric, learned) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0)",
+                (key, phrase, level1, level2, sleeve, fabric),
+            )
+    conn.execute("INSERT INTO migrations VALUES (?)", (migration,))
 
 
 def _ensure_builtin_category(conn, level1: str, level2: str, sleeve: str, fabric: str, migration: str) -> None:

@@ -232,6 +232,10 @@ def test_season_report_rules_and_workbook(store):
     assert book["按品类的款式等级表"].column_dimensions["M"].width == 17  # 每行 12 张图（B..M 列）
     from src.factory.colors import classify_color
     assert classify_color("星空花篮") == "蓝"
+    from src.factory.season_rules import category_plan
+    assert category_plan("帽子") == "小品类"
+    assert category_plan("围巾") == "小品类"
+    assert category_plan("手套") == "小品类"
 
     tracking_book = load_workbook(BytesIO(render_season_workbook(market_only, {record.id: thumb.getvalue()}, export_scope="tracking")))
     assert tracking_book.sheetnames == ["口径说明", "市场款号订补情况", "单款销售周期", "订单与备单的对比"]

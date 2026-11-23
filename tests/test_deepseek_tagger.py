@@ -370,3 +370,34 @@ def test_invalid_json_does_not_stop_the_rest_of_the_job(store, monkeypatch):
     assert any("不是合法 JSON" in item["message"] for item in public["errors"])
     saved = catalog.load_catalog()
     assert len(saved) == 1 and saved[0].tags.品类 == "上衣>套衫" and saved[0].tags_source == "deepseek"
+
+
+def test_accessory_items_like_hats_are_allowed_and_validated(tmp_path, monkeypatch):
+    image = _png(tmp_path / "681822.png")
+    hat_payload = {
+        "服装款式图": True,
+        "品类": "配饰",
+        "袖长": "",
+        "面料": "针织",
+        "风格": "休闲",
+        "季节": "冬",
+        "版型": "其他",
+        "颜色主色调": "灰色",
+        "领型": "无领",
+        "袖型": "其他",
+        "图案": "纯色/无明显图案",
+        "细节元素": ["罗纹", "花饰"],
+        "一句话描述": "灰色罗纹针织帽子，带立体花饰装饰",
+    }
+
+    def handler(request, seen):
+        return _completion(json.dumps(hat_payload, ensure_ascii=False))
+
+    tagger, seen = _tagger(handler, monkeypatch)
+    assert "帽子" in tagger.system_prompt and "服饰配饰单品" in tagger.system_prompt
+    tags = tagger.tag(image)
+    assert tags is not None
+    assert tags.品类 == "配饰"
+    assert tags.面料 == "针织"
+    assert tags.袖长 == ""
+    assert "帽子" in tags.一句话描述
