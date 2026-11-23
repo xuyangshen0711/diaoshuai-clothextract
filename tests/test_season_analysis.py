@@ -229,6 +229,9 @@ def test_season_report_rules_and_workbook(store):
                                "设计师工艺师动销统计"]
     assert len(book["按材质的款式等级表"]._images) >= 1 and len(book["市场款号订补情况"]._images) == 2  # 品牌专款共用基础款图
     assert book["市场款号订补情况"]._images[0].width >= 90
+    assert book["按品类的款式等级表"].column_dimensions["M"].width == 17  # 每行 12 张图（B..M 列）
+    from src.factory.colors import classify_color
+    assert classify_color("星空花篮") == "蓝"
 
     tracking_book = load_workbook(BytesIO(render_season_workbook(market_only, {record.id: thumb.getvalue()}, export_scope="tracking")))
     assert tracking_book.sheetnames == ["口径说明", "市场款号订补情况", "单款销售周期", "订单与备单的对比"]

@@ -530,6 +530,9 @@ def _cycle(data: _Data) -> dict:
     return {"periods": [_xun_label(p) for p in periods], "rows": rows}
 
 
+_COLOR_MAIN_ALIASES = {"黑": "黑色"}
+
+
 def _colors_tables(data: _Data, calc: _Calc, materials: list[str]) -> list[dict]:
     blocks = []
     for m in materials:
@@ -541,6 +544,7 @@ def _colors_tables(data: _Data, calc: _Calc, materials: list[str]) -> list[dict]
                 continue
             for col in s.colors:
                 main = _SPLIT_COLOR.split(col)[0].strip() or col
+                main = _COLOR_MAIN_ALIASES.get(main, main)
                 v = stats[main][col]
                 v[0] += 1
                 v[1] += (c, col) in calc.order_skc
@@ -718,7 +722,7 @@ def render_season_workbook(report: dict, thumbnails: dict[str, bytes], *, export
                 f"产销率(生产比)：{h['produced']}/{h['sku']}={h['production_ratio']:.0%}   "
                 f"无效率：{h['unproduced']}/{h['sku']}={h['invalid_ratio']:.0%}")
 
-    per_row = 8
+    per_row = 12
 
     def grade_grid(ws, r, grades):
         for label in GRADE_LABELS:

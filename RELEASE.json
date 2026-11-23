@@ -1,15 +1,16 @@
 {
-  "release": "20261123-season-analysis-v2",
-  "base_commit": "bc8efc2810e2375efac3ba44c595a0cc19d375b0",
-  "base_code_sha256": "70d28caea76c43d52af761fc1e8bf8e2b2e020051953ebf93f78ab96d9e56cfc",
-  "previous_release": "20261121-season-analysis",
+  "release": "20261123-season-analysis-v3",
+  "base_commit": "75de230",
+  "base_code_sha256": "2be84a8d8f25b8f857f546ceed9e6eea098d9b2faddd97e08377f4e38f11d4c1",
+  "previous_release": "20261123-season-analysis-v2",
   "includes_local_changes": true,
   "prebuilt_frontend": true,
   "business_data_included": false,
   "local_configuration_included": false,
   "database_schema_changes": false,
   "preserved_features": [
-    "quarterly style analysis, production/guide imports, and order season replace",
+    "quarterly style analysis v2 (default market-only, split exports, hi-res Excel images, thumbnail wall, production totals)",
+    "quarterly style analysis v1 (production/guide imports and order season replace)",
     "zero-copy thumbnail streaming and SiteGateMiddleware pure ASGI",
     "smart gallery search precision, compound queries, and relevance ranking",
     "unified gallery 批量管理 with confirmation dialog and conflict skip",
@@ -21,8 +22,8 @@
     "archive 500-row batch import"
   ],
   "validation": {
-    "regressions": "Full pytest suite vs recorded baseline: 108 passed (0 regressions); season + yarn suites 13/13 passed; vue-tsc + vite build (--emptyOutDir false) passed with 0 errors",
-    "feedback_fixes": "1) Enlarged high-res Excel thumbnails (260x320 source, 112x148 grade wall / 96x118 table display); 2) Split export into 日常跟踪(3表) / 季度复盘(6表) / 完整合集(9表); 3) Exclude brand-suffixed styles by default with opt-in 包含品牌专款 checkbox; 4) Switched grade wall images from variant=cover to variant=thumbnail + scoped DOM keys + collapsible 无产量 rows; 5) Displayed 计划总件数 in production preview, confirmation, and import history",
-    "live_rds_and_oss": "Pre-edit baseline verified identical (226 files, 70d28caea76c43d52af761fc1e8bf8e2b2e020051953ebf93f78ab96d9e56cfc); local data/ 597 files verified unchanged (ac17b370998e09348567a724de99383deaaee6a161c7505b514e78eb5a3202c3)"
+    "regressions": "tests/test_season_analysis.py + tests/test_analytics_yarn_table.py 13/13 passed; verified column M width=17 for 12-per-row layout, 黑 merged into 黑色, and 星空花篮 classified as 蓝",
+    "changes": "1) Increased Excel grade grid items per row from 8 to 12 across 按品类的款式等级表 and 按材质的款式等级表 (columns B..M); 2) Merged main color 黑 into 黑色 in season color table and mapped 花篮 typo into 蓝 family",
+    "live_rds_and_oss": "Pre-edit baseline verified identical (228 files, 2be84a8d8f25b8f857f546ceed9e6eea098d9b2faddd97e08377f4e38f11d4c1); local data/ 597 files verified unchanged (ac17b370998e09348567a724de99383deaaee6a161c7505b514e78eb5a3202c3)"
   }
 }
