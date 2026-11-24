@@ -9,12 +9,31 @@ import AnalyticsChat from '../components/AnalyticsChat.vue'
 import AnalyticsReport from '../components/AnalyticsReport.vue'
 import AnalyticsYarnTable from '../components/AnalyticsYarnTable.vue'
 import AnalyticsSeason from '../components/AnalyticsSeason.vue'
+import AnalyticsSalesInsights from '../components/AnalyticsSalesInsights.vue'
 import '../styles/analytics.css'
 
+type ProductTab = 'yarn' | 'season'
+type SalesTab = 'attribution' | 'selection' | 'customers' | 'report' | 'questions'
+type AnyTab = ProductTab | SalesTab
+
+const PRODUCT_TABS: ProductTab[] = ['yarn', 'season']
+
+function resolveInitialTab(q: unknown): AnyTab {
+  if (q === 'yarn' || q === 'season' || q === 'report' || q === 'questions' || q === 'attribution' || q === 'selection' || q === 'customers') {
+    return q
+  }
+  return 'attribution'
+}
+
 const route = useRoute()
-const tab = ref(
-  route.query.tab === 'questions' ? 'questions' : route.query.tab === 'yarn' ? 'yarn' : route.query.tab === 'season' ? 'season' : 'report',
+const tab = ref<AnyTab>(resolveInitialTab(route.query.tab))
+const lastSalesTab = ref<SalesTab>(PRODUCT_TABS.includes(tab.value as ProductTab) ? 'attribution' : (tab.value as SalesTab))
+const lastProductTab = ref<ProductTab>(PRODUCT_TABS.includes(tab.value as ProductTab) ? (tab.value as ProductTab) : 'season')
+
+const activeDomain = computed<'sales' | 'product'>(() =>
+  PRODUCT_TABS.includes(tab.value as ProductTab) ? 'product' : 'sales',
 )
+
 const session = ref<AnalysisSession | null>(null)
 const options = ref<AnalysisOptions | null>(null)
 const loading = ref(true)
@@ -28,7 +47,11 @@ const useDeepseek = ref(false)
 const asking = ref(false)
 const yarnBusy = ref(false)
 const seasonBusy = ref(false)
+const salesBusy = ref(false)
 const yarnRef = ref<InstanceType<typeof AnalyticsYarnTable> | null>(null)
+
+const anyBusy = computed(() => preparing.value || downloading.value || asking.value || yarnBusy.value || seasonBusy.value || salesBusy.value)
+
 const returnToLibrary = computed(() => typeof route.query.source === 'string' && route.query.source !== '全部'
   ? { name: 'library', query: { source_category: route.query.source } } : '/')
 
@@ -43,10 +66,20 @@ const filters = ref<AnalysisFilters>({
 })
 const filtersChanged = computed(() => Boolean(report.value && JSON.stringify(report.value.filters) !== JSON.stringify(filters.value)))
 
-async function switchTab(value: string) {
+async function switchTab(value: AnyTab) {
   error.value = ''
   tab.value = value
+  if (PRODUCT_TABS.includes(value as ProductTab)) {
+    lastProductTab.value = value as ProductTab
+  } else {
+    lastSalesTab.value = value as SalesTab
+  }
   if (value === 'report') await loadReportOptions()
+}
+
+async function switchDomain(domain: 'sales' | 'product') {
+  if (domain === activeDomain.value) return
+  await switchTab(domain === 'product' ? lastProductTab.value : lastSalesTab.value)
 }
 
 function preset(value: 'recent' | 'quarter' | 'available') {
@@ -104,7 +137,7 @@ async function unlock() {
 }
 
 async function lock() {
-  if (preparing.value || downloading.value || asking.value || yarnBusy.value) return
+  if (anyBusy.value) return
   try {
     await analysisLogout()
     session.value = { ...session.value, configured: true, authenticated: false, deepseek_configured: false }
@@ -166,9 +199,9 @@ async function download() {
       <div>
         <p>貂帅服装 / 业务资料</p>
         <h1>数据分析</h1>
-        <p>从本厂订单生成订货报告、纱线与色卡统计表，也可以直接查询款式与图库数据。</p>
+        <p>商品端汇总纱线色卡与季度款式复盘；销售端提供本厂爆款归因、外部图库微创新选款、客户偏好推款与数据问答。</p>
       </div>
-      <button v-if="session?.authenticated" type="button" class="analytics-quiet" :disabled="preparing || downloading || asking || yarnBusy" @click="lock">锁定分析</button>
+      <button v-if="session?.authenticated" type="button" class="analytics-quiet" :disabled="anyBusy" @click="lock">锁定分析</button>
     </header>
 
     <p v-if="session?.unencrypted_connection" class="analytics-note" role="note">当前使用 HTTP 兼容访问，密码和数据传输未加密。请在可信网络使用；配置 HTTPS 后可关闭此模式。</p>
@@ -186,12 +219,51 @@ async function download() {
     </section>
 
     <template v-else>
-      <nav class="analytics-tabs" aria-label="分析方式">
-        <button type="button" :aria-pressed="tab === 'report'" @click="switchTab('report')">生成报告</button>
-        <button type="button" :aria-pressed="tab === 'yarn'" @click="switchTab('yarn')">纱线与色卡表</button>
-        <button type="button" :aria-pressed="tab === 'season'" @click="switchTab('season')">季度款式分析</button>
-        <button type="button" :aria-pressed="tab === 'questions'" @click="switchTab('questions')">问数据</button>
-      </nav>
+      <!-- 一级分区：销售端 vs 商品端 -->
+      <div class="analytics-domain-nav" aria-label="业务视角切换">
+        <div class="analytics-domain-pills" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            :aria-selected="activeDomain === 'sales'"
+            :class="{ 'is-active': activeDomain === 'sales' }"
+            @click="switchDomain('sales')"
+          >
+            <strong>销售端</strong>
+            <small>爆款归因 · 外部图库选款 · 客户推款</small>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            :aria-selected="activeDomain === 'product'"
+            :class="{ 'is-active': activeDomain === 'product' }"
+            @click="switchDomain('product')"
+          >
+            <strong>商品端</strong>
+            <small>纱线与色卡表 · 季度款式分析</small>
+          </button>
+        </div>
+
+        <nav v-if="activeDomain === 'sales'" class="analytics-tabs" aria-label="销售端模块">
+          <button type="button" :aria-pressed="tab === 'attribution'" @click="switchTab('attribution')">本厂爆款归因</button>
+          <button type="button" :aria-pressed="tab === 'selection'" @click="switchTab('selection')">外部图库智能挑款</button>
+          <button type="button" :aria-pressed="tab === 'customers'" @click="switchTab('customers')">客户偏好与推款</button>
+          <button type="button" :aria-pressed="tab === 'report'" @click="switchTab('report')">订货报告</button>
+          <button type="button" :aria-pressed="tab === 'questions'" @click="switchTab('questions')">问数据</button>
+        </nav>
+
+        <nav v-else class="analytics-tabs" aria-label="商品端模块">
+          <button type="button" :aria-pressed="tab === 'yarn'" @click="switchTab('yarn')">纱线与色卡表</button>
+          <button type="button" :aria-pressed="tab === 'season'" @click="switchTab('season')">季度款式分析</button>
+        </nav>
+      </div>
+
+      <AnalyticsSalesInsights
+        v-show="tab === 'attribution' || tab === 'selection' || tab === 'customers'"
+        v-model:busy="salesBusy"
+        :mode="tab === 'selection' ? 'selection' : tab === 'customers' ? 'customers' : 'attribution'"
+        :active="tab === 'attribution' || tab === 'selection' || tab === 'customers'"
+      />
 
       <div v-if="tab === 'report'" class="analytics-layout">
         <form class="analytics-controls" @submit.prevent="prepare">
@@ -243,7 +315,6 @@ async function download() {
             <ol><li>订单总览</li><li>品类对比</li><li>重点款与配码</li></ol>
           </div>
         </div>
-
       </div>
 
       <AnalyticsYarnTable v-show="tab === 'yarn'" ref="yarnRef" v-model:busy="yarnBusy" :active="tab === 'yarn'" />

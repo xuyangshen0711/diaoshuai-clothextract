@@ -291,3 +291,233 @@ export async function exportSeason(filters: SeasonFilters, snapshot: string, exp
   const response = await requestResponse(base + '/season/xlsx', jsonPost({ filters, snapshot, export_scope }))
   return { blob: await response.blob(), images: Number(response.headers.get('X-Season-Images') || 0) }
 }
+
+// ---------------------------------------------------------------- 销售端智能洞察
+export type SalesAiStatus = {
+  ready: boolean
+  provider: 'qwen' | 'deepseek' | null
+  model: string
+  label: string
+}
+
+export type SalesOptions = {
+  seasons: { season: string; styles: number; orders: number }[]
+  default_seasons: string[]
+  categories: string[]
+  default_category: string
+  external_sources: { name: string; count: number }[]
+  catalog_seasons: string[]
+  last_order_date: string | null
+  ai: SalesAiStatus
+}
+
+export type SalesStyleCard = {
+  code: string
+  style_code: string
+  record_id: string | null
+  image_url: string | null
+  season: string
+  category: string
+  plan: string
+  material: string
+  material_short: string
+  needle: string
+  grade: string
+  quantity: number
+  amount: number
+  unit_price: number
+  price_band: string
+  replenishment: number
+  customer_count: number
+  rep_customer_count: number
+  top1_customer_share: number
+  is_winner: boolean
+  winner_type: string
+  main_color_family: string
+  tags: Record<string, any>
+  match_score?: number
+  push_reasons?: string[]
+  customer_quantity?: number
+  reordered?: boolean
+}
+
+export type SalesDimensionRow = {
+  label: string
+  sku: number
+  ordered_sku: number
+  sell_through: number
+  winner_sku: number
+  broad_winner_sku: number
+  winner_rate: number
+  replenished_sku: number
+  replenish_rate: number
+  total_quantity: number
+  avg_quantity: number
+  sample_codes: string[]
+}
+
+export type AttributionFilters = {
+  seasons: string[]
+  category: string
+  cutoff: string | null
+  include_brand: boolean
+}
+
+export type AttributionAiInsight = {
+  generated_at: string
+  model: string
+  headline: string
+  winning_drivers: { title: string; data_evidence: string; visual_commonality: string; example_codes: string[] }[]
+  losing_pitfalls: { title: string; reason: string; example_codes: string[] }[]
+  selection_methodology: { dimension: string; keep_gene: string; micro_innovation: string; avoid: string }[]
+}
+
+export type AttributionReport = {
+  scope: { seasons: string[]; category: string; cutoff: string | null; include_brand: boolean; excluded_brand_sku: number }
+  category_tabs: { name: string; sku: number }[]
+  overview: {
+    sku: number; imaged_sku: number; image_coverage: number
+    ordered_sku: number; sell_through: number; produced_sku: number; production_ratio: number
+    winner_sku: number; winner_rate: number; broad_winner_sku: number; vip_winner_sku: number
+    total_quantity: number; total_amount: number; replenishment_quantity: number
+  }
+  dimensions: { key: string; title: string; sample_size: number; rows: SalesDimensionRow[] }[]
+  top_winners: SalesStyleCard[]
+  sample_laggards: SalesStyleCard[]
+  ai_insight: AttributionAiInsight | null
+  ai_status: SalesAiStatus
+  snapshot: string
+}
+
+export type DecisionStatus = 'adopted' | 'maybe' | 'rejected' | 'none'
+
+export type SelectionCandidate = {
+  record_id: string
+  image_url: string | null
+  source_category: string
+  source_file: string
+  tags: Record<string, any>
+  notes_text: string
+  gene_score: number
+  novelty_score: number
+  total_score: number
+  gene_hits: string[]
+  matched_genes: string[]
+  diff_points: string[]
+  trend_hits: string[]
+  reference_winner: SalesStyleCard | null
+  closest_any_code: string
+  closest_any_sim: number
+  decision: DecisionStatus
+  decision_note: string
+  verdict?: 'recommend' | 'too_similar' | 'drop'
+  tier?: string
+  stars?: number
+  similarity_note?: string
+  gene_reason?: string
+  novelty_point?: string
+  yarn_and_price_advice?: string
+  risk_note?: string
+}
+
+export type SelectionFilters = {
+  seasons: string[]
+  category: string
+  sources: string[]
+  catalog_seasons: string[]
+  include_brand: boolean
+  pool_size: number
+}
+
+export type SelectionReport = {
+  scope: SelectionFilters
+  funnel: {
+    external_matched_category: number
+    gate1_duplicates_removed: number
+    gate2_scored_pool: number
+    gate3_shortlist: number
+    own_category_sku: number
+    own_winners_count: number
+  }
+  trend_radar: { total: number; highlights: { dimension: string; top: { label: string; count: number; share: number }[] }[] }
+  top_yarns: { material: string; sku: number; winner_rate: number; avg_quantity: number }[]
+  duplicate_samples: { record_id: string; image_url: string | null; source_category: string; summary: string; matched_own_code: string; reason: string }[]
+  shortlist: SelectionCandidate[]
+  ai_selection: {
+    generated_at: string
+    model: string
+    reviewed_count: number
+    recommended_count: number
+    rejected_similar_count: number
+    dropped_count: number
+    recommendations: SelectionCandidate[]
+    rejected_similar: SelectionCandidate[]
+    dropped: SelectionCandidate[]
+  } | null
+  ai_status: SalesAiStatus
+  snapshot: string
+}
+
+export type CustomerInsightFilters = {
+  seasons: string[]
+  customer: string
+  include_brand: boolean
+}
+
+export type CustomerInsightReport = {
+  scope: CustomerInsightFilters
+  customers: { name: string; quantity: number; amount: number; style_count: number; replenishment: number; replenish_style_count: number }[]
+  profile: {
+    name: string
+    quantity: number
+    amount: number
+    avg_unit_price: number
+    price_band: string
+    style_count: number
+    replenishment: number
+    replenish_rate: number
+    favorite_categories: { name: string; quantity: number }[]
+    favorite_materials: { name: string; full_name: string; quantity: number }[]
+    favorite_colors: { name: string; quantity: number }[]
+    favorite_tags: Record<string, string[]>
+    top_ordered_styles: SalesStyleCard[]
+  } | null
+  own_recommendations: SalesStyleCard[]
+  external_recommendations: {
+    record_id: string
+    image_url: string | null
+    source_category: string
+    summary: string
+    match_score: number
+    matched_preferences: string[]
+    tags: Record<string, any>
+  }[]
+}
+
+export const salesOptions = () => request<SalesOptions>(base + '/sales/options')
+export const previewSalesAttribution = (filters: AttributionFilters) =>
+  request<AttributionReport>(base + '/sales/attribution/preview', jsonPost({ filters }))
+export const analyzeSalesAttribution = (filters: AttributionFilters, force = false) =>
+  request<AttributionReport>(base + '/sales/attribution/analyze', jsonPost({ filters, force }))
+export async function exportSalesAttributionPdf(filters: AttributionFilters) {
+  const response = await requestResponse(base + '/sales/attribution/pdf', jsonPost({ filters }))
+  return response.blob()
+}
+
+export const previewSalesSelection = (filters: SelectionFilters) =>
+  request<SelectionReport>(base + '/sales/selection/preview', jsonPost({ filters }))
+export const analyzeSalesSelection = (filters: SelectionFilters, force = false) =>
+  request<SelectionReport>(base + '/sales/selection/analyze', jsonPost({ filters, force }))
+export const saveSalesDecision = (record_id: string, status: DecisionStatus, note = '') =>
+  request<{ record_id: string; status: DecisionStatus; note: string }>(base + '/sales/selection/decision', jsonPost({ record_id, status, note }))
+export async function exportSalesSelectionPdf(filters: SelectionFilters, only_adopted = false) {
+  const response = await requestResponse(base + '/sales/selection/pdf', jsonPost({ filters, only_adopted }))
+  return response.blob()
+}
+export async function exportSalesSelectionXlsx(filters: SelectionFilters, only_adopted = false) {
+  const response = await requestResponse(base + '/sales/selection/xlsx', jsonPost({ filters, only_adopted }))
+  return response.blob()
+}
+
+export const previewSalesCustomers = (filters: CustomerInsightFilters) =>
+  request<CustomerInsightReport>(base + '/sales/customers/preview', jsonPost({ filters }))
