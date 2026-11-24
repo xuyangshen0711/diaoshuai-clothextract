@@ -304,7 +304,7 @@ class SalesVisionClient:
             except Exception:
                 pass
 
-    def ask_json(self, system_prompt: str, user_blocks: list[dict], *, max_tokens: int = 3200) -> dict:
+    def ask_json(self, system_prompt: str, user_blocks: list[dict], *, max_tokens: int = 8192) -> dict:
         kwargs: dict = {
             "model": self.model,
             "messages": [
@@ -312,28 +312,32 @@ class SalesVisionClient:
                 {"role": "user", "content": user_blocks},
             ],
             "response_format": {"type": "json_object"},
-            "max_tokens": max_tokens,
+            "max_tokens": max(max_tokens, 6144),
         }
         if self.provider == "deepseek":
             kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-            kwargs["max_tokens"] = max(max_tokens, 4096)
+            kwargs["max_tokens"] = max(max_tokens, 8192)
         else:
             kwargs["temperature"] = 0.2
-        try:
-            resp = self.client.chat.completions.create(**kwargs)
-        except Exception as exc:
-            raise SalesInsightError(f"调用 {self.label} 失败：{exc}") from exc
-        msg = resp.choices[0].message if resp.choices else None
-        content = getattr(msg, "content", "") or ""
-        if isinstance(content, list):
-            content = "".join(
-                b.get("text", "") if isinstance(b, dict) else str(getattr(b, "text", ""))
-                for b in content
-            )
-        try:
-            return _extract_json(content)
-        except Exception as exc:
-            raise SalesInsightError(f"{self.label} 返回格式无法解析，请重试。") from exc
+        last_exc: Exception | None = None
+        for _attempt in range(2):
+            try:
+                resp = self.client.chat.completions.create(**kwargs)
+            except Exception as exc:
+                raise SalesInsightError(f"调用 {self.label} 失败：{exc}") from exc
+            msg = resp.choices[0].message if resp.choices else None
+            content = getattr(msg, "content", "") or ""
+            if isinstance(content, list):
+                content = "".join(
+                    b.get("text", "") if isinstance(b, dict) else str(getattr(b, "text", ""))
+                    for b in content
+                )
+            try:
+                return _extract_json(content)
+            except Exception as exc:
+                last_exc = exc
+                kwargs["max_tokens"] = min(16384, int(kwargs["max_tokens"] * 1.5))
+        raise SalesInsightError(f"{self.label} 返回格式无法解析，请重试。") from last_exc
 
 
 # ---------------------------------------------------------------- data loading & helpers
@@ -785,7 +789,8 @@ ATTRIBUTION_SYSTEM_PROMPT = """你是资深女装针织商品企划总监与销�
 严格要求：
 1. 杜绝“简约百搭、显瘦高级”这类空泛套话！每一条结论必须同时结合【硬数据指标（爆款率/动销率/补单量/客单价/材质）】和【肉眼可见的服装版型、领型、织法纹理、色彩细节】，并点名具体的本厂款号作为证据。
 2. 注意区分「通吃复购款」（多客户下单且反复补单，代表真正的市场公版爆款基因）与「大客户包场款」（单客户大单，不可盲目当成通吃规律）。
-3. 只输出合法 JSON 对象，格式严格如下：
+3. 语言精炼专业（winning_drivers 输出 3-4 条、losing_pitfalls 输出 2-3 条、selection_methodology 输出 3 条，每个文本字段控制在 90 字以内，不要在字符串内使用未转义双引号）。
+4. 只输出合法 JSON 对象，格式严格如下：
 {
   "headline": "一句话核心复盘结论（30-60字，直击该品类本季什么最好卖、什么最容易压货）",
   "winning_drivers": [
@@ -1247,6 +1252,7 @@ SELECTION_PAIR_SYSTEM_PROMPT = """你是女装针织工厂的资深买手与研�
 老板的核心选款铁律：
 1. **撞款一票否决**：如果图 1 和图 2（或本厂已做款描述）在整体版型、领型、织法纹理、门襟结构上高度雷同，属于“本厂已经做过、没必要再重复开版”，请直接判 `"verdict": "too_similar"`！
 2. **有爆款基因 + 有微创新才入选**：入选款必须既承接本厂已验证能卖动的实穿骨架，又在局部有清晰可落地的微创新（例如领口结构变化、局部绞花/提花/镂空肌理升级、撞色门襟/边饰、假两件层次等），且适合针织工厂大货落地。
+3. 每个文本字段精炼清晰（控制在 80 字以内，不要在字符串值中使用未转义双引号）。
 
 请只返回严格 JSON 对象：
 {
