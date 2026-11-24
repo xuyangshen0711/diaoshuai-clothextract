@@ -78,6 +78,9 @@ async function logout() {
     </header>
 
     <RouterView v-if="showShell || (ready && isLogin)" />
+    <footer class="site-icp-footer" aria-label="网站备案信息">
+      <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">浙ICP备2026103320号</a>
+    </footer>
     <aside v-if="showShell && jobNotice && !isLogin" class="job-toast" role="status">
       <span>{{ jobNotice }}</span><RouterLink to="/import">查看任务</RouterLink>
       <button type="button" aria-label="关闭任务提示" @click="jobNotice = ''">×</button>
