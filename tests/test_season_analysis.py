@@ -229,7 +229,15 @@ def test_season_report_rules_and_workbook(store):
                                "设计师工艺师动销统计"]
     assert len(book["按材质的款式等级表"]._images) >= 1 and len(book["市场款号订补情况"]._images) == 2  # 品牌专款共用基础款图
     assert book["市场款号订补情况"]._images[0].width >= 90
-    assert book["按品类的款式等级表"].column_dimensions["M"].width == 17  # 每行 12 张图（B..M 列）
+    assert book["按材质的款式等级表"].column_dimensions["M"].width == 17  # 按材质每行 12 张图（B..M 列）
+    cat_ws = book["按品类的款式等级表"]
+    assert cat_ws.column_dimensions["A"].width == 13 and cat_ws.column_dimensions["AA"].width == 13.5
+    assert cat_ws["A2"].value == "原料"
+    assert cat_ws["B2"].value.startswith("S（") and cat_ws["D2"].value.startswith("A（")
+    assert cat_ws["H2"].value.startswith("B（") and cat_ws["N2"].value.startswith("C（")
+    assert cat_ws["R2"].value.startswith("D（") and cat_ws["V2"].value.startswith("无产量（")
+    assert len(cat_ws._images) >= 1
+    assert cat_ws["B2"].fill.fgColor.rgb.endswith("FFFF00") and cat_ws["D2"].fill.fgColor.rgb.endswith("9BC2E6")
     from src.factory.colors import classify_color
     assert classify_color("星空花篮") == "蓝"
     from src.factory.season_rules import category_plan

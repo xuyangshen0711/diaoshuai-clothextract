@@ -618,8 +618,18 @@ def _stock_blocks(data: _Data, calc: _Calc) -> list[dict]:
 
 # ---------------------------------------------------------------- Excel
 THUMB_SOURCE_BOX = (260, 320)  # 内嵌图片源分辨率（2x+ 清晰度，放大不糊）
-GRID_IMG_BOX = (112, 148)      # 等级表单元格内显示尺寸（像素）
+GRID_IMG_BOX = (112, 148)      # 按材质等级表单元格内显示尺寸（像素）
+MATRIX_IMG_BOX = (88, 114)     # 按品类等级矩阵单元格内显示尺寸（像素）
 TABLE_IMG_BOX = (96, 118)      # 订补表与订单备单对比表显示尺寸（像素）
+# 按品类等级矩阵：每个等级横向占据的列数及色带配色（与业务参考表一致）。
+CATEGORY_MATRIX_BANDS: tuple[tuple[str, int, str, str], ...] = (
+    ("S", 2, "FFFF00", "C00000"),
+    ("A", 4, "9BC2E6", "C00000"),
+    ("B", 6, "FCE4D6", "C00000"),
+    ("C", 4, "E2EFDA", "C00000"),
+    ("D", 4, "D9E1F2", "C00000"),
+    (NO_PRODUCTION, 6, "D9D9D9", "000000"),
+)
 
 
 def load_thumbnails(conn, report: dict, *, workers: int = 8, export_scope: ExportScope = "all") -> dict[str, bytes]:
@@ -755,6 +765,128 @@ def render_season_workbook(report: dict, thumbnails: dict[str, bytes], *, export
         for j in range(2, 2 + per_row):
             ws.column_dimensions[get_column_letter(j)].width = 17
 
+    med_black = Side(style="medium", color="000000")
+    soft_sep = Side(style="dotted", color="BFBFBF")
+    matrix_total_cols = 1 + sum(span for _, span, _, _ in CATEGORY_MATRIX_BANDS)
+
+    def matrix_widths(ws):
+        ws.column_dimensions["A"].width = 13
+        for j in range(2, matrix_total_cols + 1):
+            ws.column_dimensions[get_column_letter(j)].width = 13.5
+
+    def category_matrix(ws, r, wall):
+        # Row 1: 品类标题 + 红色动销率/产销率汇总栏
+        ws.row_dimensions[r].height = 26
+        title_cell = ws.cell(r, 1, f"{wall['name']}\n等级分配")
+        title_cell.font = Font(bold=True, size=10)
+        title_cell.fill = PatternFill("solid", fgColor="E2EFDA")
+        title_cell.alignment = center
+        title_cell.border = Border(left=med_black, right=med_black, top=med_black, bottom=med_black)
+        kpi_text = headline_text(wall["headline"]) + "   2027 秋冬需求 SKU 数：（待填）"
+        ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=matrix_total_cols)
+        kpi_cell = ws.cell(r, 2, kpi_text)
+        kpi_cell.font = Font(bold=True, size=11, color="C00000")
+        kpi_cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        for j in range(2, matrix_total_cols + 1):
+            ws.cell(r, j).border = Border(
+                left=med_black if j == 2 else None,
+                right=med_black if j == matrix_total_cols else None,
+                top=med_black,
+                bottom=med_black,
+            )
+
+        # Row 2: 原料 + S / A / B / C / D / 无产量 色带表头
+        hr = r + 1
+        ws.row_dimensions[hr].height = 26
+        mat_head = ws.cell(hr, 1, "原料")
+        mat_head.font = Font(bold=True, size=12, color="C00000")
+        mat_head.alignment = center
+        mat_head.border = Border(left=med_black, right=med_black, top=med_black, bottom=med_black)
+
+        band_totals = {label: sum(len(row["grades"].get(label, [])) for row in wall["rows"])
+                       for label, _, _, _ in CATEGORY_MATRIX_BANDS}
+        band_layout = []
+        col_cursor = 2
+        for label, span, fill_hex, font_hex in CATEGORY_MATRIX_BANDS:
+            end_col = col_cursor + span - 1
+            fill = PatternFill("solid", fgColor=fill_hex)
+            ws.merge_cells(start_row=hr, start_column=col_cursor, end_row=hr, end_column=end_col)
+            hcell = ws.cell(hr, col_cursor, f"{label}（{band_totals[label]}款）")
+            hcell.font = Font(bold=True, size=12, color=font_hex)
+            hcell.alignment = center
+            for j in range(col_cursor, end_col + 1):
+                c = ws.cell(hr, j)
+                c.fill = fill
+                c.border = Border(
+                    left=med_black if j == col_cursor else thin,
+                    right=med_black if j == end_col else thin,
+                    top=med_black,
+                    bottom=med_black,
+                )
+            band_layout.append((label, col_cursor, span, fill))
+            col_cursor = end_col + 1
+
+        # Body: 每种原料一块，跨行自动换行，保持等级色带与粗黑分隔线
+        cur = hr + 1
+        for row in wall["rows"]:
+            grades = row["grades"]
+            lines = max(1, *(-(-len(grades.get(label, [])) // span) for label, _, span, _ in band_layout))
+            block_end = cur + lines * 2 - 1
+            ws.merge_cells(start_row=cur, start_column=1, end_row=block_end, end_column=1)
+            mcell = ws.cell(cur, 1, f"{row['material']}\n（{row['sku']}款）")
+            mcell.font = Font(bold=True, size=10)
+            mcell.alignment = center
+            for rr in range(cur, block_end + 1):
+                ws.cell(rr, 1).border = Border(
+                    left=med_black,
+                    right=med_black,
+                    top=med_black if rr == cur else None,
+                    bottom=med_black if rr == block_end else None,
+                )
+            for k in range(lines):
+                ws.row_dimensions[cur + 2 * k].height = 90
+                ws.row_dimensions[cur + 2 * k + 1].height = 24
+            for label, start_col, span, fill in band_layout:
+                items = grades.get(label, [])
+                for k in range(lines):
+                    img_row = cur + 2 * k
+                    text_row = cur + 2 * k + 1
+                    is_first_line = k == 0
+                    is_last_line = k == lines - 1
+                    for offset in range(span):
+                        c_idx = start_col + offset
+                        left_side = med_black if offset == 0 else thin
+                        right_side = med_black if offset == span - 1 else thin
+                        img_cell = ws.cell(img_row, c_idx)
+                        txt_cell = ws.cell(text_row, c_idx)
+                        img_cell.fill = fill
+                        txt_cell.fill = fill
+                        img_cell.border = Border(
+                            left=left_side,
+                            right=right_side,
+                            top=med_black if is_first_line else thin,
+                            bottom=soft_sep,
+                        )
+                        txt_cell.border = Border(
+                            left=left_side,
+                            right=right_side,
+                            top=soft_sep,
+                            bottom=med_black if is_last_line else thin,
+                        )
+                        idx = k * span + offset
+                        if idx < len(items):
+                            item = items[idx]
+                            letter = get_column_letter(c_idx)
+                            if not put_image(ws, item["image_url"], f"{letter}{img_row}", MATRIX_IMG_BOX):
+                                img_cell.value = f"{item['code']}\n（无图）"
+                                img_cell.alignment = center
+                                img_cell.font = Font(size=8, color="595959")
+                            txt_cell.value = f"{item['code']}\n{item['quantity']:,}件"
+                            txt_cell.alignment = center
+                            txt_cell.font = Font(size=8)
+            cur = block_end + 1
+        return cur
+
     scope = report["scope"]
     seasons = "、".join(scope["seasons"])
     detail = report["detail"]
@@ -829,21 +961,15 @@ def render_season_workbook(report: dict, thumbnails: dict[str, bytes], *, export
         ws.freeze_panes = "G2"
 
     if include_review:
-        # 按品类的款式等级表
+        # 按品类的款式等级表（纵轴原料 × 横轴等级色带二维矩阵）
         ws = wb.create_sheet("按品类的款式等级表")
-        grid_widths(ws)
         r = 1
         for wall in report["walls"]["category"]:
-            ws.cell(r, 1, f"品类：{wall['name']}").font = Font(bold=True, size=13)
-            ws.cell(r + 1, 1, headline_text(wall["headline"]) + "   2027 秋冬需求 SKU 数：（待填）").font = Font(bold=True, color="C00000")
-            r += 2
-            for row in wall["rows"]:
-                ws.cell(r, 1, f"原料：{row['material']}（{row['sku']} 款）").font = Font(bold=True)
-                r = grade_grid(ws, r + 1, row["grades"])
+            r = category_matrix(ws, r, wall)
             r = table(ws, r + 1, ["原料", "SKU", "SKU占比", "销售数量占比", "金额占比"],
                       [[s["name"], s["sku"], s["sku_share"], s["quantity_share"], s["amount_share"]] for s in wall["shares"]]
                       + [["合计", wall["headline"]["sku"], 1, 1, 1]], [None, num, pct, pct, pct]) + 2
-        grid_widths(ws)
+        matrix_widths(ws)
 
         # 按材质的款式等级表
         ws = wb.create_sheet("按材质的款式等级表")
