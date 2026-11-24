@@ -562,6 +562,116 @@
 .sales-card-desc { margin: 0; color: #4a4f4a; font-size: 12px; line-height: 1.45; }
 .sales-push-reasons { margin: 2px 0 0; color: #2d593f; font-size: 11.5px; line-height: 1.4; }
 
+/* ── 本厂爆款款号锚定条 & 真视觉海选横幅 ── */
+.sales-guard-row { border-top: 1px dashed var(--divider); padding-top: 10px; }
+.sales-guard-toggle { font-weight: 500; color: var(--analysis-olive); }
+
+.sales-hero-picker {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  padding: 14px 18px;
+  display: grid;
+  gap: 10px;
+}
+.sales-hero-picker-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.sales-hero-picker-head > div { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; }
+.sales-hero-picker-head strong { font-size: 14px; color: var(--analysis-ink); }
+.sales-hero-picker-head small { font-size: 12px; color: var(--muted); }
+.sales-hero-picker-head b { color: var(--analysis-olive); }
+.sales-hero-strip {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+.sales-hero-card {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px 6px 6px;
+  background: #faf9f5;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  text-align: left;
+  transition: border-color .15s, background .15s;
+}
+.sales-hero-card:hover { border-color: var(--analysis-olive); background: #f3f6f1; }
+.sales-hero-card.is-selected {
+  border-color: #2c5b3f;
+  background: #e7f0e9;
+  box-shadow: 0 0 0 1px #2c5b3f;
+}
+.sales-hero-card.is-all { flex-direction: column; align-items: flex-start; justify-content: center; padding: 8px 14px; min-width: 128px; }
+.sales-hero-all-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: #2c5b3f;
+  color: #fff;
+}
+.sales-hero-thumb {
+  width: 44px;
+  height: 54px;
+  background: #eeece6;
+  border-radius: 3px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+.sales-hero-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.sales-hero-meta { display: grid; gap: 2px; min-width: 78px; }
+.sales-hero-meta strong { font-size: 13px; color: var(--analysis-ink); }
+.sales-hero-meta small { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.sales-hero-sub { color: var(--analysis-olive) !important; font-weight: 500; }
+
+.sales-visual-banner {
+  padding: 12px 16px;
+  border-radius: var(--radius-control);
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 6px;
+}
+.sales-visual-banner.is-verified { background: #edf4ee; border-color: #9ec0a8; }
+.sales-visual-banner.is-preview { background: #fbf6ec; border-color: #dfc99b; }
+.sales-visual-banner-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.sales-visual-pill {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 9px;
+  border-radius: 99px;
+}
+.sales-visual-pill.is-verified { background: #2c5b3f; color: #fff; }
+.sales-visual-pill.is-preview { background: #b5893a; color: #fff; }
+.sales-batch-pill { font-size: 12px; color: var(--muted); }
+.sales-hero-read { margin: 0; font-size: 13px; line-height: 1.55; color: var(--analysis-ink); }
+.sales-vscreen-pill {
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: #e1eee4;
+  color: #245236;
+}
+.sales-next-batch-btn { border-color: var(--analysis-olive); color: var(--analysis-olive); font-weight: 500; }
+
 /* ── 外部图库选款漏斗与并排卡片 ── */
 .sales-funnel-bar {
   display: grid;

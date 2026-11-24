@@ -490,7 +490,8 @@ def sales_selection_export_pdf(body: SalesSelectionExportRequest, request: Reque
     payload = render_selection_pdf(report, thumbs, only_adopted=body.only_adopted)
     from urllib.parse import quote
     tag = "已采纳打版清单" if body.only_adopted else "外部图库微创新选款"
-    quoted = quote(f"{tag}-{report['scope']['category']}.pdf")
+    hero_part = f"-{report['scope']['target_style_code']}" if report["scope"].get("target_style_code") else ""
+    quoted = quote(f"{tag}-{report['scope']['category']}{hero_part}.pdf")
     return Response(
         payload,
         media_type="application/pdf",
@@ -506,7 +507,8 @@ def sales_selection_export_xlsx(body: SalesSelectionExportRequest, request: Requ
     payload = render_selection_xlsx(report, thumbs, only_adopted=body.only_adopted)
     from urllib.parse import quote
     tag = "已采纳打版清单" if body.only_adopted else "选款打版清单"
-    quoted = quote(f"{tag}-{report['scope']['category']}.xlsx")
+    hero_part = f"-{report['scope']['target_style_code']}" if report["scope"].get("target_style_code") else ""
+    quoted = quote(f"{tag}-{report['scope']['category']}{hero_part}.xlsx")
     return Response(
         payload,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

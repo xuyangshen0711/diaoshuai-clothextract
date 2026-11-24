@@ -168,6 +168,8 @@ def _build_vocabulary() -> tuple[dict[str, QueryToken], dict[str, QueryToken], l
     register("半高领", VisualTagToken("半高领", "neckline", "高领", ("半高领",)))
     register("polo领", VisualTagToken("polo领", "neckline", "翻领", ("polo",)))
     register("POLO领", VisualTagToken("POLO领", "neckline", "翻领", ("polo",)))
+    register("帽衫", VisualTagToken("帽衫", "neckline", "连帽", ("连帽", "帽衫")))
+    register("连帽衫", VisualTagToken("连帽衫", "neckline", "连帽", ("连帽", "帽衫")))
 
     for v in (*SLEEVE_LENGTHS, *(s for s in FILTER_FIELDS["袖型"] if s != "其他")):
         register(v, VisualTagToken(v, "sleeve", v))

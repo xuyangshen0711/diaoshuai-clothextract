@@ -307,6 +307,7 @@ export type SalesOptions = {
   default_category: string
   external_sources: { name: string; count: number }[]
   catalog_seasons: string[]
+  style_options: string[]
   last_order_date: string | null
   ai: SalesAiStatus
 }
@@ -318,6 +319,9 @@ export type SalesStyleCard = {
   image_url: string | null
   season: string
   category: string
+  cat2?: string
+  series?: string
+  structural_hints?: string[]
   plan: string
   material: string
   material_short: string
@@ -410,6 +414,9 @@ export type SelectionCandidate = {
   closest_any_sim: number
   decision: DecisionStatus
   decision_note: string
+  visual_screen_score?: number
+  visual_screen_reason?: string
+  hero_visual_note?: string
   verdict?: 'recommend' | 'too_similar' | 'drop'
   tier?: string
   stars?: number
@@ -427,14 +434,29 @@ export type SelectionFilters = {
   catalog_seasons: string[]
   include_brand: boolean
   pool_size: number
+  target_style_code?: string
+  exclude_busy_patterns?: boolean
+  styles?: string[]
+  scan_limit?: number
+  exclude_record_ids?: string[]
+  skip_rejected?: boolean
 }
 
 export type SelectionReport = {
-  scope: SelectionFilters
+  scope: SelectionFilters & { exclude_record_ids_count?: number }
+  target_hero: SalesStyleCard | null
+  hero_styles: SalesStyleCard[]
   funnel: {
     external_matched_category: number
     gate1_duplicates_removed: number
+    gate1_own_duplicates_removed: number
+    gate1_ext_duplicates_removed: number
+    gate1_offtone_removed: number
+    style_filtered_count: number
+    skipped_seen_count: number
     gate2_scored_pool: number
+    scan_pool_size: number
+    remaining_unscanned: number
     gate3_shortlist: number
     own_category_sku: number
     own_winners_count: number
@@ -442,10 +464,19 @@ export type SelectionReport = {
   trend_radar: { total: number; highlights: { dimension: string; top: { label: string; count: number; share: number }[] }[] }
   top_yarns: { material: string; sku: number; winner_rate: number; avg_quantity: number }[]
   duplicate_samples: { record_id: string; image_url: string | null; source_category: string; summary: string; matched_own_code: string; reason: string }[]
+  offtone_samples: { record_id: string; image_url: string | null; source_category: string; summary: string; reason: string }[]
+  scan_candidate_ids: string[]
   shortlist: SelectionCandidate[]
   ai_selection: {
     generated_at: string
     model: string
+    pipeline_mode?: string
+    hero_visual_read?: string
+    visual_screened_count?: number
+    contact_sheets_count?: number
+    stage1_picked_count?: number
+    stage1_rejected_summary?: string
+    scanned_record_ids?: string[]
     reviewed_count: number
     recommended_count: number
     rejected_similar_count: number

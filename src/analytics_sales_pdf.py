@@ -356,21 +356,25 @@ def render_selection_pdf(report: dict, thumbs: dict[str, bytes], *, only_adopted
     funnel = report["funnel"]
     items = _pick_selection_items(report, only_adopted)
     mode_label = "已采纳打版清单" if only_adopted else "微创新智能选款推荐报告"
+    hero_tag = f"  |  锚定本厂款号：{scope['target_style_code']}" if scope.get("target_style_code") else ""
     subtitle = (
-        f"目标品类：{scope['category']}  |  本厂参考季：{'、'.join(scope['seasons'])}  |  "
+        f"目标品类：{scope['category']}{hero_tag}  |  本厂参考季：{'、'.join(scope['seasons'])}  |  "
         f"外部来源：{'、'.join(scope['sources'])}"
     )
     pdf = _PdfBuilder(f"外部图库{mode_label} · {scope['category']}", subtitle)
 
     # Funnel & trend overview box
     ai_sel = report.get("ai_selection")
+    ext_dup = funnel.get("gate1_ext_duplicates_removed", 0)
+    offtone = funnel.get("gate1_offtone_removed", 0)
     funnel_line = (
-        f"三道防线筛选漏斗：外部同品类候选 {funnel['external_matched_category']} 张 → "
-        f"第1道剔除疑似同款 {funnel['gate1_duplicates_removed']} 张 → "
-        f"第2道双分初筛 {funnel['gate3_shortlist']} 张 → "
+        f"真视觉选款漏斗：外部同品类候选 {funnel['external_matched_category']} 张 → "
+        f"第1道去重/防花哨拦截 {funnel['gate1_duplicates_removed'] + offtone} 张"
+        f"（含图库自重 {ext_dup} 张、花纹跑偏 {offtone} 张）→ "
         + (
-            f"第3道 {ai_sel['model']} 并排看图终审入选 {ai_sel['recommended_count']} 张（另拦截视觉撞款 {ai_sel['rejected_similar_count']} 张）"
-            if ai_sel else "尚未执行第3道 AI 终审（当前为初筛候选池）"
+            f"第2道 {ai_sel['model']} 视觉海选扫描 {ai_sel.get('visual_screened_count', ai_sel['reviewed_count'])} 张 → "
+            f"1v1 高清终审推荐 {ai_sel['recommended_count']} 张（拦截撞款 {ai_sel['rejected_similar_count']} 张，风格淘汰 {ai_sel.get('dropped_count', 0)} 张）"
+            if ai_sel else f"当前为快速标签初筛预览（Top {funnel['gate3_shortlist']} 张，尚未执行真视觉海选与终审）"
         )
     )
     f_lines = _wrap_text(pdf.font, funnel_line, 8.8, CONTENT_W - 20)
@@ -378,6 +382,15 @@ def render_selection_pdf(report: dict, thumbs: dict[str, bytes], *, only_adopted
     pdf.box(LEFT, pdf.y, CONTENT_W, fh, PANEL, stroke=LINE)
     pdf.paragraph(funnel_line, LEFT + 10, pdf.y + 14, CONTENT_W - 20, size=8.8, color=INK, leading=13)
     pdf.y += fh + 8
+
+    if ai_sel and ai_sel.get("hero_visual_read"):
+        hr_txt = f"AI 肉眼读图核验本厂参照款：{ai_sel['hero_visual_read']}"
+        hr_lines = _wrap_text(pdf.font, hr_txt, 8.5, CONTENT_W - 20)
+        hr_h = 12 + len(hr_lines) * 12.5
+        pdf.ensure(hr_h + 8)
+        pdf.box(LEFT, pdf.y, CONTENT_W, hr_h, WARM, stroke=BRASS, width=0.6)
+        pdf.paragraph(hr_txt, LEFT + 10, pdf.y + 13, CONTENT_W - 20, size=8.5, color=INK, leading=12.5)
+        pdf.y += hr_h + 8
 
     # External trend highlights
     highlights = (report.get("trend_radar") or {}).get("highlights") or []
@@ -476,7 +489,8 @@ def render_selection_xlsx(report: dict, thumbs: dict[str, bytes], *, only_adopte
     left_wrap = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
     scope = report["scope"]
-    ws.cell(1, 1, f"外部图库微创新选款打版清单 · {scope['category']}（参考季：{'、'.join(scope['seasons'])}）").font = Font(bold=True, size=13)
+    hero_suffix = f" · 锚定款号 {scope['target_style_code']}" if scope.get("target_style_code") else ""
+    ws.cell(1, 1, f"外部图库微创新选款打版清单 · {scope['category']}{hero_suffix}（参考季：{'、'.join(scope['seasons'])}）").font = Font(bold=True, size=13)
     ws.merge_cells("A1:L1")
     ws.row_dimensions[1].height = 26
 

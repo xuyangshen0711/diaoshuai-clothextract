@@ -281,3 +281,194 @@ def test_sales_endpoints_decisions_and_pdf_xlsx_exports(store, monkeypatch):
     assert ws.max_row == 3  # header rows 1..2 + 1 adopted item row
     assert ws["C3"].value == "已采纳打版"
     assert len(ws._images) == 2  # candidate photo + reference winner photo side-by-side!
+
+
+def test_hoodie_taxonomy_ext_dedup_guardrail_hero_anchor_and_two_stage_contact_sheet(store, monkeypatch):
+    """Verify:
+    1. '连帽' neckline taxonomy + '帽衫' gallery query alias + ERP subcategory fusion overrides mislabeled hoodie.
+    2. External-vs-external visual deduplication catches duplicate external photos.
+    3. Busy-pattern / floral guardrail removes florals by default.
+    4. Target hero anchoring ('target_style_code') + next-batch pagination ('exclude_record_ids').
+    5. Two-stage Qwen4-Max 4x4 Contact-Sheet visual screening + high-res 1v1 side-by-side review.
+    """
+    from src.schema import DETAILS, NECKLINE
+    from src.search.gallery_query import VisualTagToken, parse_gallery_query
+
+    assert "连帽" in NECKLINE and "连帽" in DETAILS
+    tokens = parse_gallery_query("黑色帽衫")
+    assert any(isinstance(t, VisualTagToken) and t.kind == "neckline" and t.canonical == "连帽" for t in tokens)
+
+    with catalog._database() as conn:
+        ensure_factory(conn)
+        conn.executemany(
+            "INSERT INTO style_variants (variant_code, style_code, customer, season, needle, series, category, "
+            "material, design_code, designer, craftsman, subcategory, colors_json, sizes_json, source_file, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                # Mislabeled hoodie in old tags ('圆领'), but ERP subcategory explicitly says '连帽帽衫'
+                ("663315", "663315", "本厂自有版本", "2026冬", "12针", "休闲", "长袖套衫", "2/42支50.50AB", "D15", "沈爱和", "王工", "连帽帽衫",
+                 json.dumps(["咖啡", "藏青"], ensure_ascii=False), '["M","L"]', "a.xlsx", "2026-11-01"),
+                ("662757", "662757", "本厂自有版本", "2026冬", "12针", "通勤", "长袖套衫", "鎏金羊毛", "D57", "沈爱和", "王工", "POLO翻领",
+                 json.dumps(["黑色", "灰色"], ensure_ascii=False), '["M","L"]', "a.xlsx", "2026-11-01"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO style_order_lines VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                ("O10", "663315", "咖啡", "M", 2200, 264000, "663315", "张总", "杭州张总", "", "订单", "2026-10-12", "小王", "套衫", "2026冬", "o.xlsx", "t"),
+                ("O11", "663315", "藏青", "L", 1631, 195720, "663315", "陈姐", "广州陈姐", "", "补单", "2026-11-01", "小王", "套衫", "2026冬", "o.xlsx", "t"),
+                ("O12", "662757", "黑色", "M", 4162, 541060, "662757", "刘哥", "武汉刘哥", "", "订单", "2026-10-16", "小王", "套衫", "2026冬", "o.xlsx", "t"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO style_production (variant_code, color, size_label, quantity, style_code, design_code, source_file, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            [
+                ("663315", "咖啡", "M", 3831, "663315", "D15", "p.xlsx", "t"),
+                ("662757", "黑色", "M", 4162, "662757", "D57", "p.xlsx", "t"),
+            ],
+        )
+
+    img_dir = store / "raw_v2"
+    own_hoodie_img = _make_img(img_dir, "663315.jpg", (90, 58, 45))
+    own_polo_img = _make_img(img_dir, "662757.jpg", (38, 36, 40))
+
+    # Build 7 external candidates: 1 floral (blocked), 2 identical duplicates (1 removed), 5 distinct remaining -> triggers Stage 1 contact sheet!
+    ext_floral = _make_img(img_dir, "ext_floral.jpg", (220, 195, 160), stripe=True)
+    ext_dup_a = _make_img(img_dir, "ext_dup_a.jpg", (230, 232, 238), stripe=True)
+    ext_dup_b = _make_img(img_dir, "ext_dup_b.jpg", (230, 232, 238), stripe=True)  # exact same bytes as ext_dup_a!
+    ext_c1 = _make_img(img_dir, "ext_c1.jpg", (65, 72, 85))
+    ext_c2 = _make_img(img_dir, "ext_c2.jpg", (125, 118, 108))
+    ext_c3 = _make_img(img_dir, "ext_c3.jpg", (48, 62, 54))
+    ext_c4 = _make_img(img_dir, "ext_c4.jpg", (162, 148, 132))
+    ext_c5 = _make_img(img_dir, "ext_c5.jpg", (85, 80, 95))
+
+    records = [
+        ImageRecord(
+            id="own_663315", image_path=own_hoodie_img, source_category="本厂产品", style_code="663315", review_status="approved",
+            source=SourceMeta(source_file="663315.jpg", source_type="image", location="上传图片"),
+            # Intentionally mislabeled as 圆领 by old tagger — ERP cat2="连帽帽衫" must correct it!
+            tags=FashionTags(品类="上衣>套衫", 风格="休闲", 季节="冬", 版型="宽松", 颜色主色调="棕色", 领型="圆领", 袖型="长袖", 袖长="长袖", 面料="针织", 图案="纯色/无明显图案", 细节元素=["字母"], 一句话描述="深棕色宽松针织套衫"),
+        ),
+        ImageRecord(
+            id="own_662757", image_path=own_polo_img, source_category="本厂产品", style_code="662757", review_status="approved",
+            source=SourceMeta(source_file="662757.jpg", source_type="image", location="上传图片"),
+            tags=FashionTags(品类="上衣>套衫", 风格="通勤", 季节="冬", 版型="宽松", 颜色主色调="黑色", 领型="翻领", 袖型="长袖", 袖长="长袖", 面料="针织", 图案="纯色/无明显图案", 细节元素=["罗纹"], 一句话描述="黑色极简翻领针织套衫"),
+        ),
+        ImageRecord(
+            id="ext_floral", image_path=ext_floral, source_category="网图趋势", review_status="approved",
+            source=SourceMeta(source_file="floral.jpg", source_type="image", location="上传图片"),
+            tags=FashionTags(品类="上衣>套衫", 风格="复古", 季节="冬", 版型="宽松", 颜色主色调="米色", 领型="圆领", 袖型="长袖", 袖长="长袖", 面料="针织", 图案="花卉", 细节元素=["罗纹"], 一句话描述="米色大花卉圆领针织套衫"),
+        ),
+        ImageRecord(
+            id="ext_dup_a", image_path=ext_dup_a, source_category="网图趋势", review_status="approved",
+            source=SourceMeta(source_file="stripe_1.jpg", source_type="image", location="上传图片"),
+            tags=FashionTags(品类="上衣>套衫", 风格="休闲", 季节="冬", 版型="宽松", 颜色主色调="白色", 领型="连帽", 袖型="长袖", 袖长="长袖", 面料="针织", 图案="条纹", 细节元素=["罗纹", "连帽"], 一句话描述="蓝白条纹连帽针织帽衫"),
+        ),
+        ImageRecord(
+            id="ext_dup_b", image_path=ext_dup_b, source_category="网图趋势", review_status="approved",
+            source=SourceMeta(source_file="stripe_2.jpg", source_type="image", location="上传图片"),
+            tags=FashionTags(品类="上衣>套衫", 风格="休闲", 季节="冬", 版型="宽松", 颜色主色调="白色", 领型="连帽", 袖型="长袖", 袖长="长袖", 面料="针织", 图案="条纹", 细节元素=["罗纹", "连帽"], 一句话描述="蓝白条纹休闲连帽套衫"),
+        ),
+        ImageRecord(
+            id="ext_c1", image_path=ext_c1, source_category="品牌资料包", review_status="approved",
+            source=SourceMeta(source_file="c1.jpg", source_type="image", location="上传图片"),
+            tags=FashionTags(品类="上衣>套衫", 风格="休闲", 季节="冬", 版型="宽松", 颜色主色调="灰色", 领型="连帽", 袖型="长袖", 袖长="长袖", 面料="针织", 图案="纯色/无明显图案", 细节元素=["连帽", "抽绳", "口袋"], 一句话描述="深灰连帽抽绳口袋针织帽衫"),
+        ),
+        ImageRecord(
+            id="ext_c2", image_path=ext_c2, source_category="品牌资料包", review_status="approved",
+            source=SourceMeta(source_file="c2.jpg", source_type="image", location="上传图片"),
+            tags=FashionTags(品类="上衣>套衫", 风格="通勤", 季节="冬", 版型="宽松", 颜色主色调="米色", 领型="翻领", 袖型="长袖", 袖长="长袖", 面料="针织", 图案="纯色/无明显图案", 细节元素=["绞花", "纽扣"], 一句话描述="燕麦色翻领细绞花针织套衫"),
+        ),
+        ImageRecord(
+            id="ext_c3", image_path=ext_c3, source_category="市调拍照", review_status="approved",
+            source=SourceMeta(source_file="c3.jpg", source_type="image", location="上传图片"),
+            tags=FashionTags(品类="上衣>套衫", 风格="极简", 季节="冬", 版型="直筒", 颜色主色调="绿色", 领型="半高领", 袖型="长袖", 袖长="长袖", 面料="针织", 图案="纯色/无明显图案", 细节元素=["罗纹", "拼色"], 一句话描述="墨绿拼色半高领细针套衫"),
+        ),
+        ImageRecord(
+            id="ext_c4", image_path=ext_c4, source_category="市调拍照", review_status="approved",
+            source=SourceMeta(source_file="c4.jpg", source_type="image", location="上传图片"),
+            tags=FashionTags(品类="上衣>套衫", 风格="休闲", 季节="冬", 版型="宽松", 颜色主色调="卡其/驼色", 领型="连帽", 袖型="长袖", 袖长="长袖", 面料="针织", 图案="纯色/无明显图案", 细节元素=["连帽", "半拉链"], 一句话描述="驼色半拉链连帽针织套衫"),
+        ),
+        ImageRecord(
+            id="ext_c5", image_path=ext_c5, source_category="网图趋势", review_status="approved",
+            source=SourceMeta(source_file="c5.jpg", source_type="image", location="上传图片"),
+            tags=FashionTags(品类="上衣>套衫", 风格="极简", 季节="冬", 版型="宽松", 颜色主色调="灰色", 领型="V领", 袖型="长袖", 袖长="长袖", 面料="针织", 图案="纯色/无明显图案", 细节元素=["罗纹", "落肩"], 一句话描述="炭灰落肩V领宽松套衫"),
+        ),
+    ]
+    catalog.save_catalog(records)
+
+    # Preview anchored specifically to hoodie 663315
+    f_hoodie = SelectionFilters(seasons=["2026冬"], category="长袖套衫", target_style_code="663315", pool_size=4)
+    with catalog.read_database() as conn:
+        pre = build_selection_preview(conn, f_hoodie)
+
+    assert pre["target_hero"]["code"] == "663315"
+    assert pre["target_hero"]["tags"]["领型"] == "连帽"  # ERP subcategory fused!
+    assert len(pre["hero_styles"]) == 2
+    assert pre["funnel"]["gate1_offtone_removed"] == 1  # floral blocked!
+    assert pre["funnel"]["gate1_ext_duplicates_removed"] == 1  # ext_dup_b deduplicated!
+    assert pre["funnel"]["gate2_scored_pool"] == 6  # ext_dup_a + ext_c1..c5
+    assert all(c["reference_winner"]["code"] == "663315" for c in pre["shortlist"])
+    # Hoodie candidates should rank at the very top when anchored to 663315
+    assert pre["shortlist"][0]["tags"]["领型"] == "连帽"
+
+    # Next-batch pagination excludes previously seen IDs
+    first_batch_ids = [c["record_id"] for c in pre["shortlist"]]
+    f_next = SelectionFilters(
+        seasons=["2026冬"], category="长袖套衫", target_style_code="663315",
+        pool_size=4, exclude_record_ids=first_batch_ids,
+    )
+    with catalog.read_database() as conn:
+        pre_next = build_selection_preview(conn, f_next)
+    assert pre_next["funnel"]["skipped_seen_count"] == 4
+    assert pre_next["funnel"]["gate2_scored_pool"] == 2
+    assert not (set(first_batch_ids) & {c["record_id"] for c in pre_next["shortlist"]})
+
+    # Two-stage Qwen4-Max Contact Sheet (Stage 1) + 1v1 Deep Review (Stage 2)
+    stage1_calls = 0
+    stage2_calls = 0
+
+    def two_stage_handler(req: httpx.Request) -> httpx.Response:
+        nonlocal stage1_calls, stage2_calls
+        body = json.loads(req.content.decode())
+        sys_prompt = body["messages"][0]["content"]
+        img_blocks = [b for b in body["messages"][1]["content"] if b.get("type") == "image_url"]
+        assert len(img_blocks) == 2
+        if "4×4 编号拼图真视觉海选" in sys_prompt:
+            stage1_calls += 1
+            return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({
+                "hero_visual_read": "肉眼确认本厂 663315 为深棕宽松连帽针织帽衫，休闲实穿调性",
+                "picks": [
+                    {"slot": 1, "visual_score": 93, "quick_reason": "同为连帽针织帽衫，新增抽绳与袋鼠兜细节"},
+                    {"slot": 2, "visual_score": 87, "quick_reason": "半拉链连帽领口升级，质感克制耐看"},
+                ],
+                "rejected_summary": "淘汰其余非连帽及平淡基础款",
+            }, ensure_ascii=False)}}]})
+        stage2_calls += 1
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({
+            "verdict": "recommend",
+            "tier": "趋势微创新款",
+            "stars": 5,
+            "hero_visual_note": "确认本厂 663315 为宽松连帽针织帽衫",
+            "similarity_note": "承接 663315 连帽实穿骨架，门襟与抽绳工艺区分明显",
+            "gene_reason": "延续 663315（3831件/补单1631件）的宽松连帽休闲爆款基因",
+            "novelty_point": "领口改为半拉链/抽绳结构并加强罗纹收口",
+            "yarn_and_price_advice": "沿用42支50.50/AB，目标单价¥120–135",
+            "risk_note": "控制帽子克重避免向后坠领",
+        }, ensure_ascii=False)}}]})
+
+    llm = _mock_qwen_client(monkeypatch, two_stage_handler)
+    with catalog.read_database() as conn:
+        done = run_selection_ai(conn, f_hoodie, client=llm)
+    ai_sel = done["ai_selection"]
+    assert stage1_calls == 1
+    assert stage2_calls == 2
+    assert ai_sel["pipeline_mode"] == "two_stage_contact_sheet"
+    assert "663315" in ai_sel["hero_visual_read"] and "连帽" in ai_sel["hero_visual_read"]
+    assert ai_sel["visual_screened_count"] == 6
+    assert ai_sel["contact_sheets_count"] == 1
+    assert ai_sel["stage1_picked_count"] == 2
+    assert len(ai_sel["scanned_record_ids"]) == 6
+    assert ai_sel["recommended_count"] == 2
+    assert ai_sel["recommendations"][0]["visual_screen_score"] == 93

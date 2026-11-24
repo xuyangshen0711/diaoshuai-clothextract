@@ -24,7 +24,7 @@ from typing import Literal
 
 import httpx
 from openai import OpenAI
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from src import catalog
@@ -39,11 +39,20 @@ from src.images import cover_path
 from src.schema import ImageRecord
 
 EXTERNAL_SOURCES: tuple[str, ...] = ("网图趋势", "品牌资料包", "市调拍照")
+STYLE_FILTER_OPTIONS: tuple[str, ...] = ("极简", "通勤", "法式", "休闲", "复古", "甜美", "工装", "街头")
+BUSY_PATTERNS: set[str] = {"花卉", "迷彩", "抽象/泼墨", "动物纹", "混合图案"}
+BUSY_DESC_KEYWORDS: tuple[str, ...] = (
+    "大花", "碎花", "满印", "满身花", "满身小图", "满身图", "花卉", "豹纹", "斑马纹", "迷彩", "满身印花",
+)
+NEUTRAL_COLORS: set[str] = {"黑色", "白色", "灰色", "米色", "卡其/驼色", "棕色", "深蓝/藏青"}
+BOLD_COLORS: set[str] = {"红色", "黄色", "橙色", "紫色", "粉色"}
 DEFAULT_QWEN_MODEL = "qwen4-max"
 DEFAULT_DEEPSEEK_VISION_MODEL = "deepseek-flash"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 AI_TIMEOUT = httpx.Timeout(150.0, connect=25.0)
 _CACHE_LOCK = Lock()
+_FP_LOCK = Lock()
+_FINGERPRINT_CACHE: dict[tuple[str, int, str], tuple[int | None, str | None, tuple[int, ...] | None]] = {}
 _SPLIT_COLOR = re.compile(r"[+＋/、,，]")
 
 PRICE_BANDS: tuple[tuple[str, float, float], ...] = (
@@ -87,6 +96,12 @@ class SelectionFilters(BaseModel):
     catalog_seasons: list[str] = Field(default_factory=list, max_length=10)
     include_brand: bool = False
     pool_size: int = Field(default=12, ge=4, le=24)
+    target_style_code: str = Field(default="", max_length=128)
+    exclude_busy_patterns: bool = True
+    styles: list[str] = Field(default_factory=list, max_length=12)
+    scan_limit: int = Field(default=128, ge=16, le=256)
+    exclude_record_ids: list[str] = Field(default_factory=list, max_length=2000)
+    skip_rejected: bool = True
 
     @model_validator(mode="after")
     def normalize(self):
@@ -95,6 +110,9 @@ class SelectionFilters(BaseModel):
         valid_sources = [s for s in self.sources if s in EXTERNAL_SOURCES]
         self.sources = valid_sources or list(EXTERNAL_SOURCES)
         self.catalog_seasons = sorted({s.strip() for s in self.catalog_seasons if s and s.strip()})
+        self.target_style_code = (self.target_style_code or "").strip()
+        self.styles = sorted({s.strip() for s in self.styles if s and s.strip()})
+        self.exclude_record_ids = sorted({r.strip() for r in self.exclude_record_ids if r and r.strip()})
         if not self.seasons:
             raise ValueError("请至少选择一个本厂参考季节")
         return self
@@ -242,13 +260,22 @@ def _record_data_url(record: ImageRecord, max_side: int = 520) -> str | None:
         return None
 
 
-def _dhash64(record: ImageRecord) -> int | None:
-    """Fast 64-bit horizontal+vertical gradient perceptual hash; skips degenerate flat images."""
+def _image_fingerprints(record: ImageRecord) -> tuple[int | None, str | None, tuple[int, ...] | None]:
+    """Return cached (64-bit h+v gradient dHash, 16-hex byte SHA256, 2x2 RGB quad signature)."""
+    cache_key = (record.id, int(record.revision or 0), record.image_path)
+    with _FP_LOCK:
+        hit = _FINGERPRINT_CACHE.get(cache_key)
+    if hit is not None:
+        return hit
     try:
         path = cover_path(record)
-        with Image.open(path) as img:
-            h_raw = img.convert("L").resize((9, 4), Image.Resampling.BILINEAR).tobytes()
-            v_raw = img.convert("L").resize((8, 5), Image.Resampling.BILINEAR).tobytes()
+        raw_bytes = path.read_bytes()
+        sha = hashlib.sha256(raw_bytes).hexdigest()[:16]
+        with Image.open(BytesIO(raw_bytes)) as img:
+            rgb_sig = tuple(img.convert("RGB").resize((2, 2), Image.Resampling.BILINEAR).tobytes())
+            gray = img.convert("L")
+            h_raw = gray.resize((9, 4), Image.Resampling.BILINEAR).tobytes()
+            v_raw = gray.resize((8, 5), Image.Resampling.BILINEAR).tobytes()
         bits = 0
         for row in range(4):
             offset = row * 9
@@ -260,17 +287,125 @@ def _dhash64(record: ImageRecord) -> int | None:
             for col in range(8):
                 bits = (bits << 1) | (1 if v_raw[top_off + col] > v_raw[bot_off + col] else 0)
         # Uniform solid images have 0 gradient bits; only match perceptual hash on textured photos
-        if bits.bit_count() < 4 or bits.bit_count() > 60:
-            return None
-        return bits
+        dhash = None if (bits.bit_count() < 4 or bits.bit_count() > 60) else bits
+        result = (dhash, sha, rgb_sig)
     except Exception:
-        return None
+        result = (None, None, None)
+    with _FP_LOCK:
+        if len(_FINGERPRINT_CACHE) > 4000:
+            _FINGERPRINT_CACHE.clear()
+        _FINGERPRINT_CACHE[cache_key] = result
+    return result
+
+
+def _rgb_close(a: tuple[int, ...] | None, b: tuple[int, ...] | None, max_mean_diff: float = 18.0) -> bool:
+    if not a or not b or len(a) != len(b):
+        return False
+    return (sum(abs(x - y) for x, y in zip(a, b)) / len(a)) <= max_mean_diff
+
+
+def _dhash64(record: ImageRecord) -> int | None:
+    """Fast 64-bit horizontal+vertical gradient perceptual hash; skips degenerate flat images."""
+    return _image_fingerprints(record)[0]
 
 
 def _hamming(a: int | None, b: int | None) -> int:
     if a is None or b is None:
         return 64
     return (a ^ b).bit_count()
+
+
+def _badge_font(size: int = 20):
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _make_contact_sheet(
+    items_with_recs: list[tuple[int, ImageRecord]],
+    *,
+    tile_w: int = 290,
+    tile_h: int = 350,
+    cols: int = 4,
+) -> str | None:
+    """Stitch up to 16 candidate covers into a numbered 4x4 JPEG contact sheet for Qwen4-Max visual screening."""
+    if not items_with_recs:
+        return None
+    pad = 8
+    rows = max(1, (len(items_with_recs) + cols - 1) // cols)
+    canvas = Image.new("RGB", (cols * tile_w + (cols + 1) * pad, rows * tile_h + (rows + 1) * pad), (246, 245, 242))
+    draw = ImageDraw.Draw(canvas)
+    font = _badge_font(20)
+    rendered = 0
+    for idx, (slot_num, rec) in enumerate(items_with_recs):
+        r, c = divmod(idx, cols)
+        x0 = pad + c * (tile_w + pad)
+        y0 = pad + r * (tile_h + pad)
+        draw.rectangle([x0, y0, x0 + tile_w, y0 + tile_h], fill=(255, 255, 255), outline=(214, 210, 202), width=1)
+        try:
+            path = cover_path(rec)
+            with Image.open(path) as img:
+                rgb = img.convert("RGB")
+                rgb.thumbnail((tile_w - 6, tile_h - 6), Image.Resampling.LANCZOS)
+                ox = x0 + (tile_w - rgb.width) // 2
+                oy = y0 + (tile_h - rgb.height) // 2
+                canvas.paste(rgb, (ox, oy))
+                rendered += 1
+        except Exception:
+            pass
+        # High-contrast ASCII badge: 01..16
+        label = f"{slot_num:02d}"
+        draw.rectangle([x0 + 4, y0 + 4, x0 + 50, y0 + 34], fill=(24, 28, 25))
+        draw.text((x0 + 13, y0 + 8), label, fill=(255, 255, 255), font=font)
+    if rendered == 0:
+        return None
+    buf = BytesIO()
+    canvas.save(buf, format="JPEG", quality=84)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+def _make_hero_reference_image(hero_pairs: list[tuple[str, ImageRecord]]) -> str | None:
+    """Single crisp hero image (when 1 style anchored) or 2x2 labeled hero board (when multi-winner mode)."""
+    valid = [(code, rec) for code, rec in hero_pairs if rec is not None]
+    if not valid:
+        return None
+    if len(valid) == 1:
+        return _record_data_url(valid[0][1], max_side=580)
+    valid = valid[:4]
+    cols = 2
+    rows = (len(valid) + 1) // 2
+    tile_w, tile_h, pad = 340, 410, 10
+    canvas = Image.new("RGB", (cols * tile_w + (cols + 1) * pad, rows * tile_h + (rows + 1) * pad), (246, 245, 242))
+    draw = ImageDraw.Draw(canvas)
+    font = _badge_font(18)
+    rendered = 0
+    for idx, (code, rec) in enumerate(valid):
+        r, c = divmod(idx, cols)
+        x0 = pad + c * (tile_w + pad)
+        y0 = pad + r * (tile_h + pad)
+        draw.rectangle([x0, y0, x0 + tile_w, y0 + tile_h], fill=(255, 255, 255), outline=(205, 200, 190), width=1)
+        try:
+            path = cover_path(rec)
+            with Image.open(path) as img:
+                rgb = img.convert("RGB")
+                rgb.thumbnail((tile_w - 8, tile_h - 38), Image.Resampling.LANCZOS)
+                ox = x0 + (tile_w - rgb.width) // 2
+                oy = y0 + 34 + (tile_h - 38 - rgb.height) // 2
+                canvas.paste(rgb, (ox, oy))
+                rendered += 1
+        except Exception:
+            pass
+        ascii_code = "".join(ch for ch in str(code) if 32 <= ord(ch) < 127)[:14] or f"#{idx + 1}"
+        draw.rectangle([x0 + 4, y0 + 4, x0 + tile_w - 4, y0 + 30], fill=(42, 68, 52))
+        draw.text((x0 + 12, y0 + 7), f"HERO {ascii_code}", fill=(255, 255, 255), font=font)
+    if rendered == 0:
+        return None
+    buf = BytesIO()
+    canvas.save(buf, format="JPEG", quality=85)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
 
 
 class SalesVisionClient:
@@ -293,7 +428,7 @@ class SalesVisionClient:
         self._owns_http = http_client is None
         self._http = http_client or httpx.Client(
             timeout=AI_TIMEOUT,
-            limits=httpx.Limits(max_connections=16, max_keepalive_connections=8),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
         )
         self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=AI_TIMEOUT, max_retries=1, http_client=self._http)
 
@@ -450,6 +585,7 @@ def sales_options(conn) -> dict:
         "default_category": "长袖套衫",
         "external_sources": [{"name": s, "count": ext_counts[s]} for s in EXTERNAL_SOURCES],
         "catalog_seasons": ["春", "夏", "秋", "冬", "四季"],
+        "style_options": list(STYLE_FILTER_OPTIONS),
         "last_order_date": (last_day or "")[:10] or None,
         "ai": sales_ai_status(),
     }
@@ -480,6 +616,7 @@ def _collect_factory_styles(conn, seasons: list[str], *, cutoff: date | None = N
             "season": row["season"],
             "cat1": (row["category"] or "").strip(),
             "cat2": (row["subcategory"] or "").strip(),
+            "series": (row["series"] or "").strip(),
             "plan": category_plan(row["category"]),
             "material": mat_label,
             "material_short": material_short(mat_label),
@@ -590,15 +727,69 @@ def _collect_factory_styles(conn, seasons: list[str], *, cutoff: date | None = N
     }
 
 
+def _own_structural_hints(st: dict) -> tuple[str, list[str]]:
+    """Fuse ERP subcategory/series with catalog tags to correct mislabeled necklines (e.g. hoodie -> 连帽)."""
+    cat2 = (st.get("cat2") or "").strip()
+    series = (st.get("series") or "").strip()
+    rec: ImageRecord | None = st.get("record")
+    tag_neck = (rec.tags.领型 if rec else "") or ""
+    desc = (rec.tags.一句话描述 if rec else "") or ""
+    details = list(rec.tags.细节元素) if rec else []
+    erp_text = f"{cat2} {series}".strip()
+
+    effective_neck = tag_neck
+    if any(k in erp_text or k in desc or k in details for k in ("连帽", "帽衫", "带帽", "卫衣帽")):
+        effective_neck = "连帽"
+    elif any(k in cat2 for k in ("半高领", "中领")):
+        effective_neck = "半高领"
+    elif any(k in cat2 for k in ("高领", "堆堆领")):
+        effective_neck = "高领"
+    elif any(k in cat2 for k in ("POLO", "polo", "Polo", "翻领")):
+        effective_neck = "翻领"
+    elif any(k in cat2 for k in ("V领", "v领")):
+        effective_neck = "V领"
+    elif "圆领" in cat2 and tag_neck in {"", "其他", "未判断"}:
+        effective_neck = "圆领"
+
+    hints: list[str] = []
+    if cat2:
+        hints.append(f"ERP细分:{cat2}")
+    if series and series != cat2:
+        hints.append(f"系列:{series}")
+    if effective_neck and effective_neck != tag_neck and effective_neck not in {"", "其他", "未判断"}:
+        hints.append(f"结构校正:{effective_neck}")
+    return effective_neck, hints
+
+
+def _cand_effective_neckline(rec: ImageRecord) -> str:
+    desc = (rec.tags.一句话描述 or "").strip()
+    details = rec.tags.细节元素 or []
+    if "连帽" in details or any(k in desc for k in ("连帽", "帽衫", "带帽", "卫衣帽")):
+        return "连帽"
+    return (rec.tags.领型 or "").strip()
+
+
+def _is_busy_pattern(rec: ImageRecord) -> tuple[bool, str]:
+    pat = (rec.tags.图案 or "").strip()
+    desc = (rec.tags.一句话描述 or "").strip()
+    if pat in BUSY_PATTERNS:
+        return True, f"图案为「{pat}」"
+    for kw in BUSY_DESC_KEYWORDS:
+        if kw in desc:
+            return True, f"描述含花纹词「{kw}」"
+    return False, ""
+
+
 def _serialize_style_card(st: dict) -> dict:
     rec: ImageRecord | None = st["record"]
+    effective_neck, structural_hints = _own_structural_hints(st)
     tags_dict = {}
     if rec:
         tags_dict = {
             "品类": rec.tags.品类,
             "风格": rec.tags.风格,
             "版型": rec.tags.版型,
-            "领型": rec.tags.领型,
+            "领型": effective_neck or rec.tags.领型,
             "袖型": rec.tags.袖型,
             "颜色主色调": rec.tags.颜色主色调,
             "图案": rec.tags.图案,
@@ -613,6 +804,9 @@ def _serialize_style_card(st: dict) -> dict:
         "image_url": _thumb_url(rec),
         "season": st["season"],
         "category": st["cat1"] or st["plan"],
+        "cat2": st.get("cat2") or "",
+        "series": st.get("series") or "",
+        "structural_hints": structural_hints,
         "plan": st["plan"],
         "material": st["material"],
         "material_short": st["material_short"],
@@ -662,7 +856,10 @@ def _compute_dimension_tables(style_list: list[dict]) -> list[dict]:
                     for el in elems:
                         buckets[el].append(s)
                 else:
-                    val = getattr(rec.tags, key, "") or "其他"
+                    if key == "领型":
+                        val = _own_structural_hints(s)[0] or "其他"
+                    else:
+                        val = getattr(rec.tags, key, "") or "其他"
                     if val in {"其他", "未判断", "待归类"}:
                         continue
                     buckets[val].append(s)
@@ -920,7 +1117,12 @@ def run_attribution_ai(conn, filters: AttributionFilters, *, force: bool = False
 
 
 # ---------------------------------------------------------------- Module 2: External Selection Funnel
-def _tag_similarity_and_diffs(cand: ImageRecord, own: ImageRecord) -> tuple[float, list[str], list[str]]:
+def _tag_similarity_and_diffs(
+    cand: ImageRecord,
+    own: ImageRecord,
+    *,
+    own_neck_override: str = "",
+) -> tuple[float, list[str], list[str]]:
     """Return (0..1 tag overlap ratio, matched_genes, diff_points) between external candidate and an own-factory style."""
     matched: list[str] = []
     diffs: list[str] = []
@@ -935,9 +1137,14 @@ def _tag_similarity_and_diffs(cand: ImageRecord, own: ImageRecord) -> tuple[floa
         ("颜色主色调", 0.8),
         ("面料", 0.8),
     ]
+    cand_neck = _cand_effective_neckline(cand)
     for field_name, w in weights:
-        cv = getattr(cand.tags, field_name, "") or ""
-        ov = getattr(own.tags, field_name, "") or ""
+        if field_name == "领型":
+            cv = cand_neck
+            ov = own_neck_override or (own.tags.领型 or "")
+        else:
+            cv = getattr(cand.tags, field_name, "") or ""
+            ov = getattr(own.tags, field_name, "") or ""
         if cv in {"", "其他", "未判断", "待归类"} or ov in {"", "其他", "未判断", "待归类"}:
             continue
         total_w += w
@@ -974,7 +1181,7 @@ def _build_empirical_lift(cat_styles: list[dict]) -> dict[str, dict[str, float]]
     for field_name in ("领型", "版型", "风格", "图案", "颜色主色调", "面料"):
         groups = defaultdict(list)
         for s in imaged:
-            val = getattr(s["record"].tags, field_name, "") or ""
+            val = _own_structural_hints(s)[0] if field_name == "领型" else (getattr(s["record"].tags, field_name, "") or "")
             if val and val not in {"其他", "未判断", "待归类"}:
                 groups[val].append(s)
         for val, grp in groups.items():
@@ -1009,7 +1216,7 @@ def _scan_external_trends(candidates: list[ImageRecord]) -> dict:
     }
     for rec in candidates:
         for k in ("领型", "版型", "图案", "风格", "颜色主色调"):
-            v = getattr(rec.tags, k, "")
+            v = _cand_effective_neckline(rec) if k == "领型" else getattr(rec.tags, k, "")
             if v and v not in {"其他", "未判断", "待归类"}:
                 counters[k][v] += 1
         for d in rec.tags.细节元素 or []:
@@ -1029,7 +1236,17 @@ def _selection_cache_key(snapshot: str) -> str:
     return f"sel_{snapshot[:32]}"
 
 
-def build_selection_preview(conn, filters: SelectionFilters) -> dict:
+def _resolve_target_hero(target_code: str, cat_own: list[dict], all_own: list[dict]) -> dict | None:
+    if not target_code:
+        return None
+    for pool in (cat_own, all_own):
+        for s in pool:
+            if s["code"] == target_code or s["style_code"] == target_code:
+                return s
+    return None
+
+
+def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, list[dict], dict | None, list[dict], dict[str, ImageRecord]]:
     bundle = _collect_factory_styles(conn, filters.seasons, include_brand=filters.include_brand)
     all_own = list(bundle["styles"].values())
     cat_own = [s for s in all_own if filters.category in {"全部", "全部品类"} or s["plan"] == filters.category]
@@ -1039,51 +1256,98 @@ def build_selection_preview(conn, filters: SelectionFilters) -> dict:
         key=lambda x: (-x["qty"], -x["rep_qty"], x["code"]),
     )
 
-    # Filter external pool
-    ext_pool = [
+    hero_ranked = sorted(
+        imaged_own,
+        key=lambda x: (0 if x["is_winner"] else 1, -x["qty"], -x["rep_qty"], x["code"]),
+    )[:24]
+    hero_styles = [_serialize_style_card(s) for s in hero_ranked]
+
+    target_hero = _resolve_target_hero(filters.target_style_code, cat_own, all_own)
+    target_hero_card = _serialize_style_card(target_hero) if target_hero else None
+    target_hero_neck = _own_structural_hints(target_hero)[0] if target_hero else ""
+    target_hero_is_busy = bool(
+        target_hero and target_hero.get("record") and _is_busy_pattern(target_hero["record"])[0]
+    )
+
+    # Filter external pool by source, category, catalog season
+    ext_pool_cat = [
         r for r in bundle["external_records"]
         if r.source_category in filters.sources
         and _matches_category_plan(r, filters.category)
         and (not filters.catalog_seasons or r.tags.季节 in filters.catalog_seasons)
     ]
-    trend_radar = _scan_external_trends(ext_pool)
+    trend_radar = _scan_external_trends(ext_pool_cat)
     lifts = _build_empirical_lift(cat_own)
 
-    # Recommended top yarns in this category for advice context
     mat_dims = _compute_dimension_tables(cat_own)[0]["rows"][:4]
     top_yarns = [
         {"material": r["label"], "sku": r["sku"], "winner_rate": r["winner_rate"], "avg_quantity": r["avg_quantity"]}
         for r in mat_dims
     ]
 
-    # Gate 1 (near-duplicate filter) + Gate 2 (Gene + Sweet-Spot Novelty scoring)
-    own_hashes: dict[str, int | None] = {s["code"]: _dhash64(s["record"]) for s in imaged_own}
+    decisions = load_decisions()
+    excluded_ids = set(filters.exclude_record_ids)
+    if filters.skip_rejected:
+        for rid, dec in decisions.items():
+            if dec.get("status") == "rejected":
+                excluded_ids.add(rid)
+
+    own_necks: dict[str, str] = {s["code"]: _own_structural_hints(s)[0] for s in imaged_own}
+    own_fps: dict[str, tuple[int | None, str | None, tuple[int, ...] | None]] = {}
+    if imaged_own:
+        with ThreadPoolExecutor(max_workers=min(8, len(imaged_own)), thread_name_prefix="sales-own-fp") as pool:
+            fp_list = list(pool.map(lambda s: _image_fingerprints(s["record"]), imaged_own))
+        own_fps = {s["code"]: fp for s, fp in zip(imaged_own, fp_list)}
+
     trend_top_details = {
         item["label"]
         for h in trend_radar["highlights"] if h["dimension"] == "细节元素"
         for item in h["top"][:3]
     }
 
-    duplicate_filtered: list[dict] = []
-    scored_candidates: list[dict] = []
+    own_duplicate_filtered: list[dict] = []
+    offtone_filtered: list[dict] = []
+    skipped_seen_count = 0
+    style_filtered_count = 0
+    raw_scored: list[tuple[dict, ImageRecord]] = []
+    ext_rec_map: dict[str, ImageRecord] = {r.id: r for r in ext_pool_cat}
+    for s in imaged_own:
+        if s["record"] is not None:
+            ext_rec_map[s["record"].id] = s["record"]
+    if target_hero and target_hero.get("record") is not None:
+        ext_rec_map[target_hero["record"].id] = target_hero["record"]
 
-    for rec in ext_pool:
-        # Compare against all imaged own-factory styles in category for collision check
+    for rec in ext_pool_cat:
+        if filters.styles and (rec.tags.风格 or "") not in filters.styles:
+            style_filtered_count += 1
+            continue
+        if filters.exclude_busy_patterns and not target_hero_is_busy:
+            busy, busy_reason = _is_busy_pattern(rec)
+            if busy:
+                offtone_filtered.append({
+                    "record_id": rec.id,
+                    "image_url": _thumb_url(rec),
+                    "source_category": rec.source_category,
+                    "summary": rec.tags.一句话描述,
+                    "reason": f"风格花纹拦截：{busy_reason}",
+                })
+                continue
+
         closest_any = None
         max_any_sim = -1.0
         for own in imaged_own:
-            sim, _, _ = _tag_similarity_and_diffs(rec, own["record"])
+            sim, _, _ = _tag_similarity_and_diffs(rec, own["record"], own_neck_override=own_necks.get(own["code"], ""))
             if sim > max_any_sim:
                 max_any_sim = sim
                 closest_any = own
 
-        # Gate 1A: near-identical visual perceptual hash check against top similar own styles
-        cand_hash: int | None = None
+        # Gate 1A: near-identical visual perceptual hash / exact byte check against own-factory style
         if max_any_sim >= 0.82 and closest_any is not None:
-            cand_hash = _dhash64(rec)
-            ham = _hamming(cand_hash, own_hashes.get(closest_any["code"]))
-            if ham <= 7:
-                duplicate_filtered.append({
+            cand_dhash, cand_sha, cand_rgb = _image_fingerprints(rec)
+            own_dhash, own_sha, own_rgb = own_fps.get(closest_any["code"], (None, None, None))
+            ham = _hamming(cand_dhash, own_dhash)
+            if (cand_sha and own_sha and cand_sha == own_sha) or (ham <= 7 and _rgb_close(cand_rgb, own_rgb)):
+                own_duplicate_filtered.append({
                     "record_id": rec.id,
                     "image_url": _thumb_url(rec),
                     "source_category": rec.source_category,
@@ -1094,7 +1358,7 @@ def build_selection_preview(conn, filters: SelectionFilters) -> dict:
                 continue
         # Gate 1B: 96%+ identical structured tag combination + same details
         if max_any_sim >= 0.96 and closest_any is not None:
-            duplicate_filtered.append({
+            own_duplicate_filtered.append({
                 "record_id": rec.id,
                 "image_url": _thumb_url(rec),
                 "source_category": rec.source_category,
@@ -1104,62 +1368,89 @@ def build_selection_preview(conn, filters: SelectionFilters) -> dict:
             })
             continue
 
-        # Gate 2A: Gene score (0..60)
+        # Gate 2A: Calibrated Gene score (0..60, wider dynamic range so fewer cards clamp at 100)
         field_weights = [("领型", 12.0), ("版型", 11.0), ("风格", 9.0), ("图案", 9.0), ("颜色主色调", 7.0), ("面料", 6.0)]
         raw_gene = 0.0
         gene_hits: list[str] = []
+        cand_neck = _cand_effective_neckline(rec)
         for fn, fw in field_weights:
-            val = getattr(rec.tags, fn, "") or ""
+            val = cand_neck if fn == "领型" else (getattr(rec.tags, fn, "") or "")
             lift = lifts.get(fn, {}).get(val, 0.85)
-            pts = fw * min(max(lift, 0.4), 1.65) / 1.35
+            pts = fw * min(max(lift, 0.4), 1.65) / 1.60
             raw_gene += pts
             if lift >= 1.12 and val not in {"", "其他", "未判断"}:
                 gene_hits.append(f"{val}(胜率×{lift:.1f})")
         det_lifts = [lifts.get("细节元素", {}).get(d, 0.9) for d in (rec.tags.细节元素 or [])]
         if det_lifts:
             best_det_lift = max(det_lifts)
-            raw_gene += 6.0 * min(best_det_lift, 1.7) / 1.35
+            raw_gene += 6.0 * min(best_det_lift, 1.7) / 1.60
             for d in rec.tags.细节元素 or []:
                 dl = lifts.get("细节元素", {}).get(d, 0.0)
                 if dl >= 1.15:
                     gene_hits.append(f"{d}(胜率×{dl:.1f})")
         gene_score = round(min(60.0, raw_gene), 1)
 
-        # Gate 2B: Sweet-spot Novelty score against closest own-factory WINNER (0..40)
+        # Gate 2B: Sweet-spot Novelty score anchored to target_hero (if chosen) or closest own winner
         best_winner = None
         best_win_sim = -1.0
         best_matched: list[str] = []
         best_diffs: list[str] = []
-        for w_own in own_winners[:15]:
-            sim, m_list, d_list = _tag_similarity_and_diffs(rec, w_own["record"])
-            if sim > best_win_sim:
-                best_win_sim = sim
-                best_winner = w_own
-                best_matched = m_list
-                best_diffs = d_list
+        if target_hero is not None and target_hero.get("record") is not None:
+            best_winner = target_hero
+            best_win_sim, best_matched, best_diffs = _tag_similarity_and_diffs(
+                rec, target_hero["record"], own_neck_override=target_hero_neck,
+            )
+        else:
+            for w_own in own_winners[:15]:
+                sim, m_list, d_list = _tag_similarity_and_diffs(
+                    rec, w_own["record"], own_neck_override=own_necks.get(w_own["code"], ""),
+                )
+                if sim > best_win_sim:
+                    best_win_sim = sim
+                    best_winner = w_own
+                    best_matched = m_list
+                    best_diffs = d_list
 
         diff_count = len(best_diffs)
-        # Sweet spot: similarity 0.45..0.82 AND 1..3 concrete design modifications
         if 0.48 <= best_win_sim <= 0.82 and 1 <= diff_count <= 3:
-            novelty_score = 34.0
+            novelty_score = 30.0
         elif 0.35 <= best_win_sim < 0.48 and diff_count >= 2:
-            novelty_score = 26.0
+            novelty_score = 24.0
         elif best_win_sim > 0.82:
-            novelty_score = 14.0  # slightly too close to existing winner
+            novelty_score = 12.0
         else:
-            novelty_score = 18.0
+            novelty_score = 16.0
 
-        # Bonus if candidate incorporates an in-library brand trend detail or rich design notes
         trend_hits = [d for d in (rec.tags.细节元素 or []) if d in trend_top_details]
         if trend_hits:
-            novelty_score += 4.0
+            novelty_score += 3.5
         if rec.notes.text():
-            novelty_score += 2.0
+            novelty_score += 1.5
+        # Structural alignment bonus when targeting a specific hero style (e.g. hoodie -> hoodie/related neckline)
+        if target_hero is not None and target_hero_neck and target_hero_neck not in {"其他", "未判断"}:
+            if cand_neck == target_hero_neck:
+                novelty_score += 6.0
         novelty_score = round(min(40.0, novelty_score), 1)
 
-        total_score = round(gene_score + novelty_score, 1)
+        # Tone-clash penalty against minimalist/neutral reference winners
+        penalty = 0.0
+        ref_rec = best_winner["record"] if best_winner and best_winner.get("record") else None
+        if ref_rec is not None:
+            ref_pat = (ref_rec.tags.图案 or "").strip()
+            cand_pat = (rec.tags.图案 or "").strip()
+            if (
+                ref_pat == "纯色/无明显图案"
+                and cand_pat not in {"纯色/无明显图案", "条纹", "格子", "未判断", ""}
+                and (rec.tags.颜色主色调 or "") in BOLD_COLORS
+                and (ref_rec.tags.颜色主色调 or "") in NEUTRAL_COLORS
+            ):
+                penalty += 12.0
+            if (ref_rec.tags.风格 or "") in {"极简", "通勤"} and (rec.tags.风格 or "") in {"甜美", "街头", "运动"}:
+                penalty += 7.0
+
+        total_score = round(max(15.0, min(98.0, gene_score + novelty_score - penalty)), 1)
         ref_card = _serialize_style_card(best_winner) if best_winner else None
-        scored_candidates.append({
+        cand_obj = {
             "record_id": rec.id,
             "image_url": _thumb_url(rec),
             "source_category": rec.source_category,
@@ -1169,7 +1460,7 @@ def build_selection_preview(conn, filters: SelectionFilters) -> dict:
                 "风格": rec.tags.风格,
                 "季节": rec.tags.季节,
                 "版型": rec.tags.版型,
-                "领型": rec.tags.领型,
+                "领型": cand_neck or rec.tags.领型,
                 "袖型": rec.tags.袖型,
                 "颜色主色调": rec.tags.颜色主色调,
                 "图案": rec.tags.图案,
@@ -1188,26 +1479,97 @@ def build_selection_preview(conn, filters: SelectionFilters) -> dict:
             "reference_winner": ref_card,
             "closest_any_code": closest_any["code"] if closest_any else "",
             "closest_any_sim": round(max_any_sim, 2) if closest_any else 0.0,
-        })
+        }
+        raw_scored.append((cand_obj, rec))
 
-    scored_candidates.sort(key=lambda c: (-c["total_score"], -c["gene_score"], c["record_id"]))
+    raw_scored.sort(key=lambda pair: (-pair[0]["total_score"], -pair[0]["gene_score"], pair[0]["record_id"]))
+
+    # Gate 1C: External-vs-External visual deduplication across canonical score order
+    # (run BEFORE skipping excluded_ids so duplicate siblings never resurface in Batch 2+!)
+    dedup_window = min(len(raw_scored), len(excluded_ids) + max(filters.scan_limit + 64, filters.pool_size * 3))
+    window_fps: list[tuple[int | None, str | None, tuple[int, ...] | None]] = []
+    if dedup_window > 0:
+        window_recs = [pair[1] for pair in raw_scored[:dedup_window]]
+        if dedup_window > 8:
+            with ThreadPoolExecutor(max_workers=8, thread_name_prefix="sales-ext-fp") as pool:
+                window_fps = list(pool.map(_image_fingerprints, window_recs))
+        else:
+            window_fps = [_image_fingerprints(r) for r in window_recs]
+
+    ext_duplicate_filtered: list[dict] = []
+    scored_candidates: list[dict] = []
+    kept_shas: set[str] = set()
+    kept_visuals: list[tuple[int, tuple[int, ...] | None]] = []
+    kept_text_keys: set[tuple[str, str]] = set()
+
+    for idx, (cand_obj, rec) in enumerate(raw_scored):
+        text_key = ((rec.source.source_file or "").strip(), (rec.tags.一句话描述 or "").strip())
+        is_dup = False
+        dup_reason = ""
+        if idx < dedup_window:
+            dhash, sha, rgb_sig = window_fps[idx]
+            if sha and sha in kept_shas:
+                is_dup = True
+                dup_reason = "与外部图库另一张候选图完全相同，自动去重"
+            elif dhash is not None and any(_hamming(dhash, kh) <= 6 and _rgb_close(rgb_sig, k_rgb) for kh, k_rgb in kept_visuals):
+                is_dup = True
+                dup_reason = "与外部图库另一张候选图画面高度重合（重复上传/同款同图），自动去重"
+            elif text_key[0] and text_key[1] and text_key in kept_text_keys:
+                is_dup = True
+                dup_reason = "与外部图库另一条同文件同描述候选重复，自动去重"
+            if not is_dup:
+                if sha:
+                    kept_shas.add(sha)
+                if dhash is not None:
+                    kept_visuals.append((dhash, rgb_sig))
+        elif text_key[0] and text_key[1] and text_key in kept_text_keys:
+            is_dup = True
+            dup_reason = "与外部图库已有候选重复，自动去重"
+
+        if is_dup:
+            ext_duplicate_filtered.append({
+                "record_id": rec.id,
+                "image_url": _thumb_url(rec),
+                "source_category": rec.source_category,
+                "summary": rec.tags.一句话描述,
+                "matched_own_code": "外部图库重复",
+                "reason": dup_reason,
+            })
+            continue
+        if text_key[0] and text_key[1]:
+            kept_text_keys.add(text_key)
+        if rec.id in excluded_ids:
+            skipped_seen_count += 1
+            continue
+        scored_candidates.append(cand_obj)
+
+    scan_pool = scored_candidates[: filters.scan_limit]
     shortlist = scored_candidates[: filters.pool_size]
-
-    decisions = load_decisions()
     for item in shortlist:
         d = decisions.get(item["record_id"]) or {}
         item["decision"] = d.get("status", "none")
         item["decision_note"] = d.get("note", "")
 
+    all_duplicates = [*own_duplicate_filtered, *ext_duplicate_filtered]
+    scan_candidate_ids = [c["record_id"] for c in scan_pool]
+
     snapshot_payload = [
+        "v2-visual-screen",
         filters.seasons,
         filters.category,
         filters.sources,
         filters.catalog_seasons,
         filters.include_brand,
         filters.pool_size,
-        len(ext_pool),
-        [c["record_id"] for c in shortlist],
+        filters.target_style_code,
+        filters.exclude_busy_patterns,
+        filters.styles,
+        filters.scan_limit,
+        filters.skip_rejected,
+        len(filters.exclude_record_ids),
+        hashlib.sha256(",".join(filters.exclude_record_ids).encode()).hexdigest()[:12] if filters.exclude_record_ids else "",
+        len(scan_candidate_ids),
+        scan_candidate_ids[:48],
     ]
     snapshot = hashlib.sha256(json.dumps(snapshot_payload, ensure_ascii=False).encode()).hexdigest()
     cached_ai = _read_cached_json(_selection_cache_key(snapshot))
@@ -1217,7 +1579,7 @@ def build_selection_preview(conn, filters: SelectionFilters) -> dict:
             rec_item["decision"] = d.get("status", "none")
             rec_item["decision_note"] = d.get("note", "")
 
-    return {
+    preview = {
         "scope": {
             "seasons": filters.seasons,
             "category": filters.category,
@@ -1225,41 +1587,94 @@ def build_selection_preview(conn, filters: SelectionFilters) -> dict:
             "catalog_seasons": filters.catalog_seasons,
             "include_brand": filters.include_brand,
             "pool_size": filters.pool_size,
+            "target_style_code": target_hero["code"] if target_hero else filters.target_style_code,
+            "exclude_busy_patterns": filters.exclude_busy_patterns,
+            "styles": filters.styles,
+            "scan_limit": filters.scan_limit,
+            "exclude_record_ids_count": len(filters.exclude_record_ids),
+            "skip_rejected": filters.skip_rejected,
         },
+        "target_hero": target_hero_card,
+        "hero_styles": hero_styles,
         "funnel": {
-            "external_matched_category": len(ext_pool),
-            "gate1_duplicates_removed": len(duplicate_filtered),
+            "external_matched_category": len(ext_pool_cat),
+            "gate1_duplicates_removed": len(all_duplicates),
+            "gate1_own_duplicates_removed": len(own_duplicate_filtered),
+            "gate1_ext_duplicates_removed": len(ext_duplicate_filtered),
+            "gate1_offtone_removed": len(offtone_filtered),
+            "style_filtered_count": style_filtered_count,
+            "skipped_seen_count": skipped_seen_count,
             "gate2_scored_pool": len(scored_candidates),
+            "scan_pool_size": len(scan_pool),
+            "remaining_unscanned": max(0, len(scored_candidates) - len(scan_pool)),
             "gate3_shortlist": len(shortlist),
             "own_category_sku": len(cat_own),
             "own_winners_count": len(own_winners),
         },
         "trend_radar": trend_radar,
         "top_yarns": top_yarns,
-        "duplicate_samples": duplicate_filtered[:8],
+        "duplicate_samples": all_duplicates[:10],
+        "offtone_samples": offtone_filtered[:6],
+        "scan_candidate_ids": scan_candidate_ids,
         "shortlist": shortlist,
         "ai_selection": cached_ai,
         "ai_status": sales_ai_status(),
         "snapshot": snapshot,
     }
+    return preview, scan_pool, target_hero, own_winners, ext_rec_map
 
 
-SELECTION_PAIR_SYSTEM_PROMPT = """你是女装针织工厂的资深买手与研发总监，正在做【外部资料库微创新选款终审】。
-你会同时看到两张图：
+def build_selection_preview(conn, filters: SelectionFilters) -> dict:
+    preview, _, _, _, _ = _build_selection_context(conn, filters)
+    return preview
+
+
+CONTACT_SHEET_SYSTEM_PROMPT = """你是女装针织服装厂的首席买手与视觉选款总监，正在执行【4×4 编号拼图真视觉海选】。
+你会看到两张图：
+- 图 1：【本厂目标参照爆款原图】（单款参照原图，或 2×2 本厂主力爆款拼图）
+- 图 2：【外部候选图 4×4 编号网格图】（每格左上角有黑底白字编号 01..16）
+
+严厉选款铁律（务必以你肉眼看到的真实图片为准，绝不盲信可能出错的旧文字标签！）：
+1. 先肉眼精准读出【图 1 本厂参照款】的真实外观特征（领型，如连帽/帽衫、POLO翻领、V领、半高领、圆领；版型廓形；整体调性如极简气质/通勤/休闲；主色与图案克制程度），写在 hero_visual_read 中。
+2. 逐格审视【图 2】中的所有编号格子：
+   - 必须直接淘汰：大花卉/碎花/满身俗艳印花、高饱和土气花纹、明显跑偏的品类（如男装/裤子/连衣裙/童装）、与本厂参照款长得几乎一模一样的撞款、或网格里重复出现的同一件衣服。
+   - 重点精选：整体气质调性与本厂参照款高度契合（高级耐看、适合针织厂大货落地），同时在领口结构、局部绞花/提花/肌理、撞色边饰、门襟细节或版型比例上有【清晰微创新亮点】的格子！
+   - 若本轮锚定了特定本厂单款（例如连帽帽衫或翻领款），优先挑出同结构大类或能自然承接该款客群的微创新升级款。
+3. 每张网格图最多挑 4 个最值得进入 1v1 终审的格子（若整页质量差、花哨或跑偏居多，可只选 0–2 个，宁缺毋滥）。
+4. 每个文本字段精炼清晰（60 字以内，严禁在字符串内使用未转义英文双引号）。
+
+请只输出严格 JSON 对象：
+{
+  "hero_visual_read": "肉眼看到的本厂参照款真实领型（如连帽/翻领/圆领等）、版型与调性总结",
+  "picks": [
+    {
+      "slot": 1,
+      "visual_score": 88,
+      "quick_reason": "一眼看中的微创新亮点与气质契合原因"
+    }
+  ],
+  "rejected_summary": "本页主要淘汰了哪些花哨/跑偏/撞款类型（一句话）"
+}"""
+
+
+SELECTION_PAIR_SYSTEM_PROMPT = """你是女装针织工厂的资深买手与研发总监，正在做【外部资料库微创新选款 1v1 高清终审】。
+你会同时看到两张高清原图：
 - 图 1：【外部候选图】（来自网图趋势/品牌资料包/市调拍照）
-- 图 2：【本厂最相近历史参照款】（附真实销量、补单与材质数据）
+- 图 2：【本厂参照爆款原图】（附真实销量、补单、ERP细分与材质数据）
 
-老板的核心选款铁律：
-1. **撞款一票否决**：如果图 1 和图 2（或本厂已做款描述）在整体版型、领型、织法纹理、门襟结构上高度雷同，属于“本厂已经做过、没必要再重复开版”，请直接判 `"verdict": "too_similar"`！
-2. **有爆款基因 + 有微创新才入选**：入选款必须既承接本厂已验证能卖动的实穿骨架，又在局部有清晰可落地的微创新（例如领口结构变化、局部绞花/提花/镂空肌理升级、撞色门襟/边饰、假两件层次等），且适合针织工厂大货落地。
-3. 每个文本字段精炼清晰（控制在 80 字以内，不要在字符串值中使用未转义双引号）。
+老板的核心选款铁律（请一切以两张原图肉眼视觉为准，若旧文字标签有错如把帽衫标成圆领，直接以原图为准纠正！）：
+1. **撞款一票否决 (`"verdict": "too_similar"`)**：如果图 1 和图 2 在整体版型、领型、织法纹理、门襟结构上高度雷同，属于“本厂已经做过、没必要再重复开版”，请直接判 `"too_similar"`！
+2. **调性跑偏/花哨俗气一票否决 (`"verdict": "drop"`)**：如果图 1 是大花卉/碎花/满身乱印、高饱和土气印花、非针织/错误品类、或与本厂参照款的极简气质/实穿调性严重违和，请直接判 `"drop"` 并在 similarity_note 写明原因！
+3. **有爆款基因 + 有微创新才入选 (`"verdict": "recommend"`)**：入选款必须既承接本厂已验证能卖动的实穿骨架与气质调性，又在局部有清晰可落地的微创新（如领口结构变化、局部绞花/提花/镂空肌理、撞色门襟/边饰、假两件层次等），且适合针织工厂大货落地。
+4. 每个文本字段精炼清晰（控制在 80 字以内，不要在字符串值中使用未转义英文双引号）。
 
 请只返回严格 JSON 对象：
 {
   "verdict": "recommend" 或 "too_similar" 或 "drop",
   "tier": "稳妥走量款" 或 "趋势微创新款",
   "stars": 1到5的整数评分,
-  "similarity_note": "与本厂参照款的视觉对比判断（若判 too_similar 请写明哪里太像）",
+  "hero_visual_note": "一句话确认图 2 本厂参照款的真实领型与气质（例如：确认本厂663315为深色连帽针织帽衫）",
+  "similarity_note": "与本厂参照款的视觉对比判断（若判 too_similar 或 drop 请写明原因）",
   "gene_reason": "为什么判断它能卖好（承接了本厂哪条高胜率基因，结合参照款表现说明）",
   "novelty_point": "相比本厂老款的具体微创新改动点（老板打版时要保留的核心亮点）",
   "yarn_and_price_advice": "建议搭配的本厂高胜率纱线及目标客单价带",
@@ -1268,10 +1683,9 @@ SELECTION_PAIR_SYSTEM_PROMPT = """你是女装针织工厂的资深买手与研�
 
 
 def run_selection_ai(conn, filters: SelectionFilters, *, force: bool = False, client: SalesVisionClient | None = None) -> dict:
-    preview = build_selection_preview(conn, filters)
-    shortlist = preview["shortlist"]
-    if not shortlist:
-        raise SalesInsightError("当前筛选条件下没有符合品类的外部候选图片，请放宽来源或季节筛选。")
+    preview, scan_pool, target_hero, own_winners, rec_map = _build_selection_context(conn, filters)
+    if not scan_pool:
+        raise SalesInsightError("当前筛选条件下没有剩余未看的外部候选图片，请放宽筛选或重置到第 1 批。")
 
     cache_key = _selection_cache_key(preview["snapshot"])
     if not force:
@@ -1285,22 +1699,6 @@ def run_selection_ai(conn, filters: SelectionFilters, *, force: bool = False, cl
             preview["ai_selection"] = cached
             return preview
 
-    # Preload ImageRecords for candidates and their reference winners
-    needed_ids = set()
-    for item in shortlist:
-        needed_ids.add(item["record_id"])
-        ref = item.get("reference_winner")
-        if ref and ref.get("record_id"):
-            needed_ids.add(ref["record_id"])
-    rec_map: dict[str, ImageRecord] = {}
-    if needed_ids:
-        id_list = sorted(needed_ids)
-        for row in conn.execute(f"SELECT id, payload FROM records WHERE id IN ({_marks(id_list)})", id_list):
-            try:
-                rec_map[row["id"]] = ImageRecord.model_validate_json(row["payload"])
-            except Exception:
-                pass
-
     yarns_hint = "；".join(
         f"{y['material']}(爆款率{y['winner_rate']:.0%}, 均量{y['avg_quantity']}件)"
         for y in preview["top_yarns"]
@@ -1309,45 +1707,177 @@ def run_selection_ai(conn, filters: SelectionFilters, *, force: bool = False, cl
     own_client = client is None
     llm = client or SalesVisionClient()
     try:
+        hero_visual_read = ""
+        contact_sheets_count = 0
+        stage1_picked_count = 0
+        stage1_rejected_notes: list[str] = []
+        pipeline_mode = "direct_1v1"
+
+        # Stage 1: True-Visual 4x4 Contact-Sheet Screening when scan_pool has >= 5 candidates
+        if len(scan_pool) >= 5:
+            pipeline_mode = "two_stage_contact_sheet"
+            if target_hero and target_hero.get("record") is not None:
+                hero_pairs = [(target_hero["code"], target_hero["record"])]
+                t_hints = "、".join(_own_structural_hints(target_hero)[1])
+                hero_brief = (
+                    f"【定向锚定本厂单款 {target_hero['code']}】等级={target_hero['grade']} | "
+                    f"销量={target_hero['qty']:,}件（补单{target_hero['rep_qty']:,}件）| "
+                    f"材质={target_hero['material']} | ERP信息={t_hints or '无'}。"
+                    "请重点先用肉眼确认图 1 的真实领型与结构（例如是否连帽帽衫/翻领/V领等），再挑选同调性微创新升级款！"
+                )
+            else:
+                top_heroes = [w for w in own_winners[:4] if w.get("record") is not None]
+                hero_pairs = [(w["code"], w["record"]) for w in top_heroes]
+                hero_brief = (
+                    f"【全品类主力爆款 2×2 参照板（品类：{filters.category}）】"
+                    + "；".join(
+                        f"{w['code']}({w['grade']}级/{w['qty']:,}件/{w['material_short']})"
+                        for w in top_heroes
+                    )
+                )
+            hero_url = _make_hero_reference_image(hero_pairs)
+
+            chunks = [scan_pool[i:i + 16] for i in range(0, len(scan_pool), 16)]
+            contact_sheets_count = len(chunks)
+            tone_rule = (
+                "本轮要求严格排除大花卉/碎花/满身花纹与俗艳土气印花，确保实穿耐看。"
+                if filters.exclude_busy_patterns
+                else "允许合理花纹图案，但仍需高级耐看且适合大货针织落地。"
+            )
+            style_rule = f"限定风格偏好：{'、'.join(filters.styles)}。" if filters.styles else ""
+
+            def screen_sheet(sheet_idx_chunk: tuple[int, list[dict]]) -> dict:
+                s_idx, chunk = sheet_idx_chunk
+                slot_pairs: list[tuple[int, ImageRecord]] = []
+                for slot_no, cand in enumerate(chunk, 1):
+                    rec = rec_map.get(cand["record_id"])
+                    if rec is not None:
+                        slot_pairs.append((slot_no, rec))
+                sheet_url = _make_contact_sheet(slot_pairs)
+                if not sheet_url:
+                    return {"hero_visual_read": "", "picks": [], "rejected_summary": ""}
+                blocks: list[dict] = [{
+                    "type": "text",
+                    "text": (
+                        f"目标品类：{filters.category} | 海选第 {s_idx + 1}/{len(chunks)} 页（共 {len(slot_pairs)} 格，编号 01..{len(slot_pairs):02d}）\n"
+                        f"{hero_brief}\n{tone_rule} {style_rule}\n"
+                        "请先用肉眼阅读图 1 本厂参照爆款，再从图 2 网格图中精选最值得进入 1v1 终审的 0–4 个编号格子。"
+                    ),
+                }]
+                if hero_url:
+                    blocks.append({"type": "image_url", "image_url": {"url": hero_url}})
+                blocks.append({"type": "image_url", "image_url": {"url": sheet_url}})
+                try:
+                    res = llm.ask_json(CONTACT_SHEET_SYSTEM_PROMPT, blocks, max_tokens=6144)
+                except Exception as exc:
+                    return {"error": str(exc), "hero_visual_read": "", "picks": [], "rejected_summary": ""}
+                picked_out = []
+                for raw_pick in (res.get("picks") or [])[:5]:
+                    try:
+                        slot = int(raw_pick.get("slot") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if 1 <= slot <= len(chunk):
+                        try:
+                            vscore = int(raw_pick.get("visual_score") or 80)
+                        except (TypeError, ValueError):
+                            vscore = 80
+                        picked_out.append({
+                            "cand": chunk[slot - 1],
+                            "visual_score": max(1, min(100, vscore)),
+                            "quick_reason": str(raw_pick.get("quick_reason") or "").strip(),
+                        })
+                return {
+                    "hero_visual_read": str(res.get("hero_visual_read") or "").strip(),
+                    "picks": picked_out,
+                    "rejected_summary": str(res.get("rejected_summary") or "").strip(),
+                }
+
+            with ThreadPoolExecutor(max_workers=min(8, len(chunks)), thread_name_prefix="sales-sheet") as pool:
+                sheet_results = list(pool.map(screen_sheet, list(enumerate(chunks))))
+
+            sheet_errors = [r["error"] for r in sheet_results if r.get("error")]
+            if len(sheet_errors) == len(sheet_results) and sheet_errors:
+                raise SalesInsightError(sheet_errors[0])
+
+            merged_picks: dict[str, dict] = {}
+            for sr in sheet_results:
+                if not hero_visual_read and sr.get("hero_visual_read"):
+                    hero_visual_read = sr["hero_visual_read"]
+                if sr.get("rejected_summary"):
+                    stage1_rejected_notes.append(sr["rejected_summary"])
+                for p in sr.get("picks") or []:
+                    cand = p["cand"]
+                    rid = cand["record_id"]
+                    prev_p = merged_picks.get(rid)
+                    if prev_p is None or p["visual_score"] > prev_p["visual_score"]:
+                        merged_picks[rid] = p
+
+            ordered_picks = sorted(
+                merged_picks.values(),
+                key=lambda p: (-p["visual_score"], -p["cand"]["total_score"], p["cand"]["record_id"]),
+            )
+            stage1_picked_count = len(ordered_picks)
+            stage2_pool: list[dict] = []
+            for p in ordered_picks[: filters.pool_size]:
+                stage2_pool.append({
+                    **p["cand"],
+                    "visual_screen_score": p["visual_score"],
+                    "visual_screen_reason": p["quick_reason"],
+                })
+            # If every single sheet rejected all tiles, inspect top 4 in Stage 2 so the user still gets transparent verdicts
+            if not stage2_pool:
+                stage2_pool = list(scan_pool[: min(4, filters.pool_size)])
+        else:
+            stage2_pool = list(scan_pool[: filters.pool_size])
+
+        # Stage 2: High-Resolution 1v1 Side-by-Side Deep Review
         def review_one(cand: dict) -> dict:
             cand_rec = rec_map.get(cand["record_id"])
             ref = cand.get("reference_winner")
             ref_rec = rec_map.get(ref["record_id"]) if ref and ref.get("record_id") else None
+            ref_hints = "、".join(ref.get("structural_hints") or []) if ref else ""
+            screen_hint = f"\n海选阶段视觉初评：{cand['visual_screen_reason']}" if cand.get("visual_screen_reason") else ""
             blocks: list[dict] = [{
                 "type": "text",
                 "text": (
                     f"目标品类：{filters.category} | 本厂该品类高胜率主力纱线参考：{yarns_hint}\n"
-                    f"【图 1：外部候选款】来源={cand['source_category']} | AI标签={cand['tags']['一句话描述']} | "
-                    f"细节={','.join(cand['tags']['细节元素']) or '无'} | 资料备注={cand['notes_text'] or '无'}\n"
-                    f"初筛命中基因：{', '.join(cand['gene_hits']) or '基础实穿骨架'} | 初筛差异点：{'; '.join(cand['diff_points']) or '待视觉复核'}"
+                    f"【图 1：外部候选款】来源={cand['source_category']} | 旧标签仅供参考={cand['tags']['一句话描述']} | "
+                    f"细节={','.join(cand['tags']['细节元素']) or '无'} | 资料备注={cand['notes_text'] or '无'}{screen_hint}\n"
+                    f"（请严格以两张原图肉眼视觉为准，若图 1 出现大花卉/满身杂乱印花/错误品类或与图 2 调性违和，直接判 drop！）"
                 ),
             }]
-            cand_url = _record_data_url(cand_rec) if cand_rec else None
+            cand_url = _record_data_url(cand_rec, max_side=560) if cand_rec else None
             if cand_url:
                 blocks.append({"type": "image_url", "image_url": {"url": cand_url}})
             if ref:
                 blocks.append({
                     "type": "text",
                     "text": (
-                        f"【图 2：本厂最相近历史参照款 {ref['code']}】等级={ref['grade']} | {ref['winner_type']} | "
+                        f"【图 2：本厂参照爆款 {ref['code']}】等级={ref['grade']} | {ref['winner_type']} | "
                         f"销量={ref['quantity']:,}件（补单{ref['replenishment']:,}件，客户{ref['customer_count']}家）| "
-                        f"材质={ref['material']} | 单价=¥{ref['unit_price']} | 标签={ref['tags'].get('一句话描述', '')}"
+                        f"材质={ref['material']} | 单价=¥{ref['unit_price']} | ERP信息={ref_hints or '无'} | "
+                        f"旧标签仅供参考={ref['tags'].get('一句话描述', '')}"
                     ),
                 })
-                ref_url = _record_data_url(ref_rec) if ref_rec else None
+                ref_url = _record_data_url(ref_rec, max_side=560) if ref_rec else None
                 if ref_url:
                     blocks.append({"type": "image_url", "image_url": {"url": ref_url}})
-            res = llm.ask_json(SELECTION_PAIR_SYSTEM_PROMPT, blocks, max_tokens=1200)
+            res = llm.ask_json(SELECTION_PAIR_SYSTEM_PROMPT, blocks, max_tokens=6144)
             verdict = str(res.get("verdict") or "recommend").strip().lower()
             if verdict not in {"recommend", "too_similar", "drop"}:
                 verdict = "recommend"
-            stars = int(res.get("stars") or 4)
+            try:
+                stars = int(res.get("stars") or 4)
+            except (TypeError, ValueError):
+                stars = 4
             stars = max(1, min(5, stars))
             return {
                 **cand,
                 "verdict": verdict,
                 "tier": str(res.get("tier") or "趋势微创新款").strip(),
                 "stars": stars,
+                "hero_visual_note": str(res.get("hero_visual_note") or "").strip(),
                 "similarity_note": str(res.get("similarity_note") or "").strip(),
                 "gene_reason": str(res.get("gene_reason") or "").strip(),
                 "novelty_point": str(res.get("novelty_point") or "").strip(),
@@ -1355,13 +1885,21 @@ def run_selection_ai(conn, filters: SelectionFilters, *, force: bool = False, cl
                 "risk_note": str(res.get("risk_note") or "").strip(),
             }
 
-        with ThreadPoolExecutor(max_workers=min(4, len(shortlist)), thread_name_prefix="sales-select") as pool:
-            reviewed = list(pool.map(review_one, shortlist))
+        with ThreadPoolExecutor(max_workers=min(6, len(stage2_pool)), thread_name_prefix="sales-select") as pool:
+            reviewed = list(pool.map(review_one, stage2_pool))
+
+        if not hero_visual_read:
+            for r in reviewed:
+                if r.get("hero_visual_note"):
+                    hero_visual_read = r["hero_visual_note"]
+                    break
 
         recommended = [r for r in reviewed if r["verdict"] == "recommend"]
         rejected_similar = [r for r in reviewed if r["verdict"] == "too_similar"]
         dropped = [r for r in reviewed if r["verdict"] == "drop"]
-        recommended.sort(key=lambda r: (-r["stars"], -r["total_score"], r["record_id"]))
+        recommended.sort(
+            key=lambda r: (-r["stars"], -(r.get("visual_screen_score") or 0), -r["total_score"], r["record_id"])
+        )
 
         decisions = load_decisions()
         for r in recommended:
@@ -1372,6 +1910,13 @@ def run_selection_ai(conn, filters: SelectionFilters, *, force: bool = False, cl
         ai_payload = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "model": llm.label,
+            "pipeline_mode": pipeline_mode,
+            "hero_visual_read": hero_visual_read,
+            "visual_screened_count": len(scan_pool),
+            "contact_sheets_count": contact_sheets_count,
+            "stage1_picked_count": stage1_picked_count,
+            "stage1_rejected_summary": "；".join(stage1_rejected_notes[:2]),
+            "scanned_record_ids": [c["record_id"] for c in scan_pool],
             "reviewed_count": len(reviewed),
             "recommended_count": len(recommended),
             "rejected_similar_count": len(rejected_similar),
