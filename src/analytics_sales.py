@@ -1236,20 +1236,293 @@ def _selection_cache_key(snapshot: str) -> str:
     return f"sel_{snapshot[:32]}"
 
 
-def _resolve_target_hero(target_code: str, cat_own: list[dict], all_own: list[dict]) -> dict | None:
-    if not target_code:
-        return None
+def _plan_from_record(rec: ImageRecord) -> str:
+    for plan in CATEGORY_ORDER:
+        if _matches_category_plan(rec, plan):
+            return plan
+    return "长袖套衫"
+
+
+def _build_single_style_from_db(conn, row, rec: ImageRecord | None, *, lookup_source: str = "other_season") -> dict:
+    vcode = (row["variant_code"] or "").strip()
+    scode = (row["style_code"] or "").strip()
+    mat_group, mat_ab = material_group(row["material"])
+    mat_label = f"{mat_group}/AB" if mat_ab and mat_group != OTHER_MATERIAL else mat_group
+    qty = 0
+    amt = 0.0
+    rep_qty = 0
+    customers: dict[str, int] = defaultdict(int)
+    rep_customers: set[str] = set()
+    color_qty: dict[str, int] = defaultdict(int)
+    for orow in conn.execute(
+        "SELECT color, quantity, amount, order_kind, customer, customer_raw FROM style_order_lines WHERE variant_code = ?",
+        (vcode,),
+    ):
+        q = int(orow["quantity"] or 0)
+        a = float(orow["amount"] or 0.0)
+        qty += q
+        amt += a
+        cust = (orow["customer_raw"] or "").strip() or (orow["customer"] or "").strip() or "未知客户"
+        customers[cust] += q
+        col = (orow["color"] or "").strip()
+        if col:
+            color_qty[col] += q
+        if (orow["order_kind"] or "") == "补单":
+            rep_qty += q
+            rep_customers.add(cust)
+    prod_hit = conn.execute("SELECT 1 FROM style_production WHERE variant_code = ? LIMIT 1", (vcode,)).fetchone()
+    produced = bool(prod_hit) or qty > 0
+    grade = grade_of(qty) if produced else NO_PRODUCTION
+    cust_n = len(customers)
+    top1_share = (max(customers.values()) / qty) if (qty > 0 and customers) else 0.0
+    is_winner = grade in {"S", "A", "B"} or (qty >= 500 and rep_qty >= 150 and cust_n >= 3)
+    if is_winner:
+        if cust_n >= 3 and rep_qty > 0 and top1_share < 0.70:
+            winner_type = "通吃复购款"
+        elif top1_share >= 0.70 or cust_n <= 2:
+            winner_type = "大客户包场款"
+        else:
+            winner_type = "稳健走量款"
+    else:
+        winner_type = ""
+    if color_qty:
+        top_col = max(color_qty.items(), key=lambda kv: kv[1])[0]
+        main_color = classify_color(_SPLIT_COLOR.split(top_col)[0].strip() or top_col)
+    elif rec:
+        main_color = rec.tags.颜色主色调
+    else:
+        main_color = "未填"
+    plan = category_plan(row["category"])
+    if plan not in CATEGORY_ORDER and rec is not None:
+        plan = _plan_from_record(rec)
+    return {
+        "code": vcode,
+        "style_code": scode or vcode,
+        "season": (row["season"] or "").strip(),
+        "cat1": (row["category"] or "").strip(),
+        "cat2": (row["subcategory"] or "").strip(),
+        "series": (row["series"] or "").strip(),
+        "plan": plan,
+        "material": mat_label,
+        "material_short": material_short(mat_label),
+        "material_raw": (row["material"] or "").strip(),
+        "needle": (row["needle"] or "").strip(),
+        "designer": (row["designer"] or "").strip() or "（未填）",
+        "colors": [],
+        "ctype": customer_type(vcode),
+        "record": rec,
+        "qty": qty,
+        "amt": amt,
+        "rep_qty": rep_qty,
+        "customers": customers,
+        "rep_customers": rep_customers,
+        "color_qty": color_qty,
+        "produced": produced,
+        "grade": grade,
+        "unit_price": round(amt / qty, 1) if qty > 0 else 0.0,
+        "price_band": _price_band(round(amt / qty, 1) if qty > 0 else 0.0),
+        "customer_count": cust_n,
+        "rep_customer_count": len(rep_customers),
+        "top1_customer_share": round(top1_share, 3),
+        "is_winner": is_winner,
+        "winner_type": winner_type,
+        "main_color_family": main_color,
+        "lookup_source": lookup_source,
+    }
+
+
+def _resolve_target_hero(
+    conn,
+    target_code: str,
+    cat_own: list[dict],
+    all_own: list[dict],
+    own_images: dict[str, ImageRecord],
+) -> tuple[dict | None, str]:
+    raw_q = (target_code or "").strip()
+    if not raw_q:
+        return None, ""
+    q_up = raw_q.upper()
+    own_img_ci: dict[str, ImageRecord] = {k.upper(): v for k, v in own_images.items()}
+
+    # 1. Exact match in current category or current seasons
     for pool in (cat_own, all_own):
         for s in pool:
-            if s["code"] == target_code or s["style_code"] == target_code:
-                return s
-    return None
+            if s["code"].upper() == q_up or s["style_code"].upper() == q_up:
+                notice = ""
+                if s["record"] is None:
+                    notice = f"已定位本厂款号 {s['code']}，但图库暂缺该款原图，建议先上传本厂产品图后再用 AI 视觉海选。"
+                return s, notice
+
+    # 2. Cross-season ERP lookup across all seasons
+    row = conn.execute(
+        "SELECT * FROM style_variants WHERE UPPER(variant_code) = ? OR UPPER(style_code) = ? ORDER BY season DESC LIMIT 1",
+        (q_up, q_up),
+    ).fetchone()
+    if row is not None:
+        vcode = (row["variant_code"] or "").strip()
+        scode = (row["style_code"] or "").strip()
+        rec = own_img_ci.get(scode.upper()) or own_img_ci.get(vcode.upper())
+        st = _build_single_style_from_db(conn, row, rec, lookup_source="other_season")
+        if rec is None:
+            return st, f"已跨季定位本厂款号 {st['code']}（{st['season']}），但图库暂缺原图，建议先上传本厂图。"
+        return st, f"已跨季定位本厂款号 {st['code']}（{st['season']} · {st['plan']}），将以该款原图作为视觉参照。"
+
+    # 3. Own-factory photo-only fallback (brand-new sample uploaded to 本厂产品 without ERP variant/orders)
+    rec = own_img_ci.get(q_up)
+    if rec is None and len(q_up) >= 4:
+        prefix_hits = [r for k, r in own_img_ci.items() if k.startswith(q_up)]
+        if len(prefix_hits) == 1:
+            rec = prefix_hits[0]
+    if rec is not None:
+        code = (rec.style_code or raw_q).strip()
+        plan = _plan_from_record(rec)
+        virtual_st = {
+            "code": code,
+            "style_code": code,
+            "season": rec.tags.季节 or "新样衣",
+            "cat1": rec.tags.品类 or plan,
+            "cat2": "",
+            "series": "",
+            "plan": plan,
+            "material": rec.tags.面料 or "针织",
+            "material_short": rec.tags.面料 or "针织",
+            "material_raw": "",
+            "needle": "",
+            "designer": "",
+            "colors": [],
+            "ctype": MARKET,
+            "record": rec,
+            "qty": 0,
+            "amt": 0.0,
+            "rep_qty": 0,
+            "customers": {},
+            "rep_customers": set(),
+            "color_qty": {},
+            "produced": False,
+            "grade": "新样衣",
+            "unit_price": 0.0,
+            "price_band": "未定价/无订单",
+            "customer_count": 0,
+            "rep_customer_count": 0,
+            "top1_customer_share": 0.0,
+            "is_winner": False,
+            "winner_type": "本厂图库新样",
+            "main_color_family": rec.tags.颜色主色调 or "未填",
+            "lookup_source": "gallery_only",
+        }
+        return virtual_st, f"已从本厂产品图库定位样衣 {code}（{plan}），将直接按其原图执行真视觉挑款。"
+
+    return None, f"未找到款号「{raw_q}」的本厂档案或图片，请核对款号（已暂按全品类爆款综合展示）。"
+
+
+def search_own_factory_styles(conn, query: str, *, limit: int = 12) -> list[dict]:
+    """Fast autocomplete search across ALL own-factory style codes (all seasons + gallery-only samples)."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    q_up = q.upper()
+    own_images, _ = _load_records(conn)
+    own_img_ci: dict[str, ImageRecord] = {k.upper(): v for k, v in own_images.items()}
+
+    like_pat = f"%{q_up}%"
+    variant_rows = conn.execute(
+        "SELECT variant_code, style_code, season, category, subcategory, material "
+        "FROM style_variants "
+        "WHERE UPPER(variant_code) LIKE ? OR UPPER(style_code) LIKE ? "
+        "ORDER BY season DESC LIMIT 120",
+        (like_pat, like_pat),
+    ).fetchall()
+
+    vcodes = sorted({(r["variant_code"] or "").strip() for r in variant_rows if (r["variant_code"] or "").strip()})
+    qty_map: dict[str, int] = {}
+    if vcodes:
+        for offset in range(0, len(vcodes), 100):
+            chunk = vcodes[offset:offset + 100]
+            for orow in conn.execute(
+                f"SELECT variant_code, COALESCE(SUM(quantity), 0) AS q FROM style_order_lines WHERE variant_code IN ({_marks(chunk)}) GROUP BY variant_code",
+                chunk,
+            ):
+                qty_map[orow["variant_code"]] = int(orow["q"] or 0)
+
+    merged: dict[str, dict] = {}
+    for r in variant_rows:
+        vcode = (r["variant_code"] or "").strip()
+        scode = (r["style_code"] or "").strip() or vcode
+        if not vcode or vcode.upper() in merged:
+            continue
+        rec = own_img_ci.get(scode.upper()) or own_img_ci.get(vcode.upper())
+        qty = qty_map.get(vcode, 0)
+        plan = category_plan(r["category"])
+        if plan not in CATEGORY_ORDER and rec is not None:
+            plan = _plan_from_record(rec)
+        mat_group, mat_ab = material_group(r["material"])
+        mat_label = f"{mat_group}/AB" if mat_ab and mat_group != OTHER_MATERIAL else mat_group
+        merged[vcode.upper()] = {
+            "code": vcode,
+            "style_code": scode,
+            "record_id": rec.id if rec else None,
+            "image_url": _thumb_url(rec),
+            "season": (r["season"] or "").strip(),
+            "plan": plan,
+            "cat2": (r["subcategory"] or "").strip(),
+            "material_short": material_short(mat_label),
+            "quantity": qty,
+            "grade": grade_of(qty) if qty > 0 else NO_PRODUCTION,
+            "summary": rec.tags.一句话描述 if rec else "",
+        }
+
+    # Include gallery-only own-factory photos not yet present in style_variants
+    for code_up, rec in own_img_ci.items():
+        if q_up not in code_up or code_up in merged:
+            continue
+        code = (rec.style_code or code_up).strip()
+        merged[code_up] = {
+            "code": code,
+            "style_code": code,
+            "record_id": rec.id,
+            "image_url": _thumb_url(rec),
+            "season": rec.tags.季节 or "新样衣",
+            "plan": _plan_from_record(rec),
+            "cat2": "",
+            "material_short": rec.tags.面料 or "针织",
+            "quantity": 0,
+            "grade": "新样衣",
+            "summary": rec.tags.一句话描述,
+        }
+
+    def rank_key(item: dict):
+        cu = item["code"].upper()
+        su = item["style_code"].upper()
+        exact = 0 if (cu == q_up or su == q_up) else (1 if (cu.startswith(q_up) or su.startswith(q_up)) else 2)
+        has_img = 0 if item["image_url"] else 1
+        return (exact, has_img, -item["quantity"], item["code"])
+
+    items = sorted(merged.values(), key=rank_key)
+    return items[: max(1, min(30, limit))]
 
 
 def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, list[dict], dict | None, list[dict], dict[str, ImageRecord]]:
     bundle = _collect_factory_styles(conn, filters.seasons, include_brand=filters.include_brand)
     all_own = list(bundle["styles"].values())
-    cat_own = [s for s in all_own if filters.category in {"全部", "全部品类"} or s["plan"] == filters.category]
+    initial_cat_own = [s for s in all_own if filters.category in {"全部", "全部品类"} or s["plan"] == filters.category]
+
+    target_hero, target_hero_notice = _resolve_target_hero(
+        conn, filters.target_style_code, initial_cat_own, all_own, bundle["own_images"],
+    )
+
+    # Auto-align target category when the searched style belongs to another concrete category
+    effective_category = filters.category
+    if (
+        target_hero is not None
+        and target_hero.get("plan") in CATEGORY_ORDER
+        and filters.category != "全部品类"
+        and target_hero["plan"] != filters.category
+    ):
+        effective_category = target_hero["plan"]
+        switch_note = f"已自动将目标品类切换为「{effective_category}」以匹配款号 {target_hero['code']}。"
+        target_hero_notice = f"{target_hero_notice} {switch_note}".strip() if target_hero_notice else switch_note
+
+    cat_own = [s for s in all_own if effective_category in {"全部", "全部品类"} or s["plan"] == effective_category]
     imaged_own = [s for s in cat_own if s["record"] is not None]
     own_winners = sorted(
         [s for s in imaged_own if s["is_winner"]] or sorted(imaged_own, key=lambda x: -x["qty"])[:8],
@@ -1262,18 +1535,19 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
     )[:24]
     hero_styles = [_serialize_style_card(s) for s in hero_ranked]
 
-    target_hero = _resolve_target_hero(filters.target_style_code, cat_own, all_own)
     target_hero_card = _serialize_style_card(target_hero) if target_hero else None
+    if target_hero_card is not None and not any(h["code"] == target_hero_card["code"] for h in hero_styles):
+        hero_styles.insert(0, target_hero_card)
     target_hero_neck = _own_structural_hints(target_hero)[0] if target_hero else ""
     target_hero_is_busy = bool(
         target_hero and target_hero.get("record") and _is_busy_pattern(target_hero["record"])[0]
     )
 
-    # Filter external pool by source, category, catalog season
+    # Filter external pool by source, effective_category, catalog season
     ext_pool_cat = [
         r for r in bundle["external_records"]
         if r.source_category in filters.sources
-        and _matches_category_plan(r, filters.category)
+        and _matches_category_plan(r, effective_category)
         and (not filters.catalog_seasons or r.tags.季节 in filters.catalog_seasons)
     ]
     trend_radar = _scan_external_trends(ext_pool_cat)
@@ -1556,12 +1830,12 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
     snapshot_payload = [
         "v2-visual-screen",
         filters.seasons,
-        filters.category,
+        effective_category,
         filters.sources,
         filters.catalog_seasons,
         filters.include_brand,
         filters.pool_size,
-        filters.target_style_code,
+        target_hero["code"] if target_hero else filters.target_style_code,
         filters.exclude_busy_patterns,
         filters.styles,
         filters.scan_limit,
@@ -1582,7 +1856,7 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
     preview = {
         "scope": {
             "seasons": filters.seasons,
-            "category": filters.category,
+            "category": effective_category,
             "sources": filters.sources,
             "catalog_seasons": filters.catalog_seasons,
             "include_brand": filters.include_brand,
@@ -1595,6 +1869,7 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
             "skip_rejected": filters.skip_rejected,
         },
         "target_hero": target_hero_card,
+        "target_hero_notice": target_hero_notice,
         "hero_styles": hero_styles,
         "funnel": {
             "external_matched_category": len(ext_pool_cat),
@@ -1699,6 +1974,7 @@ def run_selection_ai(conn, filters: SelectionFilters, *, force: bool = False, cl
             preview["ai_selection"] = cached
             return preview
 
+    effective_category = preview["scope"]["category"]
     yarns_hint = "；".join(
         f"{y['material']}(爆款率{y['winner_rate']:.0%}, 均量{y['avg_quantity']}件)"
         for y in preview["top_yarns"]
@@ -1729,7 +2005,7 @@ def run_selection_ai(conn, filters: SelectionFilters, *, force: bool = False, cl
                 top_heroes = [w for w in own_winners[:4] if w.get("record") is not None]
                 hero_pairs = [(w["code"], w["record"]) for w in top_heroes]
                 hero_brief = (
-                    f"【全品类主力爆款 2×2 参照板（品类：{filters.category}）】"
+                    f"【全品类主力爆款 2×2 参照板（品类：{effective_category}）】"
                     + "；".join(
                         f"{w['code']}({w['grade']}级/{w['qty']:,}件/{w['material_short']})"
                         for w in top_heroes
@@ -1759,7 +2035,7 @@ def run_selection_ai(conn, filters: SelectionFilters, *, force: bool = False, cl
                 blocks: list[dict] = [{
                     "type": "text",
                     "text": (
-                        f"目标品类：{filters.category} | 海选第 {s_idx + 1}/{len(chunks)} 页（共 {len(slot_pairs)} 格，编号 01..{len(slot_pairs):02d}）\n"
+                        f"目标品类：{effective_category} | 海选第 {s_idx + 1}/{len(chunks)} 页（共 {len(slot_pairs)} 格，编号 01..{len(slot_pairs):02d}）\n"
                         f"{hero_brief}\n{tone_rule} {style_rule}\n"
                         "请先用肉眼阅读图 1 本厂参照爆款，再从图 2 网格图中精选最值得进入 1v1 终审的 0–4 个编号格子。"
                     ),
@@ -1841,7 +2117,7 @@ def run_selection_ai(conn, filters: SelectionFilters, *, force: bool = False, cl
             blocks: list[dict] = [{
                 "type": "text",
                 "text": (
-                    f"目标品类：{filters.category} | 本厂该品类高胜率主力纱线参考：{yarns_hint}\n"
+                    f"目标品类：{effective_category} | 本厂该品类高胜率主力纱线参考：{yarns_hint}\n"
                     f"【图 1：外部候选款】来源={cand['source_category']} | 旧标签仅供参考={cand['tags']['一句话描述']} | "
                     f"细节={','.join(cand['tags']['细节元素']) or '无'} | 资料备注={cand['notes_text'] or '无'}{screen_hint}\n"
                     f"（请严格以两张原图肉眼视觉为准，若图 1 出现大花卉/满身杂乱印花/错误品类或与图 2 调性违和，直接判 drop！）"

@@ -442,9 +442,24 @@ export type SelectionFilters = {
   skip_rejected?: boolean
 }
 
+export type OwnStyleSearchHit = {
+  code: string
+  style_code: string
+  record_id: string | null
+  image_url: string | null
+  season: string
+  plan: string
+  cat2: string
+  material_short: string
+  quantity: number
+  grade: string
+  summary: string
+}
+
 export type SelectionReport = {
   scope: SelectionFilters & { exclude_record_ids_count?: number }
   target_hero: SalesStyleCard | null
+  target_hero_notice?: string
   hero_styles: SalesStyleCard[]
   funnel: {
     external_matched_category: number
@@ -526,6 +541,8 @@ export type CustomerInsightReport = {
 }
 
 export const salesOptions = () => request<SalesOptions>(base + '/sales/options')
+export const searchSalesStyles = (q: string, limit = 12) =>
+  request<{ items: OwnStyleSearchHit[] }>(`${base}/sales/styles/search?q=${encodeURIComponent(q)}&limit=${limit}`)
 export const previewSalesAttribution = (filters: AttributionFilters) =>
   request<AttributionReport>(base + '/sales/attribution/preview', jsonPost({ filters }))
 export const analyzeSalesAttribution = (filters: AttributionFilters, force = false) =>

@@ -29,7 +29,7 @@ from src.analytics_season import ExportScope, SeasonFilters, build_season_report
 from src.analytics_sales import (
     AttributionFilters, CustomerInsightFilters, DecisionUpdate, SalesInsightError, SelectionFilters,
     build_attribution_preview, build_customer_insights, build_selection_preview,
-    run_attribution_ai, run_selection_ai, sales_options, save_decision,
+    run_attribution_ai, run_selection_ai, sales_options, save_decision, search_own_factory_styles,
 )
 from src.analytics_sales_pdf import load_record_thumbs, render_attribution_pdf, render_selection_pdf, render_selection_xlsx
 from src.db import _load_env, mysql_config
@@ -446,6 +446,18 @@ def _load_attribution_export(conn, filters: AttributionFilters):
         if c.get("record_id")
     ]
     return report, load_record_thumbs(conn, ids)
+
+
+@router.get("/sales/styles/search", dependencies=[Depends(_require_access)])
+def sales_search_styles(q: str = "", limit: int = 12, request: Request = None):
+    if request is not None:
+        _throttle(request, "sales-style-search", 90)
+    q_clean = (q or "").strip()[:64]
+    if not q_clean:
+        return {"items": []}
+    with read_business_data() as conn:
+        items = _season_call(lambda: search_own_factory_styles(conn, q_clean, limit=max(1, min(30, limit))))
+    return {"items": items}
 
 
 @router.post("/sales/selection/preview", dependencies=[Depends(_require_access)])

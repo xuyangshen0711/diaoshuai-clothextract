@@ -472,3 +472,96 @@ def test_hoodie_taxonomy_ext_dedup_guardrail_hero_anchor_and_two_stage_contact_s
     assert len(ai_sel["scanned_record_ids"]) == 6
     assert ai_sel["recommended_count"] == 2
     assert ai_sel["recommendations"][0]["visual_screen_score"] == 93
+
+
+def test_style_code_search_cross_season_gallery_only_and_category_autoswitch(store, monkeypatch):
+    """Verify arbitrary style-code lookup: cross-season ERP, gallery-only new sample, auto category switch, and autocomplete API."""
+    monkeypatch.setenv("SITE_PASSWORD", SITE_SECRET)
+    monkeypatch.setenv("ANALYTICS_PASSWORD", ANALYTICS_SECRET)
+    analytics_api.ATTEMPTS.clear()
+
+    with catalog._database() as conn:
+        ensure_factory(conn)
+        conn.executemany(
+            "INSERT INTO style_variants (variant_code, style_code, customer, season, needle, series, category, "
+            "material, design_code, designer, craftsman, subcategory, colors_json, sizes_json, source_file, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                # Older season cardigan (NOT in 2026冬!)
+                ("551888", "551888", "本厂自有版本", "2025秋", "12针", "通勤", "长袖开衫", "2/42支50.50AB", "D88", "沈爱和", "王工", "V领开衫",
+                 json.dumps(["驼色"], ensure_ascii=False), '["M"]', "a.xlsx", "2025-09-01"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO style_order_lines VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                ("O88", "551888", "驼色", "M", 1800, 216000, "551888", "张总", "杭州张总", "", "订单", "2025-09-12", "小王", "开衫", "2025秋", "o.xlsx", "t"),
+            ],
+        )
+
+    img_dir = store / "raw_search"
+    cardigan_img = _make_img(img_dir, "551888.jpg", (180, 145, 110))
+    sample_img = _make_img(img_dir, "NEW901.jpg", (60, 75, 92))
+    ext_cardigan_img = _make_img(img_dir, "ext_card.jpg", (195, 168, 140), stripe=True)
+
+    catalog.save_catalog([
+        ImageRecord(
+            id="own_551888", image_path=cardigan_img, source_category="本厂产品", style_code="551888", review_status="approved",
+            source=SourceMeta(source_file="551888.jpg", source_type="image", location="上传图片"),
+            tags=FashionTags(品类="上衣>开衫", 风格="通勤", 季节="秋", 版型="宽松", 颜色主色调="卡其/驼色", 领型="V领", 袖型="长袖", 袖长="长袖", 面料="针织", 图案="纯色/无明显图案", 细节元素=["纽扣", "罗纹"], 一句话描述="驼色宽松V领针织开衫"),
+        ),
+        # Brand-new sample photo only (zero ERP variant rows!)
+        ImageRecord(
+            id="own_new901", image_path=sample_img, source_category="本厂产品", style_code="NEW901", review_status="approved",
+            source=SourceMeta(source_file="NEW901.jpg", source_type="image", location="上传图片"),
+            tags=FashionTags(品类="上衣>套衫", 风格="极简", 季节="冬", 版型="宽松", 颜色主色调="深蓝/藏青", 领型="连帽", 袖型="长袖", 袖长="长袖", 面料="针织", 图案="纯色/无明显图案", 细节元素=["连帽"], 一句话描述="藏青连帽宽松针织帽衫新样"),
+        ),
+        ImageRecord(
+            id="ext_card_1", image_path=ext_cardigan_img, source_category="网图趋势", review_status="approved",
+            source=SourceMeta(source_file="ext_card.jpg", source_type="image", location="上传图片"),
+            tags=FashionTags(品类="上衣>开衫", 风格="通勤", 季节="秋", 版型="宽松", 颜色主色调="米色", 领型="V领", 袖型="长袖", 袖长="长袖", 面料="针织", 图案="纯色/无明显图案", 细节元素=["纽扣", "绞花"], 一句话描述="米色绞花V领针织开衫"),
+        ),
+    ])
+
+    # 1. Cross-season cardigan lookup while sitting on 2026冬 + 长袖套衫 -> auto-switches to 长袖开衫!
+    with catalog.read_database() as conn:
+        pre_card = build_selection_preview(
+            conn,
+            SelectionFilters(seasons=["2026冬"], category="长袖套衫", target_style_code="551888"),
+        )
+    assert pre_card["target_hero"]["code"] == "551888"
+    assert pre_card["scope"]["category"] == "长袖开衫"
+    assert pre_card["hero_styles"][0]["code"] == "551888"
+    assert "长袖开衫" in pre_card["target_hero_notice"]
+    assert len(pre_card["shortlist"]) == 1 and pre_card["shortlist"][0]["record_id"] == "ext_card_1"
+
+    # 2. Gallery-only new sample lookup (no ERP rows)
+    with catalog.read_database() as conn:
+        pre_new = build_selection_preview(
+            conn,
+            SelectionFilters(seasons=["2026冬"], category="长袖套衫", target_style_code="new901"),
+        )
+    assert pre_new["target_hero"]["code"] == "NEW901"
+    assert pre_new["target_hero"]["grade"] == "新样衣"
+    assert "NEW901" in pre_new["target_hero_notice"]
+
+    # 3. Unknown style code returns clear friendly notice
+    with catalog.read_database() as conn:
+        pre_missing = build_selection_preview(
+            conn,
+            SelectionFilters(seasons=["2026冬"], category="长袖套衫", target_style_code="NOPE999"),
+        )
+    assert pre_missing["target_hero"] is None
+    assert "未找到款号" in pre_missing["target_hero_notice"]
+
+    # 4. Autocomplete endpoint /api/analytics/sales/styles/search
+    client = TestClient(api.app, base_url="https://localhost")
+    assert client.post("/api/login", json={"password": SITE_SECRET}).status_code == 200
+    assert client.post("/api/analytics/login", json={"password": ANALYTICS_SECRET}).status_code == 200
+    r1 = client.get("/api/analytics/sales/styles/search?q=5518")
+    assert r1.status_code == 200
+    assert r1.json()["items"][0]["code"] == "551888"
+    assert r1.json()["items"][0]["plan"] == "长袖开衫"
+    r2 = client.get("/api/analytics/sales/styles/search?q=NEW9")
+    assert r2.status_code == 200
+    assert r2.json()["items"][0]["code"] == "NEW901"

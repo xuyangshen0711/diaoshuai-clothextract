@@ -3,8 +3,8 @@ import { computed, ref, watch } from 'vue'
 import {
   analyzeSalesAttribution, analyzeSalesSelection, exportSalesAttributionPdf,
   exportSalesSelectionPdf, exportSalesSelectionXlsx, previewSalesAttribution,
-  previewSalesCustomers, previewSalesSelection, salesOptions, saveSalesDecision,
-  type AttributionReport, type CustomerInsightReport, type DecisionStatus,
+  previewSalesCustomers, previewSalesSelection, salesOptions, saveSalesDecision, searchSalesStyles,
+  type AttributionReport, type CustomerInsightReport, type DecisionStatus, type OwnStyleSearchHit,
   type SalesOptions, type SelectionCandidate, type SelectionReport,
 } from '../analyticsApi'
 
@@ -24,6 +24,11 @@ const catalogSeasons = ref<string[]>([])
 const poolSize = ref(12)
 const scanLimit = ref(128)
 const targetStyleCode = ref('')
+const styleSearchQuery = ref('')
+const styleSearchHits = ref<OwnStyleSearchHit[]>([])
+const styleSearchOpen = ref(false)
+const styleSearching = ref(false)
+let styleSearchTimer: number | null = null
 const excludeBusyPatterns = ref(true)
 const selectedStyles = ref<string[]>([])
 const excludedRecordIds = ref<string[]>([])
@@ -153,10 +158,64 @@ function toggleStyleFilter(st: string) {
 
 async function pickHeroStyle(code: string) {
   if (isBusy.value) return
+  styleSearchOpen.value = false
+  if (!code) styleSearchQuery.value = ''
   if (targetStyleCode.value === code && batchNumber.value === 1) return
   targetStyleCode.value = code
   resetSelectionBatch()
   await refreshCurrentMode()
+}
+
+function onStyleSearchInput() {
+  const q = styleSearchQuery.value.trim()
+  if (styleSearchTimer) window.clearTimeout(styleSearchTimer)
+  if (!q) {
+    styleSearchHits.value = []
+    styleSearchOpen.value = false
+    return
+  }
+  styleSearchOpen.value = true
+  styleSearchTimer = window.setTimeout(async () => {
+    styleSearching.value = true
+    try {
+      const res = await searchSalesStyles(q, 12)
+      styleSearchHits.value = res.items || []
+    } catch {
+      styleSearchHits.value = []
+    } finally {
+      styleSearching.value = false
+    }
+  }, 180)
+}
+
+async function chooseSearchedStyle(hit: OwnStyleSearchHit) {
+  if (isBusy.value) return
+  styleSearchQuery.value = hit.code
+  styleSearchOpen.value = false
+  targetStyleCode.value = hit.code
+  resetSelectionBatch()
+  await refreshCurrentMode()
+}
+
+async function submitStyleSearch() {
+  if (isBusy.value) return
+  const q = styleSearchQuery.value.trim()
+  styleSearchOpen.value = false
+  if (!q) {
+    if (targetStyleCode.value) {
+      targetStyleCode.value = ''
+      resetSelectionBatch()
+      await refreshCurrentMode()
+    }
+    return
+  }
+  targetStyleCode.value = q
+  resetSelectionBatch()
+  await refreshCurrentMode()
+}
+
+function closeStyleDropdownLater() {
+  window.setTimeout(() => { styleSearchOpen.value = false }, 180)
 }
 
 async function refreshCurrentMode() {
@@ -172,7 +231,16 @@ async function refreshCurrentMode() {
         include_brand: includeBrand.value,
       })
     } else if (props.mode === 'selection') {
-      selReport.value = await previewSalesSelection(buildSelectionPayload())
+      const res = await previewSalesSelection(buildSelectionPayload())
+      selReport.value = res
+      if (res.scope.category && res.scope.category !== category.value) {
+        category.value = res.scope.category
+      }
+      if (res.target_hero) {
+        targetStyleCode.value = res.target_hero.code
+      } else if (targetStyleCode.value && !res.target_hero) {
+        targetStyleCode.value = ''
+      }
     } else if (props.mode === 'customers') {
       const res = await previewSalesCustomers({
         seasons: seasons.value,
@@ -690,25 +758,65 @@ const filteredCustomers = computed(() => {
     <!-- MODULE 2: 外部图库微创新选款 -->
     <!-- ================================================================ -->
     <div v-else-if="mode === 'selection' && selReport" class="sales-panel">
-      <!-- Target Hero Style Picker ("按款号选一批") -->
-      <section v-if="selReport.hero_styles?.length" class="sales-hero-picker">
+      <!-- Target Hero Style Picker ("按款号选一批" + 任意款号搜索) -->
+      <section class="sales-hero-picker">
         <header class="sales-hero-picker-head">
           <div>
-            <strong>按本厂爆款定向挑一批</strong>
+            <strong>按本厂款号定向挑一批</strong>
             <small>
               <template v-if="selReport.target_hero">
-                当前锁定款号 <b>{{ selReport.target_hero.code }}</b>（{{ selReport.target_hero.grade }}级 · {{ selReport.target_hero.quantity.toLocaleString() }}件{{ selReport.target_hero.cat2 ? ` · ERP细分:${selReport.target_hero.cat2}` : '' }}）专项找微创新升级款
+                当前锁定款号 <b>{{ selReport.target_hero.code }}</b>（{{ selReport.target_hero.grade }} · {{ selReport.target_hero.quantity.toLocaleString() }}件{{ selReport.target_hero.cat2 ? ` · ERP细分:${selReport.target_hero.cat2}` : '' }}）专项找微创新升级款
               </template>
               <template v-else>
-                点选任意本厂款号，即可围绕该款版型/领型（如帽衫、翻领等）专门海选一批；也可保持「全品类爆款综合」
+                支持搜索任意本厂有图款号（含往季款与新样衣），或直接点选下方热销爆款；也可保持「全品类爆款综合」
               </template>
             </small>
           </div>
-          <button v-if="targetStyleCode" type="button" class="sales-link-btn" :disabled="isBusy" @click="pickHeroStyle('')">
-            切回全品类爆款综合
-          </button>
+          <div class="sales-hero-head-actions">
+            <form class="sales-hero-search" @submit.prevent="submitStyleSearch">
+              <div class="sales-hero-search-box">
+                <input
+                  v-model="styleSearchQuery"
+                  type="search"
+                  placeholder="搜任意本厂款号（如 663315）回车锁定…"
+                  maxlength="40"
+                  :disabled="isBusy"
+                  @input="onStyleSearchInput"
+                  @focus="styleSearchOpen = Boolean(styleSearchQuery.trim())"
+                  @blur="closeStyleDropdownLater"
+                />
+                <div v-if="styleSearchOpen" class="sales-hero-dropdown" role="listbox">
+                  <div v-if="styleSearching" class="sales-hero-dd-empty">正在检索全库本厂款号…</div>
+                  <div v-else-if="!styleSearchHits.length" class="sales-hero-dd-empty">未匹配到款号，回车可直接精确查找</div>
+                  <button
+                    v-for="hit in styleSearchHits"
+                    :key="`${hit.code}-${hit.season}`"
+                    type="button"
+                    class="sales-hero-dd-item"
+                    @mousedown.prevent="chooseSearchedStyle(hit)"
+                  >
+                    <span class="sales-hero-dd-thumb">
+                      <img v-if="hit.image_url" :src="hit.image_url" :alt="hit.code" loading="lazy" />
+                      <em v-else>无图</em>
+                    </span>
+                    <span class="sales-hero-dd-info">
+                      <strong>{{ hit.code }} <small>{{ hit.plan }}</small></strong>
+                      <small>{{ hit.season }} · {{ hit.grade }} · {{ hit.quantity.toLocaleString() }}件{{ hit.cat2 ? ` · ${hit.cat2}` : '' }}</small>
+                    </span>
+                  </button>
+                </div>
+              </div>
+              <button type="submit" class="analytics-quiet sales-hero-search-btn" :disabled="isBusy">
+                锁定款号
+              </button>
+            </form>
+            <button v-if="targetStyleCode" type="button" class="sales-link-btn" :disabled="isBusy" @click="pickHeroStyle('')">
+              切回全品类综合
+            </button>
+          </div>
         </header>
-        <div class="sales-hero-strip">
+        <p v-if="selReport.target_hero_notice" class="sales-hero-notice">{{ selReport.target_hero_notice }}</p>
+        <div v-if="selReport.hero_styles?.length" class="sales-hero-strip">
           <button
             type="button"
             class="sales-hero-card is-all"
