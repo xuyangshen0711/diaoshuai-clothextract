@@ -264,6 +264,38 @@ def local_file(ref: str | Path) -> Path:
     return cache
 
 
+def cached_local_file(ref: str | Path) -> Path:
+    """Return local file path, trusting an existing oss-cache copy + etag without a remote HEAD."""
+    if not is_remote(ref):
+        return Path(ref)
+    cache = _cache_root() / _key(ref)
+    stamp = cache.with_name(cache.name + ".etag")
+    if cache.is_file() and stamp.is_file():
+        try:
+            if cache.stat().st_size > 0:
+                return cache
+        except OSError:
+            pass
+    return local_file(ref)
+
+
+def cached_version(ref: str | Path) -> str | None:
+    """Return local version token without remote HEAD when oss-cache + etag already exist."""
+    if not is_remote(ref):
+        return version(ref)
+    cache = _cache_root() / _key(ref)
+    stamp = cache.with_name(cache.name + ".etag")
+    if cache.is_file() and stamp.is_file():
+        try:
+            etag = stamp.read_text(encoding="utf-8").strip().strip('"')
+            size = cache.stat().st_size
+            if etag and size > 0:
+                return f"{etag}-{size:x}"
+        except OSError:
+            pass
+    return None
+
+
 def version(ref: str | Path) -> str:
     if is_remote(ref):
         meta = _head(ref)

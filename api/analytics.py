@@ -33,7 +33,7 @@ from src.analytics_sales import (
     save_report_decision, search_own_factory_styles, selection_asset_path,
 )
 from src.analytics_sales_pdf import render_attribution_pdf, render_selection_pdf, render_selection_xlsx
-from src.db import _load_env, mysql_config
+from src.db import _load_env, loaded_environment, mysql_config
 from src.site_gate import site_password
 from src.tag.tagger import provider_ready
 
@@ -55,17 +55,18 @@ class AnalyticsRoute(APIRoute):
         handle = super().get_route_handler()
 
         async def route(request: Request):
-            try:
-                response = await handle(request)
-            except RequestValidationError:
-                # FastAPI's default validation response echoes invalid inputs, including passwords.
-                response = JSONResponse({"detail": "请检查填写内容和日期范围。"}, status_code=422)
-            except AnalyticsUnavailable as exc:
-                response = JSONResponse({"detail": str(exc)}, status_code=503)
-            except SalesInsightError as exc:
-                response = JSONResponse({"detail": str(exc)}, status_code=exc.status_code)
-            response.headers.update(NO_STORE)
-            return response
+            with loaded_environment():
+                try:
+                    response = await handle(request)
+                except RequestValidationError:
+                    # FastAPI's default validation response echoes invalid inputs, including passwords.
+                    response = JSONResponse({"detail": "请检查填写内容和日期范围。"}, status_code=422)
+                except AnalyticsUnavailable as exc:
+                    response = JSONResponse({"detail": str(exc)}, status_code=503)
+                except SalesInsightError as exc:
+                    response = JSONResponse({"detail": str(exc)}, status_code=exc.status_code)
+                response.headers.update(NO_STORE)
+                return response
 
         return route
 

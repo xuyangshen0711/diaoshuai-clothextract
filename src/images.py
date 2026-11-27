@@ -40,15 +40,16 @@ def cover_version(record: ImageRecord) -> str:
     return f"{image_version(record.image_path)}-{hashlib.sha256(crop.encode()).hexdigest()[:12]}"
 
 
-def original_data_url(record: ImageRecord, max_side: int = 1600) -> str:
+def original_data_url(record: ImageRecord, max_side: int = 1600, *, verify_remote: bool = True) -> str:
     from src.tag.images import image_data_url
-    return image_data_url(record.image_path, max_side=max_side)
+    source = record.image_path if verify_remote else storage.cached_local_file(record.image_path)
+    return image_data_url(source, max_side=max_side)
 
 
-def cover_path(record: ImageRecord) -> Path:
+def cover_path(record: ImageRecord, *, verify_remote: bool = True) -> Path:
     if record.cover_crop is None:
-        return thumbnail_path(record.id, record.image_path)
-    return thumbnail_path(record.id, record.image_path, record.cover_crop)
+        return thumbnail_path(record.id, record.image_path, verify_remote=verify_remote)
+    return thumbnail_path(record.id, record.image_path, record.cover_crop, verify_remote=verify_remote)
 
 
 def _render_thumbnail_file(local: Path, target: Path, crop: CoverCrop | None = None) -> Path:
@@ -83,13 +84,31 @@ def _render_thumbnail_file(local: Path, target: Path, crop: CoverCrop | None = N
     return target
 
 
-def thumbnail_path(record_id: str, source: str | Path, crop: CoverCrop | None = None) -> Path:
+def thumbnail_path(record_id: str, source: str | Path, crop: CoverCrop | None = None, *, verify_remote: bool = True) -> Path:
     folder = catalog.PROCESSED_DIR / "thumbnails"
     folder.mkdir(parents=True, exist_ok=True)
     # IDs can come from legacy JSON; hash them rather than treating them as paths.
     key = hashlib.sha256(record_id.encode()).hexdigest()[:24]
-    ver = image_version(source)
     crop_key = f"-crop-{hashlib.sha256(crop.model_dump_json().encode()).hexdigest()[:12]}" if crop else ""
+    if not verify_remote and storage.is_remote(source):
+        cached_ver = storage.cached_version(source)
+        if cached_ver:
+            target = folder / f"{key}-{cached_ver}{crop_key}.jpg"
+            if target.exists():
+                return target
+            local = storage.cached_local_file(source)
+            return _render_thumbnail_file(local, target, crop)
+        matches = sorted(
+            (
+                p for p in folder.glob(f"{key}-*{crop_key}.jpg")
+                if crop is not None or "-crop-" not in p.name
+            ),
+            key=lambda p: p.stat().st_mtime_ns,
+            reverse=True,
+        )
+        if matches:
+            return matches[0]
+    ver = image_version(source)
     target = folder / f"{key}-{ver}{crop_key}.jpg"
     if target.exists():
         return target

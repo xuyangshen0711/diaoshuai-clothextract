@@ -20,8 +20,8 @@ import os
 from pathlib import Path
 import re
 import tempfile
-from threading import Lock
-from typing import Literal
+from threading import BoundedSemaphore, Lock
+from typing import Iterable, Literal
 
 import httpx
 from openai import OpenAI
@@ -30,7 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from src import catalog, storage
 from src.analytics_season import BRAND, MARKET, customer_type
-from src.db import _load_env, json_extract
+from src.db import _load_env, is_mysql, json_extract
 from src.factory.aliases import customer_short_name
 from src.factory.codes import OWN_CUSTOMER, normalize_code_text, parse_style_code
 from src.factory.sales_policy import counted_from_rows, historical_range
@@ -56,9 +56,16 @@ DEFAULT_QWEN_MODEL = "qwen4-max"
 DEFAULT_DEEPSEEK_VISION_MODEL = "deepseek-flash"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 AI_TIMEOUT = httpx.Timeout(150.0, connect=25.0)
+_DEFAULT_COVER_PATH = cover_path
 _CACHE_LOCK = Lock()
 _FP_LOCK = Lock()
+_FP_FETCH_SEM = BoundedSemaphore(4)
 _FINGERPRINT_CACHE: OrderedDict[tuple[str, int, str], tuple[int | None, str | None, tuple[int, ...] | None]] = OrderedDict()
+_FP_DISK_PATH: Path | None = None
+_FP_DISK: dict[str, tuple[int | None, str, tuple[int, ...]]] = {}
+_FP_DISK_DIRTY: dict[str, list] = {}
+_RECORDS_CACHE_LOCK = Lock()
+_RECORDS_CACHE: OrderedDict[tuple, tuple[dict[str, ImageRecord], list[ImageRecord]]] = OrderedDict()
 _SPLIT_COLOR = re.compile(r"[+＋/、,，]")
 
 PRICE_BANDS: tuple[tuple[str, float, float], ...] = (
@@ -269,7 +276,7 @@ def _extract_json(text: str) -> dict:
 
 def _record_data_url(record: ImageRecord, max_side: int = 520) -> str | None:
     try:
-        return original_data_url(record, max_side=max_side)
+        return original_data_url(record, max_side=max_side, verify_remote=False)
     except Exception:
         return None
 
@@ -277,6 +284,8 @@ def _record_data_url(record: ImageRecord, max_side: int = 520) -> str | None:
 def _image_stamp(record: ImageRecord) -> str:
     if not record.image_path:
         return "missing"
+    if storage.is_remote(record.image_path):
+        return _image_fingerprints(record)[1] or "missing"
     try:
         return image_version(record.image_path)
     except Exception:
@@ -288,43 +297,189 @@ def _record_version(record):
             record.cover_crop.model_dump() if record.cover_crop else None]
 
 
-def _image_fingerprints(record: ImageRecord) -> tuple[int | None, str | None, tuple[int, ...] | None]:
-    """Return cached (64-bit h+v gradient dHash, 16-hex byte SHA256, 2x2 RGB quad signature)."""
-    cache_key = (record.image_path, int(record.revision or 0), _image_stamp(record))
+def _fp_disk_key(record: ImageRecord) -> str:
+    return f"{record.image_path}|{int(record.revision or 0)}"
+
+
+def _ensure_disk_fp_loaded_locked() -> Path:
+    global _FP_DISK_PATH, _FP_DISK, _FP_DISK_DIRTY
+    path = _cache_dir() / "fingerprints.json"
+    if _FP_DISK_PATH == path:
+        return path
+    _FP_DISK_PATH = path
+    _FINGERPRINT_CACHE.clear()
+    _FP_DISK = {}
+    _FP_DISK_DIRTY = {}
+    if path.is_file():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw = None
+        if isinstance(raw, dict):
+            for key, val in raw.items():
+                if (
+                    isinstance(key, str)
+                    and isinstance(val, list)
+                    and len(val) == 3
+                    and isinstance(val[1], str)
+                    and val[1]
+                    and isinstance(val[2], list)
+                ):
+                    dhash = val[0] if (val[0] is None or type(val[0]) is int) else None
+                    _FP_DISK[key] = (dhash, val[1], tuple(int(x) for x in val[2]))
+    return path
+
+
+def _flush_disk_fingerprints() -> None:
+    with _FP_LOCK:
+        path = _ensure_disk_fp_loaded_locked()
+        if not _FP_DISK_DIRTY:
+            return
+        pending = dict(_FP_DISK_DIRTY)
+    lock_path = path.with_name("fingerprints.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _CACHE_LOCK, lock_path.open("a+b") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        merged: dict[str, list] = {}
+        if path.is_file():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(existing, dict):
+                    merged = existing
+            except (OSError, ValueError):
+                merged = {}
+        merged.update(pending)
+        _atomic_write_json(path, merged)
+    with _FP_LOCK:
+        if _FP_DISK_PATH == path:
+            for key, val in pending.items():
+                if _FP_DISK_DIRTY.get(key) == val:
+                    _FP_DISK_DIRTY.pop(key, None)
+
+
+def _fp_cache_key(record: ImageRecord) -> tuple[str, int, str]:
+    rev = int(record.revision or 0)
+    if storage.is_remote(record.image_path):
+        return (record.image_path, rev, "oss")
+    try:
+        stamp = image_version(record.image_path) if record.image_path else "missing"
+    except Exception:
+        stamp = "missing"
+    return (record.image_path, rev, stamp)
+
+
+def _lookup_cached_fingerprint(record: ImageRecord) -> tuple[bool, tuple[int | None, str | None, tuple[int, ...] | None]]:
+    if not record.image_path:
+        return True, (None, None, None)
+    cache_key = _fp_cache_key(record)
+    remote = cache_key[2] == "oss"
     with _FP_LOCK:
         hit = _FINGERPRINT_CACHE.get(cache_key)
         if hit is not None:
             _FINGERPRINT_CACHE.move_to_end(cache_key)
-            return hit
+            return True, hit
+        if remote:
+            _ensure_disk_fp_loaded_locked()
+            disk_hit = _FP_DISK.get(_fp_disk_key(record))
+            if disk_hit is not None:
+                _FINGERPRINT_CACHE[cache_key] = disk_hit
+                if len(_FINGERPRINT_CACHE) > 16384:
+                    _FINGERPRINT_CACHE.popitem(last=False)
+                return True, disk_hit
+    return False, (None, None, None)
+
+
+def _decode_fingerprint_bytes(raw_bytes: bytes) -> tuple[int | None, str, tuple[int, ...]]:
+    sha = hashlib.sha256(raw_bytes).hexdigest()[:16]
+    with Image.open(BytesIO(raw_bytes)) as img:
+        rgb_sig = tuple(img.convert("RGB").resize((2, 2), Image.Resampling.BILINEAR).tobytes())
+        gray = img.convert("L")
+        h_raw = gray.resize((9, 4), Image.Resampling.BILINEAR).tobytes()
+        v_raw = gray.resize((8, 5), Image.Resampling.BILINEAR).tobytes()
+    bits = 0
+    for row in range(4):
+        offset = row * 9
+        for col in range(8):
+            bits = (bits << 1) | (1 if h_raw[offset + col] > h_raw[offset + col + 1] else 0)
+    for row in range(4):
+        top_off = row * 8
+        bot_off = (row + 1) * 8
+        for col in range(8):
+            bits = (bits << 1) | (1 if v_raw[top_off + col] > v_raw[bot_off + col] else 0)
+    # Uniform solid images have 0 gradient bits; only match perceptual hash on textured photos
+    dhash = None if (bits.bit_count() < 4 or bits.bit_count() > 60) else bits
+    return dhash, sha, rgb_sig
+
+
+def _compute_fingerprint_uncached(record: ImageRecord, *, persist_immediately: bool = True) -> tuple[int | None, str | None, tuple[int, ...] | None]:
+    if not record.image_path:
+        return None, None, None
+    cache_key = _fp_cache_key(record)
+    remote = cache_key[2] == "oss"
     try:
-        path = storage.local_file(record.image_path)
-        raw_bytes = path.read_bytes()
-        sha = hashlib.sha256(raw_bytes).hexdigest()[:16]
-        with Image.open(BytesIO(raw_bytes)) as img:
-            rgb_sig = tuple(img.convert("RGB").resize((2, 2), Image.Resampling.BILINEAR).tobytes())
-            gray = img.convert("L")
-            h_raw = gray.resize((9, 4), Image.Resampling.BILINEAR).tobytes()
-            v_raw = gray.resize((8, 5), Image.Resampling.BILINEAR).tobytes()
-        bits = 0
-        for row in range(4):
-            offset = row * 9
-            for col in range(8):
-                bits = (bits << 1) | (1 if h_raw[offset + col] > h_raw[offset + col + 1] else 0)
-        for row in range(4):
-            top_off = row * 8
-            bot_off = (row + 1) * 8
-            for col in range(8):
-                bits = (bits << 1) | (1 if v_raw[top_off + col] > v_raw[bot_off + col] else 0)
-        # Uniform solid images have 0 gradient bits; only match perceptual hash on textured photos
-        dhash = None if (bits.bit_count() < 4 or bits.bit_count() > 60) else bits
-        result = (dhash, sha, rgb_sig)
+        if remote:
+            with _FP_FETCH_SEM:
+                path = storage.cached_local_file(record.image_path)
+                try:
+                    result = _decode_fingerprint_bytes(path.read_bytes())
+                except Exception:
+                    # Retry once via verified OSS download if a cached local copy was truncated.
+                    path.unlink(missing_ok=True)
+                    path.with_name(path.name + ".etag").unlink(missing_ok=True)
+                    fresh = storage.local_file(record.image_path)
+                    result = _decode_fingerprint_bytes(fresh.read_bytes())
+        else:
+            path = storage.local_file(record.image_path)
+            result = _decode_fingerprint_bytes(path.read_bytes())
     except Exception:
         return None, None, None
     with _FP_LOCK:
         _FINGERPRINT_CACHE[cache_key] = result
-        if len(_FINGERPRINT_CACHE) > 8192:
+        if len(_FINGERPRINT_CACHE) > 16384:
             _FINGERPRINT_CACHE.popitem(last=False)
+        if remote and result[1]:
+            _ensure_disk_fp_loaded_locked()
+            dkey = _fp_disk_key(record)
+            _FP_DISK[dkey] = result
+            _FP_DISK_DIRTY[dkey] = [result[0], result[1], list(result[2])]
+    if remote and persist_immediately:
+        _flush_disk_fingerprints()
     return result
+
+
+def _image_fingerprints(record: ImageRecord) -> tuple[int | None, str | None, tuple[int, ...] | None]:
+    """Return cached (64-bit h+v gradient dHash, 16-hex byte SHA256, 2x2 RGB quad signature)."""
+    hit, result = _lookup_cached_fingerprint(record)
+    if hit:
+        return result
+    return _compute_fingerprint_uncached(record, persist_immediately=True)
+
+
+def _ensure_fingerprints(records: Iterable[ImageRecord]) -> dict[str, tuple[int | None, str | None, tuple[int, ...] | None]]:
+    """Batch-resolve fingerprints, skipping thread pool when warm and flushing new OSS entries once."""
+    unique: dict[str, ImageRecord] = {}
+    for rec in records:
+        if rec is not None and rec.id not in unique:
+            unique[rec.id] = rec
+    prints: dict[str, tuple[int | None, str | None, tuple[int, ...] | None]] = {}
+    missing: list[ImageRecord] = []
+    for rid, rec in unique.items():
+        hit, val = _lookup_cached_fingerprint(rec)
+        if hit:
+            prints[rid] = val
+        else:
+            missing.append(rec)
+    if missing:
+        if len(missing) == 1:
+            rec = missing[0]
+            prints[rec.id] = _compute_fingerprint_uncached(rec, persist_immediately=False)
+        else:
+            with ThreadPoolExecutor(max_workers=min(4, len(missing)), thread_name_prefix="sales-fingerprint") as pool:
+                computed = list(pool.map(lambda r: _compute_fingerprint_uncached(r, persist_immediately=False), missing))
+            for rec, val in zip(missing, computed):
+                prints[rec.id] = val
+        _flush_disk_fingerprints()
+    return prints
 
 
 def _rgb_close(a: tuple[int, ...] | None, b: tuple[int, ...] | None, max_mean_diff: float = 18.0) -> bool:
@@ -373,7 +528,7 @@ def _make_contact_sheet(
         y0 = pad + r * (tile_h + pad)
         draw.rectangle([x0, y0, x0 + tile_w, y0 + tile_h], fill=(255, 255, 255), outline=(214, 210, 202), width=1)
         try:
-            path = storage.local_file(rec.image_path)
+            path = storage.cached_local_file(rec.image_path)
             with Image.open(path) as img:
                 rgb = ImageOps.exif_transpose(img).convert("RGB")
                 rgb.thumbnail((tile_w - 6, tile_h - 39), Image.Resampling.LANCZOS)
@@ -416,7 +571,7 @@ def _make_hero_reference_image(hero_pairs: list[tuple[str, ImageRecord]]) -> str
         y0 = pad + r * (tile_h + pad)
         draw.rectangle([x0, y0, x0 + tile_w, y0 + tile_h], fill=(255, 255, 255), outline=(205, 200, 190), width=1)
         try:
-            path = storage.local_file(rec.image_path)
+            path = storage.cached_local_file(rec.image_path)
             with Image.open(path) as img:
                 rgb = ImageOps.exif_transpose(img).convert("RGB")
                 rgb.thumbnail((tile_w - 8, tile_h - 38), Image.Resampling.LANCZOS)
@@ -533,11 +688,21 @@ def _matches_category_plan(record: ImageRecord, plan: str) -> bool:
 
 
 def _load_records(conn, *, own_only=False) -> tuple[dict[str, ImageRecord], list[ImageRecord]]:
+    use_cache = is_mysql(conn)
+    cache_key = None
+    if use_cache:
+        cache_key = (catalog._records_stamp(conn), bool(own_only))
+        with _RECORDS_CACHE_LOCK:
+            hit = _RECORDS_CACHE.get(cache_key)
+            if hit is not None:
+                _RECORDS_CACHE.move_to_end(cache_key)
+                return dict(hit[0]), list(hit[1])
     own_by_code: dict[str, ImageRecord] = {}
     external_records: list[ImageRecord] = []
+    dialect = "mysql" if use_cache else "sqlite"
     query = "SELECT id, revision, review_status, payload FROM records WHERE review_status <> 'rejected'"
     if own_only:
-        query += " AND " + json_extract("payload", "$.source_category") + " = '本厂产品'"
+        query += " AND " + json_extract("payload", "$.source_category", dialect=dialect) + " = '本厂产品'"
     for row in conn.execute(query):
         try:
             rec = ImageRecord.model_validate_json(row["payload"])
@@ -561,6 +726,11 @@ def _load_records(conn, *, own_only=False) -> tuple[dict[str, ImageRecord], list
             # Skip unsorted garbage unless it has a meaningful description
             if rec.review_status == "approved" or rec.has_ai_suggestion or rec.tags.一句话描述:
                 external_records.append(rec)
+    if use_cache and cache_key is not None:
+        with _RECORDS_CACHE_LOCK:
+            _RECORDS_CACHE[cache_key] = (dict(own_by_code), list(external_records))
+            if len(_RECORDS_CACHE) > 4:
+                _RECORDS_CACHE.popitem(last=False)
     return own_by_code, external_records
 
 
@@ -582,16 +752,17 @@ def sales_options(conn) -> dict:
         default_seasons = [sorted(seasons.keys(), reverse=True)[0]]
 
     ext_counts = Counter()
-    for row in conn.execute("SELECT review_status, payload FROM records"):
-        if row["review_status"] == "rejected":
-            continue
-        try:
-            payload = json.loads(row["payload"])
-        except ValueError:
-            continue
-        sc = payload.get("source_category") or ""
-        if sc in EXTERNAL_SOURCES and payload.get("image_path"):
-            ext_counts[sc] += 1
+    dialect = "mysql" if is_mysql(conn) else "sqlite"
+    sc_expr = json_extract("payload", "$.source_category", dialect=dialect)
+    img_expr = json_extract("payload", "$.image_path", dialect=dialect)
+    for row in conn.execute(
+        f"SELECT {sc_expr} AS sc, COUNT(*) AS n FROM records "
+        f"WHERE review_status <> 'rejected' AND COALESCE({img_expr}, '') <> '' "
+        f"GROUP BY {sc_expr}"
+    ):
+        sc = row["sc"] or ""
+        if sc in EXTERNAL_SOURCES:
+            ext_counts[sc] = int(row["n"] or 0)
 
     last_day = conn.execute("SELECT MAX(order_date) FROM style_order_lines WHERE order_date <> ''").fetchone()[0]
     return {
@@ -851,15 +1022,17 @@ def _serialize_style_card(st: dict) -> dict:
 
 def _visual_units(styles: list[dict]) -> list[dict]:
     """One observation per original image. Any winning version makes that observation a win."""
+    eligible_styles = [
+        st for st in styles
+        if st.get("record") is not None
+        and not ((st["record"].tags_source == "mock" or st["record"].ai_tags_source == "mock") and not st["record"].human_overrides)
+    ]
+    prints = _ensure_fingerprints(st["record"] for st in eligible_styles)
     groups = defaultdict(list)
-    image_keys = {}
-    for st in styles:
-        rec = st.get("record")
-        if rec is None or ((rec.tags_source == "mock" or rec.ai_tags_source == "mock") and not rec.human_overrides):
-            continue
-        if rec.id not in image_keys:
-            image_keys[rec.id] = _image_fingerprints(rec)[1] or rec.image_path or rec.id
-        groups[image_keys[rec.id]].append(st)
+    for st in eligible_styles:
+        rec = st["record"]
+        image_key = prints.get(rec.id, (None, None, None))[1] or rec.image_path or rec.id
+        groups[image_key].append(st)
     units = []
     for versions in groups.values():
         best = min(versions, key=lambda st: (not st["is_winner"], -st["qty"], st["code"]))
@@ -977,9 +1150,10 @@ def preview_attribution_inputs(bundle, filters: AttributionFilters, *, client=No
         [s for s in cat_styles if not s["is_winner"] and s["sales_coverage"] == "生产及订单已确认" and s["qty"] < 150],
         key=lambda s: (0 if s["record"] is not None else 1, s["qty"], s["code"]),
     )
-    winning_images = {_image_fingerprints(s["record"])[1] or s["record"].image_path for s in winners if s["record"]}
+    prints = _ensure_fingerprints(s["record"] for s in cat_styles if s.get("record"))
+    winning_images = {prints.get(s["record"].id, (None, None, None))[1] or s["record"].image_path for s in winners if s["record"]}
     laggards = [s for s in laggards if not s["record"] or
-                (_image_fingerprints(s["record"])[1] or s["record"].image_path) not in winning_images]
+                (prints.get(s["record"].id, (None, None, None))[1] or s["record"].image_path) not in winning_images]
     imaged_count = sum(1 for s in cat_styles if s["record"] is not None)
     dimensions = _compute_dimension_tables(cat_styles)
 
@@ -1481,48 +1655,111 @@ def search_own_factory_styles(conn, query: str, *, limit: int = 12) -> list[dict
     return items[: max(1, min(30, limit))]
 
 
+_SKIP_TAG_VALS = frozenset({"", "其他", "未判断", "待归类"})
+_SKIP_COLORS = frozenset({"", "其他", "未判断"})
+_SIM_WEIGHTS = (1.2, 1.5, 0.9, 1.1, 1.3, 0.8, 0.8)
+
+
+def _compact_tag_vec(rec: ImageRecord, neck_val: str) -> tuple[tuple[str, ...], frozenset[str]]:
+    tags = rec.tags
+    fabric = tags.面料 if tags.面料来源 in {"目视", "人工"} else ""
+    vals = (
+        tags.版型 or "",
+        neck_val or "",
+        tags.袖型 or "",
+        tags.风格 or "",
+        tags.图案 or "",
+        tags.颜色主色调 or "",
+        fabric or "",
+    )
+    cleaned = tuple("" if v in _SKIP_TAG_VALS else v for v in vals)
+    return cleaned, frozenset(tags.细节元素 or ())
+
+
+def _fast_tag_sim(
+    c_vals: tuple[str, ...],
+    c_det: frozenset[str],
+    o_vals: tuple[str, ...],
+    o_det: frozenset[str],
+) -> tuple[float, int]:
+    score = 0.0
+    total_w = 0.0
+    hits = 0
+    for cv, ov, w in zip(c_vals, o_vals, _SIM_WEIGHTS):
+        if not cv or not ov:
+            continue
+        total_w += w
+        if cv == ov:
+            score += w
+            hits += 1
+    if c_det or o_det:
+        total_w += 1.6
+        inter = len(c_det & o_det)
+        union = len(c_det) + len(o_det) - inter
+        score += 1.6 * (inter / union)
+        if inter:
+            hits += 1
+    return (score / total_w if total_w > 0 else 0.0), hits
+
+
 def _deduplicate_candidates(records, own_images, own_styles, shapes):
     """Stable representatives over the whole eligible library, before batching or exclusions."""
     own = list(own_images.values())
     recs = sorted(records, key=lambda rec: rec.id)
-    with ThreadPoolExecutor(max_workers=8, thread_name_prefix="sales-fingerprint") as pool:
-        prints = dict(zip((r.id for r in [*own, *recs]), pool.map(_image_fingerprints, [*own, *recs])))
+    prints = _ensure_fingerprints([*own, *recs])
     own_sha = {prints[r.id][1]: r for r in own if prints[r.id][1]}
-    own_visual = [r for r in own if prints[r.id][0] is not None]
+    own_visual = [
+        (r, prints[r.id][0], prints[r.id][2], "" if r.tags.颜色主色调 in _SKIP_COLORS else r.tags.颜色主色调)
+        for r in own
+        if prints[r.id][0] is not None
+    ]
+    own_tag_rows = []
+    for st in own_styles:
+        srec = st["record"]
+        sneck = _own_structure(st).neck or (srec.tags.领型 or "")
+        svals, sdet = _compact_tag_vec(srec, sneck)
+        sfp = prints.get(srec.id, (None, None, None))
+        own_tag_rows.append((svals, sdet, srec.tags.颜色主色调, st["code"], srec, sfp[1], sfp[2]))
     seen_sha = {}
     seen_visual = []
     survivors, rejected_own, rejected_ext = [], [], []
     neighbors = {}
 
-    def same_picture(rec, other, distance):
-        dh, _, rgb = prints[rec.id]
-        oh, _, orgb = prints[other.id]
-        colors = {rec.tags.颜色主色调, other.tags.颜色主色调} - {"", "其他", "未判断"}
-        return len(colors) <= 1 and _hamming(dh, oh) <= distance and _rgb_close(rgb, orgb, 9)
-
     for rec in recs:
-        dh, sha, _ = prints[rec.id]
+        dh, sha, rgb = prints[rec.id]
+        r_color = "" if rec.tags.颜色主色调 in _SKIP_COLORS else rec.tags.颜色主色调
         match = own_sha.get(sha)
         if not match and dh is not None:
-            match = next((r for r in own_visual if same_picture(rec, r, 7)), None)
+            for orec, oh, orgb, ocol in own_visual:
+                if (dh ^ oh).bit_count() <= 7 and (not r_color or not ocol or r_color == ocol) and _rgb_close(rgb, orgb, 9):
+                    match = orec
+                    break
         reason = "原图与本厂款重复"
         nearest, best = None, -1.0
         if not match:
-            for st in own_styles:
-                sim, hits, _ = _tag_similarity_and_diffs(
-                    rec, st["record"], own_neck_override=_own_structure(st).neck, candidate_neck=shapes[rec.id].neck)
+            c_vals, c_det = _compact_tag_vec(rec, shapes[rec.id].neck)
+            c_main_color = rec.tags.颜色主色调
+            for ovals, odet, o_main_color, st_code, st_rec, st_sha, st_rgb in own_tag_rows:
+                sim, hits = _fast_tag_sim(c_vals, c_det, ovals, odet)
                 if sim > best:
-                    best, nearest = sim, st["code"]
-                if (sim >= .96 and len(hits) >= 5 and rec.tags.颜色主色调 == st["record"].tags.颜色主色调
-                    and (not sha or not prints[st["record"].id][1] or _rgb_close(prints[rec.id][2], prints[st["record"].id][2]))):
-                    match, reason = st["record"], "多项结构、色系及工艺标签与本厂款重复"
+                    best, nearest = sim, st_code
+                if (
+                    sim >= 0.96
+                    and hits >= 5
+                    and c_main_color == o_main_color
+                    and (not sha or not st_sha or _rgb_close(rgb, st_rgb))
+                ):
+                    match, reason = st_rec, "多项结构、色系及工艺标签与本厂款重复"
                     break
         neighbors[rec.id] = (nearest or "", max(0., best))
         own_match = match is not None
         if not match:
             match = seen_sha.get(sha)
             if not match and dh is not None:
-                match = next((r for r in seen_visual if same_picture(rec, r, 6)), None)
+                for orec, oh, orgb, ocol in seen_visual:
+                    if (dh ^ oh).bit_count() <= 6 and (not r_color or not ocol or r_color == ocol) and _rgb_close(rgb, orgb, 9):
+                        match = orec
+                        break
             reason = "与外部图库另一张候选图重复"
         if match:
             bucket = rejected_own if own_match else rejected_ext
@@ -1534,7 +1771,7 @@ def _deduplicate_candidates(records, own_images, own_styles, shapes):
             if sha:
                 seen_sha[sha] = rec
             if dh is not None:
-                seen_visual.append(rec)
+                seen_visual.append((rec, dh, rgb, r_color))
     return survivors, rejected_own, rejected_ext, neighbors, prints
 
 
@@ -1544,7 +1781,7 @@ def read_selection_inputs(conn, filters):
     return bundle, target, notice
 
 
-def _build_selection_context(inputs, filters, *, client=None):
+def _build_selection_context(inputs, filters, *, client=None, build_hero_image: bool = False):
     bundle, target_hero, target_hero_notice = inputs
     all_own = list(bundle["styles"].values())
     target = _own_structure(target_hero) if target_hero else None
@@ -1786,8 +2023,16 @@ def _build_selection_context(inputs, filters, *, client=None):
     elif target and target.conflicts:
         ai_blocked_reason = "；".join(target.conflicts) + "。请核对档案后再进行视觉挑款。"
     else:
-        hero_url = _make_hero_reference_image([(st["code"], st["record"]) for st in heroes])
-        if not hero_url:
+        hero_pairs = [(st["code"], st["record"]) for st in heroes if st and st.get("record") is not None]
+        if build_hero_image:
+            hero_url = _make_hero_reference_image(hero_pairs)
+            hero_readable = bool(hero_url)
+        else:
+            missing_hero_recs = [rec for _, rec in hero_pairs if rec.id not in fingerprints]
+            if missing_hero_recs:
+                fingerprints.update(_ensure_fingerprints(missing_hero_recs))
+            hero_readable = any(bool(fingerprints.get(rec.id, (None, None, None))[1]) for _, rec in hero_pairs)
+        if not hero_readable:
             ai_blocked_reason = (f"款号 {target_hero['code']} 的本厂原图缺失或不可读，仅显示标签预览。"
                                  if target_hero else "本轮没有可读的本厂参照原图，仅显示标签预览。")
         elif target and not target.plan():
@@ -1906,7 +2151,12 @@ def _freeze_report(report, records):
             if rid in records and "image_url" in node:
                 if rid not in assets:
                     try:
-                        blob = cover_path(records[rid]).read_bytes()
+                        cover = (
+                            _DEFAULT_COVER_PATH(records[rid], verify_remote=False)
+                            if cover_path is _DEFAULT_COVER_PATH
+                            else cover_path(records[rid])
+                        )
+                        blob = cover.read_bytes()
                     except Exception:
                         assets[rid] = None
                     else:
@@ -2057,7 +2307,7 @@ def run_selection_ai(conn, filters: SelectionFilters, *, force=False, client=Non
 
 
 def analyze_selection_inputs(inputs, filters: SelectionFilters, *, force=False, client=None, expected_snapshot=None) -> dict:
-    report, scan_pool, target, hero_url, records = _build_selection_context(inputs, filters, client=client)
+    report, scan_pool, target, hero_url, records = _build_selection_context(inputs, filters, client=client, build_hero_image=True)
     if expected_snapshot and report["snapshot"] != expected_snapshot:
         raise SalesInsightError("候选数据或参照款已更新，请刷新标签预览后重试。", status_code=409)
     if report["ai_blocked_reason"]:

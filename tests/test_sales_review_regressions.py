@@ -254,3 +254,70 @@ def test_unlocked_reference_preflight_stops_before_ai_and_recovers_with_a_readab
     locked = run(filters(target_style_code=hero.style_code), forbidden)
     assert locked["ai_blocked_reason"] and locked["ai_selection"] is None and not forbidden.calls
 
+
+def test_oss_sales_previews_persist_fingerprints_and_make_zero_oss_calls_after_restart(store):
+    from src import storage
+    from test_response_speed import CountingOSSBucket
+
+    bucket = CountingOSSBucket()
+    storage.set_bucket_override(bucket)
+    hero, cards = seed(store, 4)
+    with catalog._database() as conn:
+        add_order(conn, "ORD-OSS-1", hero.style_code, hero.style_code, "甲", "甲", 1500)
+    assert hero.image_path.startswith("oss://")
+    assert all(c.image_path.startswith("oss://") for c in cards)
+
+    # First cold run warms oss-cache, thumbnails, and persists fingerprints.json on disk.
+    with catalog.read_database() as conn:
+        sel1 = sales.build_selection_preview(conn, filters())
+        attr1 = sales.build_attribution_preview(conn, sales.AttributionFilters(seasons=["2026冬"]))
+        cust1 = sales.build_customer_insights(conn, sales.CustomerInsightFilters(seasons=["2026冬"], customer="甲"))
+    fp_file = sales._cache_dir() / "fingerprints.json"
+    assert fp_file.is_file()
+    assert sel1["scan_candidate_ids"] and attr1["top_winners"] and cust1["profile"]
+
+    # Simulate a full service restart: wipe in-memory caches and reset OSS counters.
+    sales._FINGERPRINT_CACHE.clear()
+    sales._FP_DISK_PATH = None
+    bucket.head_calls = 0
+    bucket.get_calls = 0
+    bucket.exists_calls = 0
+
+    with catalog.read_database() as conn:
+        sel2 = sales.build_selection_preview(conn, filters())
+        attr2 = sales.build_attribution_preview(conn, sales.AttributionFilters(seasons=["2026冬"]))
+        cust2 = sales.build_customer_insights(conn, sales.CustomerInsightFilters(seasons=["2026冬"], customer="甲"))
+
+    assert (bucket.head_calls, bucket.get_calls, bucket.exists_calls) == (0, 0, 0)
+    assert sel2["snapshot"] == sel1["snapshot"]
+    assert attr2["snapshot"] == attr1["snapshot"]
+    assert cust2["external_recommendations"] == cust1["external_recommendations"]
+
+
+def test_fast_tag_sim_matches_tag_similarity_and_diffs(store):
+    hero, cards = seed(store, 2)
+    hero.tags = FashionTags(
+        品类="上衣>套衫", 袖长="长袖", 领型="V领", 版型="修身", 袖型="长袖",
+        风格="通勤", 图案="条纹", 颜色主色调="黑色", 面料="针织", 面料来源="目视",
+        细节元素=["坑条", "罗纹"], 一句话描述="V领横机套衫",
+    )
+    cards[0].tags = FashionTags(
+        品类="上衣>套衫", 袖长="长袖", 领型="圆领", 版型="修身", 袖型="长袖",
+        风格="通勤", 图案="纯色/无明显图案", 颜色主色调="黑色", 面料="针织", 面料来源="词表",
+        细节元素=["罗纹", "绞花"], 一句话描述="圆领套衫",
+    )
+    cards[1].tags = FashionTags(
+        品类="上衣>套衫", 袖长="长袖", 领型="V领", 版型="其他", 袖型="未判断",
+        风格="极简", 图案="纯色/无明显图案", 颜色主色调="白色", 面料="其他",
+        细节元素=[], 一句话描述="纯色V领套衫",
+    )
+    for cand in cards:
+        ref_sim, ref_hits, _ = sales._tag_similarity_and_diffs(
+            cand, hero, own_neck_override="V领", candidate_neck=cand.tags.领型,
+        )
+        c_vec = sales._compact_tag_vec(cand, cand.tags.领型)
+        o_vec = sales._compact_tag_vec(hero, "V领")
+        fast_sim, fast_hits = sales._fast_tag_sim(c_vec[0], c_vec[1], o_vec[0], o_vec[1])
+        assert fast_sim == pytest.approx(ref_sim)
+        assert fast_hits == len(ref_hits)
+
