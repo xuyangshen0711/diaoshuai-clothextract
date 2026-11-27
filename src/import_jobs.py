@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Lock, RLock
@@ -19,7 +21,7 @@ from src.import_scheduler import ImageQueue
 from src import storage
 from src.extract.office import extract_from_file
 from src.factory.codes import image_style_code
-from src.factory.excel_io import workbook_table_kind
+from src.factory.excel_io import KIND_LABELS, workbook_table_kind
 from src.factory.tables import find_own_factory
 from src.schema import UNCLASSIFIED_SOURCE, ImageRecord
 from src.tag.tagger import apply_suggestion, get_tagger, needs_tagging
@@ -108,7 +110,7 @@ def public_job(job):
     files = [source for source in job["files"] if source["state"] != "deleted"]
     done = sum(item["state"] == "done" for item in job["items"])
     filtered = sum(item["state"] == "done" and item.get("filtered", False) for item in job["items"])
-    skipped = sum(bool(item.get("skipped")) for item in job["items"])
+    skipped = sum(item["state"] == "done" and bool(item.get("skipped")) for item in job["items"])
     failed = sum(item["state"] == "failed" for item in job["items"])
     processed = done + failed
     elapsed = job.get("elapsed", 0) + (seconds(job.get("run_started_at")) if job["status"] in ACTIVE else 0)
@@ -189,7 +191,7 @@ def _table_upload_hint(job) -> str:
             continue
         kind = workbook_table_kind(Path(source.get("path") or ""))
         if kind == "archive":
-            labels.append("款式档案")
+            labels.append(KIND_LABELS["archive"])
         elif kind == "sales":
             labels.append("销量表")
     if not labels:
@@ -230,7 +232,7 @@ def friendly_error(exc):
 def _finish(job, status, message, end=None):
     job["elapsed"] += seconds(job.get("run_started_at"), end)
     job["run_started_at"] = None
-    skipped = sum(bool(item.get("skipped")) for item in job.get("items", []))
+    skipped = sum(item["state"] == "done" and bool(item.get("skipped")) for item in job.get("items", []))
     if skipped and status in {"completed", "partial"} and "已跳过" not in message:
         message += f"（{skipped} 张与现有图片相同，已跳过）"
     job["status"], job["message"] = status, message
@@ -253,6 +255,35 @@ def _same_file(left, right) -> bool:
     return digest(left_path) == digest(right_path)
 
 
+def same_tagged_factory_image(target: ImageRecord, incoming) -> bool:
+    return target.has_ai_suggestion and any(
+        _same_file(incoming, path) for path in (target.image_path, target.pending_image_path) if path
+    )
+
+
+@contextmanager
+def _item_checkpoint(job, item, state_lock, *, bump_catalog=True):
+    """Commit the item and catalog together before a sibling can save this checkpoint."""
+    with state_lock:
+        previous = dict(item)
+        try:
+            with catalog._database(bump_catalog=bump_catalog) as conn:
+                yield conn
+                _put(conn, job)
+        except Exception:
+            item.clear()
+            item.update(previous)
+            raise
+
+
+def _cleanup_checkpoint_image(path, record):
+    # Cleanup is after commit. A storage error cannot turn a saved result back into an AI failure.
+    try:
+        catalog.discard_unreferenced_image(path, record)
+    except Exception:
+        logging.getLogger(__name__).warning("款式 %s 的未引用图片副本未清理，任务结果已保存", record.id)
+
+
 def _tag_replacement(item, tagger, job, state_lock) -> str:
     """Attach a re-uploaded 本厂产品 photo to the existing 款号. Returns insert when the target is gone."""
     target_id = item["replacement_of"]
@@ -260,38 +291,37 @@ def _tag_replacement(item, tagger, job, state_lock) -> str:
     target = catalog.get_record(target_id)
     if target is None:
         return "insert"
-    if target.has_ai_suggestion and (_same_file(new_path, target.image_path) or (
-            target.pending_image_path and _same_file(new_path, target.pending_image_path))):
-        Path(new_path).unlink(missing_ok=True)
-        with state_lock:
+    if same_tagged_factory_image(target, new_path):
+        with _item_checkpoint(job, item, state_lock, bump_catalog=False) as conn:
+            lock = " FOR UPDATE" if is_mysql(conn) else ""
+            row = conn.execute("SELECT revision FROM records WHERE id=?" + lock, (target_id,)).fetchone()
+            if not row or row[0] != target.revision:
+                raise CatalogConflict("这张图片已更新，请检查后重试")
             item.update(state="done", error="", skipped=True, filtered=False, record=target.model_dump())
-            with catalog._database(bump_catalog=False) as conn:
-                _put(conn, job)
+        _cleanup_checkpoint_image(new_path, target)
         return "done"
     suggestion = tagger.tag(new_path, target.notes.text()) if tagger else None
     validate_suggestion(suggestion)
-    with state_lock:
-        with catalog._database() as conn:
-            current_row = conn.execute("SELECT payload FROM records WHERE id=?", (target_id,)).fetchone()
-            if not current_row:
-                return "insert"
-            current = ImageRecord.model_validate_json(current_row[0])
-            if current.revision != target.revision:
-                raise CatalogConflict("这张图片已更新，请检查后重试")
-            apply_suggestion(current, suggestion, tagger.name)
-            previous_pending = current.pending_image_path
-            resolved_new_path = str(Path(new_path).resolve())
-            current.pending_image_path = resolved_new_path
-            catalog._adopt_pending_image(current)
-            current.style_code = current.style_code or target.style_code
-            current.revision = catalog._save(
-                conn, current, "image_replaced", note="新图片识别成功后生效，原图和人工标签已保留",
-            )
-            warm_thumbnail_from_local(current, resolved_new_path)
-            item.update(state="done", error="", filtered=False, skipped=False, replacement=True, record=current.model_dump())
-            _put(conn, job)
+    with _item_checkpoint(job, item, state_lock) as conn:
+        current_row = conn.execute("SELECT payload FROM records WHERE id=?", (target_id,)).fetchone()
+        if not current_row:
+            return "insert"
+        current = ImageRecord.model_validate_json(current_row[0])
+        if current.revision != target.revision:
+            raise CatalogConflict("这张图片已更新，请检查后重试")
+        apply_suggestion(current, suggestion, tagger.name)
+        previous_pending = current.pending_image_path
+        resolved_new_path = str(Path(new_path).resolve())
+        current.pending_image_path = resolved_new_path
+        catalog._adopt_pending_image(current)
+        current.style_code = current.style_code or target.style_code
+        current.revision = catalog._save(
+            conn, current, "image_replaced", note="新图片识别成功后生效，原图和人工标签已保留",
+        )
+        warm_thumbnail_from_local(current, resolved_new_path)
+        item.update(state="done", error="", filtered=False, skipped=False, replacement=True, record=current.model_dump())
     if previous_pending and previous_pending != current.pending_image_path:
-        catalog.discard_unreferenced_image(previous_pending, current)
+        _cleanup_checkpoint_image(previous_pending, current)
     return "done"
 
 
@@ -450,18 +480,11 @@ def _process_item(job, item, tagger, state_lock, stop_event, flush_state=None):
         suggestion = tagger.tag(record.image_path, record.notes.text()) if tagger else None
         validate_suggestion(suggestion)
         # Commit the result and checkpoint together. Sibling completions cannot overwrite it.
-        with state_lock, catalog._database() as conn:
-            previous = dict(item)
-            try:
-                apply_suggestion(record, suggestion, tagger.name)
-                record.revision = catalog._save(conn, record)
-                warm_thumbnail_from_local(record, local_before_save)
-                item.update(state='done', error='', filtered=False, record=record.model_dump())
-                _put(conn, job)
-            except Exception:
-                item.clear()
-                item.update(previous)
-                raise
+        with _item_checkpoint(job, item, state_lock) as conn:
+            apply_suggestion(record, suggestion, tagger.name)
+            record.revision = catalog._save(conn, record)
+            warm_thumbnail_from_local(record, local_before_save)
+            item.update(state='done', error='', filtered=False, record=record.model_dump())
     except Exception as exc:
         blocked = getattr(exc, 'status_code', None) in {401, 402, 403, 429} or getattr(exc, 'code', None) == 'insufficient_quota'
         if blocked:
@@ -482,7 +505,7 @@ def _complete_job(job):
     has_errors = bool(blocked) or any(i["state"] not in {"done", "deleted"} for i in [*job["items"], *job["files"]])
     successes = sum(i["state"] == "done" for i in job["items"])
     filtered = sum(i["state"] == "done" and i.get("filtered", False) for i in job["items"])
-    skipped = sum(bool(i.get("skipped")) for i in job["items"])
+    skipped = sum(i["state"] == "done" and bool(i.get("skipped")) for i in job["items"])
     state = ("partial" if successes else "failed") if has_errors else "completed"
     kept = successes - filtered - skipped
     message = blocked or ("已保存成功结果，可重试剩余项目" if has_errors else
@@ -492,7 +515,7 @@ def _complete_job(job):
                "图片与已有款号相同，未重复导入")
     if filtered and not blocked:
         message += f"（已自动过滤 {filtered} 张非款式图）"
-    replacements = sum(bool(item.get("replacement")) for item in job["items"])
+    replacements = sum(item["state"] == "done" and bool(item.get("replacement")) for item in job["items"])
     if replacements and not blocked:
         message += f"（{replacements} 张已替换为新图，历史原图和人工标签已保留）"
     hint = _table_upload_hint(job)
@@ -530,7 +553,7 @@ def _enqueue_job(job_id):
 
 
 def run_job(job_id):
-    """Synchronous entry point for scripts/tests; uses the same global two slots."""
+    """Synchronous entry point for scripts/tests; uses the shared image worker pool."""
     return _enqueue_job(job_id).result()
 
 

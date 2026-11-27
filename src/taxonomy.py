@@ -7,11 +7,35 @@ assigns one and the original wording is stored here.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import Lock
 
 UNSORTED = "待归类"
 SLEEVE_LENGTHS = ("无袖", "短袖", "中袖", "长袖")
 FABRICS = ("针织", "梭织")
 _SLEEVE_PREFIXES = ("长袖", "短袖", "中袖", "无袖")
+
+# Ordered from specific garment terms to shorter aliases.
+NECK_ALIASES = {
+    "连帽": ("帽子套头衫", "帽子套衫", "帽子开衫", "帽子衫", "连帽", "帽兜", "帽衫", "带帽", "卫衣帽"),
+    "堆堆领": ("堆堆领",), "半高领": ("半高领", "小高领", "中领"), "高领": ("翻高领", "高领"),
+    "翻领": ("翻领", "反领", "polo"), "V领": ("鸡心领", "v领", "深v", "大v"),
+    "方领": ("方领",), "一字领": ("一字领", "船领"), "立领": ("立领",),
+    "连领": ("连领",), "圆领": ("圆领",), "无领": ("无领",),
+}
+
+def canonical_neckline(value: str) -> str:
+    text = value.strip().casefold()
+    return next((name for name, aliases in NECK_ALIASES.items() if text in aliases or text == name.casefold()), value)
+
+
+_ERP_STRUCTURES = (
+    ("帽子衫", "上衣", "套衫", "", ""),
+    ("假两件帽子衫", "上衣", "假两件套衫", "", ""),
+    ("帽子套头衫", "上衣", "套衫", "", ""),
+    ("帽子套衫", "上衣", "套衫", "", ""),
+    ("帽子开衫", "上衣", "开衫", "", ""),
+    ("假两件", "上衣", "假两件套衫", "", ""),
+)
 
 # level1, child names. A row with an empty child is the level itself.
 TREE = (
@@ -26,6 +50,7 @@ TREE = (
 
 # phrase, level1, level2, sleeve, fabric. Covers archive wording and common aliases.
 SEED_SYNONYMS = (
+    *_ERP_STRUCTURES,
     ("长袖套衫", "上衣", "套衫", "长袖", "针织"),
     ("假两件套衫", "上衣", "假两件套衫", "长袖", "针织"),
     ("短袖套衫", "上衣", "套衫", "短袖", "针织"),
@@ -286,6 +311,7 @@ def ensure_taxonomy(conn) -> Taxonomy:
         ),
         "accessory_synonyms_v1",
     )
+    _ensure_builtin_synonyms(conn, _ERP_STRUCTURES, "erp_structure_synonyms_v2")
     # Seeding runs before the catalog transaction starts. Close it so BEGIN IMMEDIATE can open.
     if conn.in_transaction:
         conn.commit()
@@ -344,6 +370,10 @@ def read_taxonomy(conn) -> Taxonomy:
     for row in conn.execute(
         "SELECT phrase_key, phrase, level1, level2, sleeve_length, fabric, learned FROM category_synonyms"
     ):
+        if row["learned"] and row["phrase_key"] in {phrase_key("其他"), phrase_key(UNSORTED)}:
+            # Older manual corrections could accidentally classify every generic placeholder alike.
+            synonyms[row["phrase_key"]] = Synonym(row["phrase"], UNSORTED, "", "", "", False)
+            continue
         synonyms[row["phrase_key"]] = Synonym(
             row["phrase"], row["level1"], row["level2"], row["sleeve_length"], row["fabric"], bool(row["learned"]),
         )
@@ -357,13 +387,14 @@ def resolve(phrase: str, *, factory: bool = False) -> Placement:
     if not key:
         return Placement(UNSORTED, "", "", "针织" if factory else "", raw, True)
 
+    explicit_sleeve = next((v for v in _SLEEVE_PREFIXES if raw.startswith(v)), "")
     split = _split_known(raw, taxonomy)
     if split is not None:
         level1, level2 = split
         sleeve, fabric = _attrs_for(key, taxonomy)
         if factory and not fabric:
             fabric = "针织"
-        return Placement(level1, level2, sleeve, fabric, raw, False)
+        return Placement(level1, level2, explicit_sleeve or sleeve, fabric, raw, False)
 
     found = taxonomy.synonyms.get(key)
     if found is None:
@@ -371,13 +402,13 @@ def resolve(phrase: str, *, factory: bool = False) -> Placement:
             if key.startswith(phrase_key(prefix)) and len(key) > len(phrase_key(prefix)):
                 rest = taxonomy.synonyms.get(key[len(phrase_key(prefix)):])
                 if rest is not None:
-                    sleeve = rest.sleeve or prefix
+                    sleeve = prefix
                     fabric = rest.fabric or ("针织" if factory else "")
                     return Placement(rest.level1, rest.level2, sleeve, fabric, raw, False)
         return Placement(UNSORTED, "", "", "针织" if factory else "", raw, True)
 
     fabric = found.fabric or ("针织" if factory else "")
-    return Placement(found.level1, found.level2, found.sleeve, fabric, raw, False)
+    return Placement(found.level1, found.level2, explicit_sleeve or found.sleeve, fabric, raw, False)
 
 
 def _split_known(raw: str, taxonomy: Taxonomy) -> tuple[str, str] | None:
@@ -535,7 +566,7 @@ def usage_count(conn, level1: str, level2: str = "") -> int:
     return total
 
 
-def save_synonym(conn, phrase: str, level1: str, level2: str = "", sleeve: str = "", fabric: str = "", *, learned: bool = False) -> Taxonomy:
+def _write_synonym(conn, phrase: str, level1: str, level2: str = "", sleeve: str = "", fabric: str = "", *, learned: bool) -> None:
     phrase = (phrase or "").strip()
     level2 = level2 or ""
     sleeve = (sleeve or "").strip()
@@ -563,6 +594,10 @@ def save_synonym(conn, phrase: str, level1: str, level2: str = "", sleeve: str =
         ),
         (phrase_key(phrase), phrase, level1, level2, sleeve, fabric, 1 if learned else 0),
     )
+
+
+def save_synonym(conn, phrase: str, level1: str, level2: str = "", sleeve: str = "", fabric: str = "", *, learned: bool = False) -> Taxonomy:
+    _write_synonym(conn, phrase, level1, level2, sleeve, fabric, learned=learned)
     return _remember(conn, read_taxonomy(conn))
 
 
@@ -571,27 +606,38 @@ def delete_synonym(conn, phrase: str) -> Taxonomy:
     return _remember(conn, read_taxonomy(conn))
 
 
-def learn_phrase(conn, phrase: str, level1: str, level2: str = "", sleeve: str = "", fabric: str = "") -> None:
-    """Remember an unsorted wording. Canonical labels and seeded specifics stay put."""
+def learn_phrase(conn, phrase: str, level1: str, level2: str = "", sleeve: str = "", fabric: str = "") -> bool:
+    """Store a concrete unknown phrase; callers refresh the vocabulary after commit."""
     key = phrase_key(phrase)
-    if not key or key in {phrase_key(label_of(level1, level2)), phrase_key(UNSORTED)}:
-        return
+    if not key or key in {phrase_key(label_of(level1, level2)), phrase_key(UNSORTED), phrase_key("其他")}:
+        return False
     current = active().synonyms.get(key)
     if current is not None and not current.learned and current.level1 != UNSORTED:
-        return
+        return False
     placement = resolve(phrase)
     if current is None and not placement.unmapped and placement.label != UNSORTED:
-        return
+        return False
     try:
         _require_node(active(), level1, level2)
     except TaxonomyError:
-        return
-    save_synonym(
+        return False
+    _write_synonym(
         conn, phrase, level1, level2,
         sleeve or (current.sleeve if current else ""),
         fabric or (current.fabric if current else ""),
         learned=True,
     )
+    return True
+
+
+_LEARNED_REFRESH_LOCK = Lock()
+
+
+def refresh_learned_phrases() -> None:
+    """Publish committed edits in read order, including concurrent corrections to other phrases."""
+    from src import catalog
+    with _LEARNED_REFRESH_LOCK, catalog.read_database() as conn:
+        _remember(conn, read_taxonomy(conn))
 
 
 def _rewrite_label(conn, old: str, new: str) -> None:
@@ -654,10 +700,12 @@ def migrate_record_labels(conn) -> None:
                 changed = True
             if placement.sleeve and not block.get("袖长"):
                 block["袖长"] = placement.sleeve
+                block["袖长来源"] = "品名" if phrase.startswith(_SLEEVE_PREFIXES) else "词表"
                 sleeve = sleeve or placement.sleeve
                 changed = True
             if placement.fabric and not block.get("面料"):
                 block["面料"] = placement.fabric
+                block["面料来源"] = "词表"
                 fabric = fabric or placement.fabric
                 changed = True
         if raw_phrase and not data.get("category_raw"):

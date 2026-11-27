@@ -9,7 +9,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from src import catalog, storage
-from src.factory.archive import parse_archive_rows, write_archive
+from src.factory.archive import archive_db_fields, parse_archive_rows, write_archive
 from src.factory.codes import parse_style_code
 from src.factory.excel_io import (cell_at, column_index, find_header, load_sheet_rows, parse_number,
                                  plain_text, sheet_headers, table_kind_from_headers)
@@ -112,7 +112,7 @@ def workspace(status="missing", query="", page=1, page_size=20, *, verify_remote
 
 
 def _fingerprint(conn, complete=None, *, tables_data: dict[str, list[dict]] | None = None) -> str:
-    state: dict = {"style_grouping": "starred_style_codes_v1", "archive_template": "product_table_11_columns_v1"}
+    state: dict = {"style_grouping": "starred_style_codes_v1", "archive_template": "product_table_provided_columns_v2"}
     for table in ("style_variants", "style_sales", "style_order_lines"):
         raw_rows = (
             tables_data[table]
@@ -129,9 +129,7 @@ def _fingerprint(conn, complete=None, *, tables_data: dict[str, list[dict]] | No
 
 def _row_data(kind, item):
     if kind == "archive":
-        return {**{k: v for k, v in item.items() if k not in {"colors", "sizes"}},
-                "colors_json": json.dumps(item["colors"], ensure_ascii=False),
-                "sizes_json": json.dumps(item["sizes"], ensure_ascii=False)}
+        return archive_db_fields(item)
     return {k: v for k, v in item.items() if k != "extra_json"}
 
 
@@ -205,11 +203,6 @@ def preview_table(path: Path, filename: str, requested_kind: str) -> dict:
     if kind == "archive":
         rows, skipped, warnings, recognized = parse_archive_rows(path, sheet_rows=sheet_rows)
         meta = {**recognized, "skipped_rows": skipped, "warnings": warnings}
-        missing_fields = [r["variant_code"] for r in rows if not r["category"] or not r["material"]]
-        if missing_fields:
-            meta["warnings"] = [*warnings, f"{len(missing_fields)} 款缺少一级品类或原料名称（"
-                                + "、".join(missing_fields[:8]) + ("等" if len(missing_fields) > 8 else "")
-                                + "），季度款式分析会单列为「未填品类 / 其他原料」，建议补填后重新导入。"]
     else:
         rows, meta = parse_sales_rows(path, sheet_rows=sheet_rows)
         stock_lines = meta.pop("stock_lines", [])
@@ -227,6 +220,14 @@ def preview_table(path: Path, filename: str, requested_kind: str) -> dict:
             else "style_order_lines" if meta["format"] == "sales_lines"
             else "style_sales"
         )
+        if kind == "archive":
+            existing = {r["variant_code"]: r for r in tables_data[target_table]}
+            effective = [{**existing.get(r["variant_code"], {}), **r} for r in rows]
+            missing_fields = [r["variant_code"] for r in effective if not r.get("category") or not r.get("material")]
+            if missing_fields:
+                meta["warnings"] = [*warnings, f"{len(missing_fields)} 款缺少一级品类或原料名称（"
+                                    + "、".join(missing_fields[:8]) + ("等" if len(missing_fields) > 8 else "")
+                                    + "），季度款式分析会单列为「未填品类 / 其他原料」，建议补填后重新导入。"]
         plan = _plan(conn, kind, rows, meta["format"], table_rows=tables_data[target_table])
         archive_codes = {r["style_code"] for r in tables_data["style_variants"]}
         sales_codes = {r["style_code"] for r in tables_data["style_sales"]} | {

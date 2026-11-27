@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import {
   analyzeSalesAttribution, analyzeSalesSelection, exportSalesAttributionPdf,
   exportSalesSelectionPdf, exportSalesSelectionXlsx, previewSalesAttribution,
   previewSalesCustomers, previewSalesSelection, salesOptions, saveSalesDecision, searchSalesStyles,
   type AttributionReport, type CustomerInsightReport, type DecisionStatus, type OwnStyleSearchHit,
-  type SalesOptions, type SelectionCandidate, type SelectionReport,
+  type SalesOptions, type SelectionCandidate, type SelectionReport, type SelectionFilters,
 } from '../analyticsApi'
 
 const props = defineProps<{
@@ -31,7 +31,8 @@ const styleSearching = ref(false)
 let styleSearchTimer: number | null = null
 const excludeBusyPatterns = ref(true)
 const selectedStyles = ref<string[]>([])
-const excludedRecordIds = ref<string[]>([])
+const savingDecision = ref(false)
+const noteDrafts = ref<Record<string, string>>({})
 const batchNumber = ref(1)
 const selectedCustomer = ref('')
 const customerQuery = ref('')
@@ -49,7 +50,7 @@ const showDuplicates = ref(false)
 const showAiRejected = ref(false)
 const showAiDropped = ref(false)
 
-const isBusy = computed(() => loadingPreview.value || runningAi.value || exporting.value)
+const isBusy = computed(() => loadingPreview.value || runningAi.value || exporting.value || savingDecision.value)
 watch(isBusy, (v) => emit('update:busy', v))
 
 function errMsg(reason: unknown) {
@@ -96,11 +97,17 @@ watch(() => [props.active, props.mode], async ([act]) => {
   if (act) await ensureInit()
 }, { immediate: true })
 
-function resetSelectionBatch() {
-  excludedRecordIds.value = []
-  batchNumber.value = 1
+function displaySelection(report: SelectionReport, batch: number) {
+  selReport.value = report
+  noteDrafts.value = {}
+  batchNumber.value = batch
   showAiRejected.value = false
   showAiDropped.value = false
+}
+
+function displayedFilters(report: SelectionReport): SelectionFilters {
+  const { exclude_record_ids_count, ...filters } = report.scope
+  return filters
 }
 
 function buildSelectionPayload() {
@@ -115,7 +122,7 @@ function buildSelectionPayload() {
     exclude_busy_patterns: excludeBusyPatterns.value,
     styles: selectedStyles.value,
     scan_limit: scanLimit.value,
-    exclude_record_ids: excludedRecordIds.value,
+    exclude_record_ids: [],
     skip_rejected: true,
   }
 }
@@ -126,7 +133,6 @@ function toggleSeason(s: string) {
   } else {
     seasons.value = [...seasons.value, s]
   }
-  resetSelectionBatch()
 }
 
 function toggleSource(s: string) {
@@ -135,7 +141,6 @@ function toggleSource(s: string) {
   } else {
     extSources.value = [...extSources.value, s]
   }
-  resetSelectionBatch()
 }
 
 function toggleCatalogSeason(s: string) {
@@ -144,7 +149,6 @@ function toggleCatalogSeason(s: string) {
   } else {
     catalogSeasons.value = [...catalogSeasons.value, s]
   }
-  resetSelectionBatch()
 }
 
 function toggleStyleFilter(st: string) {
@@ -153,22 +157,31 @@ function toggleStyleFilter(st: string) {
   } else {
     selectedStyles.value = [...selectedStyles.value, st]
   }
-  resetSelectionBatch()
 }
 
 async function pickHeroStyle(code: string) {
   if (isBusy.value) return
+  invalidateStyleSearch()
   styleSearchOpen.value = false
   if (!code) styleSearchQuery.value = ''
-  if (targetStyleCode.value === code && batchNumber.value === 1) return
+  if (selReport.value?.scope.target_style_code === code && batchNumber.value === 1) return
   targetStyleCode.value = code
-  resetSelectionBatch()
   await refreshCurrentMode()
 }
 
+let searchGeneration = 0
+function invalidateStyleSearch() {
+  searchGeneration++
+  if (styleSearchTimer !== null) window.clearTimeout(styleSearchTimer)
+  styleSearching.value = false
+  styleSearchHits.value = []
+}
+onBeforeUnmount(invalidateStyleSearch)
+
 function onStyleSearchInput() {
+  invalidateStyleSearch()
+  const generation = searchGeneration
   const q = styleSearchQuery.value.trim()
-  if (styleSearchTimer) window.clearTimeout(styleSearchTimer)
   if (!q) {
     styleSearchHits.value = []
     styleSearchOpen.value = false
@@ -179,38 +192,37 @@ function onStyleSearchInput() {
     styleSearching.value = true
     try {
       const res = await searchSalesStyles(q, 12)
-      styleSearchHits.value = res.items || []
+      if (generation === searchGeneration) styleSearchHits.value = res.items || []
     } catch {
-      styleSearchHits.value = []
+      if (generation === searchGeneration) styleSearchHits.value = []
     } finally {
-      styleSearching.value = false
+      if (generation === searchGeneration) styleSearching.value = false
     }
   }, 180)
 }
 
 async function chooseSearchedStyle(hit: OwnStyleSearchHit) {
   if (isBusy.value) return
+  invalidateStyleSearch()
   styleSearchQuery.value = hit.code
   styleSearchOpen.value = false
   targetStyleCode.value = hit.code
-  resetSelectionBatch()
   await refreshCurrentMode()
 }
 
 async function submitStyleSearch() {
   if (isBusy.value) return
+  invalidateStyleSearch()
   const q = styleSearchQuery.value.trim()
   styleSearchOpen.value = false
   if (!q) {
     if (targetStyleCode.value) {
       targetStyleCode.value = ''
-      resetSelectionBatch()
-      await refreshCurrentMode()
+        await refreshCurrentMode()
     }
     return
   }
   targetStyleCode.value = q
-  resetSelectionBatch()
   await refreshCurrentMode()
 }
 
@@ -232,14 +244,12 @@ async function refreshCurrentMode() {
       })
     } else if (props.mode === 'selection') {
       const res = await previewSalesSelection(buildSelectionPayload())
-      selReport.value = res
+      displaySelection(res, 1)
       if (res.scope.category && res.scope.category !== category.value) {
         category.value = res.scope.category
       }
       if (res.target_hero) {
         targetStyleCode.value = res.target_hero.code
-      } else if (targetStyleCode.value && !res.target_hero) {
-        targetStyleCode.value = ''
       }
     } else if (props.mode === 'customers') {
       const res = await previewSalesCustomers({
@@ -259,9 +269,11 @@ async function refreshCurrentMode() {
 
 async function pickCategory(cat: string) {
   if (category.value === cat && ((props.mode === 'attribution' && attrReport.value) || (props.mode === 'selection' && selReport.value))) return
-  category.value = cat
+  invalidateStyleSearch()
+  styleSearchQuery.value = ''
+  styleSearchOpen.value = false
   targetStyleCode.value = ''
-  resetSelectionBatch()
+  category.value = cat
   await refreshCurrentMode()
 }
 
@@ -276,12 +288,9 @@ async function runAttributionDeepAi(force = false) {
   error.value = ''
   runningAi.value = true
   try {
-    attrReport.value = await analyzeSalesAttribution({
-      seasons: seasons.value,
-      category: category.value,
-      cutoff: null,
-      include_brand: includeBrand.value,
-    }, force)
+    if (!attrReport.value) return
+    const { seasons, category, cutoff, include_brand } = attrReport.value.scope
+    attrReport.value = await analyzeSalesAttribution({ seasons, category, cutoff, include_brand }, force)
   } catch (e) {
     error.value = errMsg(e)
   } finally {
@@ -294,13 +303,9 @@ async function downloadAttributionPdf() {
   exporting.value = true
   error.value = ''
   try {
-    const blob = await exportSalesAttributionPdf({
-      seasons: seasons.value,
-      category: category.value,
-      cutoff: null,
-      include_brand: includeBrand.value,
-    })
-    triggerDownload(blob, `本厂爆款归因-${category.value}-${seasons.value.join('_')}.pdf`)
+    const { seasons, category } = attrReport.value.scope
+    const blob = await exportSalesAttributionPdf(attrReport.value.report_id)
+    triggerDownload(blob, `本厂爆款归因-${category}-${seasons.join('_')}.pdf`)
   } catch (e) {
     error.value = errMsg(e)
   } finally {
@@ -309,11 +314,12 @@ async function downloadAttributionPdf() {
 }
 
 async function runSelectionDeepAi(force = false) {
-  if (isBusy.value || !seasons.value.length) return
+  const report = selReport.value
+  if (isBusy.value || !report || report.ai_blocked_reason) return
   error.value = ''
   runningAi.value = true
   try {
-    selReport.value = await analyzeSalesSelection(buildSelectionPayload(), force)
+    displaySelection(await analyzeSalesSelection(displayedFilters(report), force, report.snapshot), batchNumber.value)
   } catch (e) {
     error.value = errMsg(e)
   } finally {
@@ -321,27 +327,30 @@ async function runSelectionDeepAi(force = false) {
   }
 }
 
-async function loadNextSelectionBatch() {
-  if (isBusy.value || !selReport.value) return
-  const hadAi = Boolean(selReport.value.ai_selection)
-  const batchIds = hadAi
-    ? (selReport.value.ai_selection?.scanned_record_ids || selReport.value.scan_candidate_ids || [])
-    : selReport.value.shortlist.map(i => i.record_id)
-  if (!batchIds.length) return
-  const merged = new Set([...excludedRecordIds.value, ...batchIds])
-  excludedRecordIds.value = Array.from(merged)
-  batchNumber.value += 1
-  if (hadAi && selReport.value.ai_status.ready) {
-    await runSelectionDeepAi(false)
-  } else {
-    await refreshCurrentMode()
+async function changeBatch(first = false) {
+  const report = selReport.value
+  if (isBusy.value || !report) return
+  const filters = displayedFilters(report)
+  const seen = report.ai_selection?.scanned_record_ids ?? report.shortlist.map(i => i.record_id)
+  filters.exclude_record_ids = first ? [] : [...new Set([...(filters.exclude_record_ids || []), ...seen])]
+  loadingPreview.value = true
+  error.value = ''
+  try {
+    const next = report.ai_selection && !first
+      ? await analyzeSalesSelection(filters)
+      : await previewSalesSelection(filters)
+    if (!first && report.ai_selection && !next.ai_selection) {
+      throw new Error(next.ai_blocked_reason || '下一批尚未完成视觉评审，已保留当前批次。')
+    }
+    if (!first && next.ai_selection?.retry_record_ids.length && !next.ai_selection.scanned_record_ids.length) {
+      throw new Error('下一批图片评审失败，已保留当前批次，可再次换批重试。')
+    }
+    displaySelection(next, first ? 1 : batchNumber.value + 1)
+  } catch (e) {
+    error.value = errMsg(e)
+  } finally {
+    loadingPreview.value = false
   }
-}
-
-async function resetToFirstBatch() {
-  if (isBusy.value) return
-  resetSelectionBatch()
-  await refreshCurrentMode()
 }
 
 const activeSelectionItems = computed<SelectionCandidate[]>(() => {
@@ -354,26 +363,29 @@ const adoptedCount = computed(() => activeSelectionItems.value.filter(i => i.dec
 const hasNextBatch = computed(() => {
   if (!selReport.value) return false
   if (selReport.value.ai_selection) {
-    return selReport.value.funnel.remaining_unscanned > 0
+    return selReport.value.ai_selection.scanned_record_ids.length > 0 && selReport.value.funnel.remaining_unscanned > 0
   }
   return selReport.value.funnel.gate2_scored_pool > selReport.value.shortlist.length
 })
 
-async function setDecision(item: SelectionCandidate, status: DecisionStatus) {
-  const nextStatus: DecisionStatus = item.decision === status ? 'none' : status
-  item.decision = nextStatus
+async function setDecision(item: SelectionCandidate, status: DecisionStatus, input?: HTMLInputElement) {
+  const report = selReport.value
+  if (!report || isBusy.value) return
+  savingDecision.value = true
+  const nextStatus = input ? item.decision : (item.decision === status ? 'none' : status)
   try {
-    await saveSalesDecision(item.record_id, nextStatus, item.decision_note || '')
+    const saved = await saveSalesDecision(report.report_id, item.record_id, nextStatus, input?.value ?? noteDrafts.value[item.record_id] ?? item.decision_note ?? '')
+    item.decision = saved.status
+    item.decision_note = saved.note
+    report.report_id = saved.report_id
+    delete noteDrafts.value[item.record_id]
+    if (input) input.value = saved.note
   } catch (e) {
+    delete noteDrafts.value[item.record_id]
+    if (input) input.value = item.decision_note || ''
     error.value = errMsg(e)
-  }
-}
-
-async function saveNote(item: SelectionCandidate) {
-  try {
-    await saveSalesDecision(item.record_id, item.decision || 'none', item.decision_note || '')
-  } catch (e) {
-    error.value = errMsg(e)
+  } finally {
+    savingDecision.value = false
   }
 }
 
@@ -382,10 +394,11 @@ async function downloadSelectionPdf() {
   exporting.value = true
   error.value = ''
   try {
-    const blob = await exportSalesSelectionPdf(buildSelectionPayload(), onlyAdoptedExport.value)
+    const blob = await exportSalesSelectionPdf(selReport.value.report_id, onlyAdoptedExport.value)
     const prefix = onlyAdoptedExport.value ? '已采纳打版清单' : '外部图库微创新选款'
-    const heroSuffix = targetStyleCode.value ? `-${targetStyleCode.value}` : ''
-    triggerDownload(blob, `${prefix}-${category.value}${heroSuffix}-${seasons.value.join('_')}.pdf`)
+    const scope = selReport.value.scope
+    const heroSuffix = scope.target_style_code ? `-${scope.target_style_code}` : ''
+    triggerDownload(blob, `${prefix}-${scope.category}${heroSuffix}-${scope.seasons.join('_')}.pdf`)
   } catch (e) {
     error.value = errMsg(e)
   } finally {
@@ -398,10 +411,11 @@ async function downloadSelectionXlsx() {
   exporting.value = true
   error.value = ''
   try {
-    const blob = await exportSalesSelectionXlsx(buildSelectionPayload(), onlyAdoptedExport.value)
+    const blob = await exportSalesSelectionXlsx(selReport.value.report_id, onlyAdoptedExport.value)
     const prefix = onlyAdoptedExport.value ? '已采纳打版清单' : '选款打版清单'
-    const heroSuffix = targetStyleCode.value ? `-${targetStyleCode.value}` : ''
-    triggerDownload(blob, `${prefix}-${category.value}${heroSuffix}-${seasons.value.join('_')}.xlsx`)
+    const scope = selReport.value.scope
+    const heroSuffix = scope.target_style_code ? `-${scope.target_style_code}` : ''
+    triggerDownload(blob, `${prefix}-${scope.category}${heroSuffix}-${scope.seasons.join('_')}.xlsx`)
   } catch (e) {
     error.value = errMsg(e)
   } finally {
@@ -509,7 +523,7 @@ const filteredCustomers = computed(() => {
 
         <label class="sales-pool-select">
           视觉海选扫图
-          <select v-model.number="scanLimit" :disabled="isBusy" @change="resetSelectionBatch(); refreshCurrentMode()">
+          <select v-model.number="scanLimit" :disabled="isBusy" @change="refreshCurrentMode()">
             <option :value="64">快速扫 64 张</option>
             <option :value="128">标准扫 128 张</option>
             <option :value="200">深度扫 200 张</option>
@@ -530,7 +544,7 @@ const filteredCustomers = computed(() => {
       <!-- Quality Guardrail & Style Filter Row -->
       <div v-if="mode === 'selection'" class="sales-control-row sales-guard-row">
         <label class="sales-brand-toggle sales-guard-toggle">
-          <input v-model="excludeBusyPatterns" type="checkbox" :disabled="isBusy" @change="resetSelectionBatch(); refreshCurrentMode()" />
+          <input v-model="excludeBusyPatterns" type="checkbox" :disabled="isBusy" @change="refreshCurrentMode()" />
           排除大花卉 / 碎花 / 满身花纹（保高级实穿调性）
         </label>
 
@@ -564,7 +578,7 @@ const filteredCustomers = computed(() => {
         <div>
           <h2>{{ attrReport.scope.category }} · 本厂爆款胜率对照与深度归因</h2>
           <p>
-            对比高卖/高补单款与滞销无产量款，区分「多客户通吃复购款」与「大客户包场款」。支持一键导出图文 PDF 发给个人 AI 继续追问。
+            对比高卖/高补单款与有生产和订单记录的低销量款，区分「多客户通吃复购款」与「大客户包场款」。支持一键导出图文 PDF 发给个人 AI 继续追问。
           </p>
         </div>
         <div class="sales-action-buttons">
@@ -631,7 +645,7 @@ const filteredCustomers = computed(() => {
         </div>
 
         <div v-if="attrReport.ai_insight.losing_pitfalls?.length" class="sales-pitfall-box">
-          <h4>滞销 / 无产量避坑提示</h4>
+          <h4>已生产低销量避坑提示</h4>
           <ul>
             <li v-for="(p, idx) in attrReport.ai_insight.losing_pitfalls" :key="idx">
               <strong>{{ p.title }}：</strong>{{ p.reason }}
@@ -661,7 +675,7 @@ const filteredCustomers = computed(() => {
       <section class="sales-section">
         <div class="analytics-section-title">
           <h3>各维度客观胜率对照表</h3>
-          <p>按高卖爆款数与爆款率排序，直观识别本品类真正跑出来的材质、价位与视觉特征</p>
+          <p>销售按客户版本统计，共 {{ attrReport.overview.independent_styles }} 个基础款。视觉维度按 {{ attrReport.overview.independent_images }} 张独立图片计权。</p>
         </div>
         <div class="sales-dim-grid">
           <div v-for="dim in attrReport.dimensions" :key="dim.key" class="sales-dim-card">
@@ -730,7 +744,7 @@ const filteredCustomers = computed(() => {
 
       <section v-if="attrReport.sample_laggards.length" class="sales-section">
         <div class="analytics-section-title">
-          <h3>滞销 / 无产量对照样本</h3>
+          <h3>已生产低销量对照样本</h3>
           <p>供对照排查版型、元素或纱线匹配问题</p>
         </div>
         <div class="sales-card-grid is-compact">
@@ -768,7 +782,7 @@ const filteredCustomers = computed(() => {
                 当前锁定款号 <b>{{ selReport.target_hero.code }}</b>（{{ selReport.target_hero.grade }} · {{ selReport.target_hero.quantity.toLocaleString() }}件{{ selReport.target_hero.cat2 ? ` · ERP细分:${selReport.target_hero.cat2}` : '' }}）专项找微创新升级款
               </template>
               <template v-else>
-                支持搜索任意本厂有图款号（含往季款与新样衣），或直接点选下方热销爆款；也可保持「全品类爆款综合」
+                可按完整款号搜索本季、往季或图库样衣。缺少本厂原图的款式仅提供标签预览。
               </template>
             </small>
           </div>
@@ -820,7 +834,7 @@ const filteredCustomers = computed(() => {
           <button
             type="button"
             class="sales-hero-card is-all"
-            :class="{ 'is-selected': !targetStyleCode }"
+            :class="{ 'is-selected': !selReport.scope.target_style_code }"
             :disabled="isBusy"
             @click="pickHeroStyle('')"
           >
@@ -833,7 +847,7 @@ const filteredCustomers = computed(() => {
             :key="h.code"
             type="button"
             class="sales-hero-card"
-            :class="{ 'is-selected': targetStyleCode === h.code }"
+            :class="{ 'is-selected': selReport.scope.target_style_code === h.code }"
             :disabled="isBusy"
             @click="pickHeroStyle(h.code)"
           >
@@ -854,23 +868,24 @@ const filteredCustomers = computed(() => {
         <div>
           <h2>
             {{ selReport.scope.category }}
+            · {{ selReport.scope.seasons.join('、') }}
             <template v-if="selReport.target_hero"> · 围绕 {{ selReport.target_hero.code }} 专项选款</template>
             <template v-else> · 外部图库真视觉微创新选款</template>
           </h2>
           <p>
-            第 1 道自动去重（含外部图库自重）并拦截大花卉/满印 → 第 2 道用 4×4 编号网格让千问肉眼海选扫图 → 第 3 道 1v1 原图并排终审防撞款。
+            报告 {{ selReport.report_id.slice(0, 12) }} · {{ selReport.scope.sources.join('、') }}，{{ selReport.scope.exclude_busy_patterns ? '已开启排花' : '允许花纹' }}。
           </p>
         </div>
         <div class="sales-action-buttons">
           <button
             type="button"
             class="analytics-primary"
-            :disabled="isBusy || !selReport.ai_status.ready || !selReport.scan_candidate_ids.length"
+            :disabled="isBusy || !selReport.ai_status.ready || !!selReport.ai_blocked_reason || !selReport.scan_candidate_ids.length"
             @click="runSelectionDeepAi(Boolean(selReport.ai_selection))"
           >
             {{
               runningAi
-                ? `正在真视觉海选 ${selReport.funnel.scan_pool_size} 张并 1v1 终审（约30–50秒）…`
+                ? `正在真视觉海选 ${selReport.funnel.scan_pool_size} 张并 1v1 终审…`
                 : selReport.ai_selection
                   ? '重新本批 AI 视觉海选'
                   : `AI 真视觉海选 ${selReport.funnel.scan_pool_size} 张 + 1v1 终审`
@@ -880,7 +895,7 @@ const filteredCustomers = computed(() => {
             type="button"
             class="analytics-quiet sales-next-batch-btn"
             :disabled="isBusy || !hasNextBatch"
-            @click="loadNextSelectionBatch"
+            @click="changeBatch()"
           >
             {{ selReport.ai_selection ? '换下一批 AI 海选' : '换下一批预览' }}
           </button>
@@ -900,14 +915,18 @@ const filteredCustomers = computed(() => {
       <!-- Batch & Visual Mode Status Banner -->
       <div v-if="selReport.ai_selection" class="sales-visual-banner is-verified">
         <div class="sales-visual-banner-top">
-          <span class="sales-visual-pill is-verified">✓ {{ selReport.ai_selection.model }} 真视觉海选已完成</span>
+          <span class="sales-visual-pill is-verified">{{ selReport.ai_selection.model }} · {{ selReport.ai_selection.retry_record_ids.length ? '部分图片需重试' : '本批评审完成' }}</span>
           <span class="sales-batch-pill">
-            第 {{ batchNumber }} 批 · 本批实扫 {{ selReport.ai_selection.visual_screened_count || selReport.ai_selection.reviewed_count }} 张（{{ selReport.ai_selection.contact_sheets_count || 0 }} 页拼图）· 池内剩余未看 {{ selReport.funnel.remaining_unscanned }} 张
+            第 {{ batchNumber }} 批 · 本批实扫 {{ selReport.ai_selection.visual_screened_count ?? selReport.ai_selection.reviewed_count }} 张（{{ selReport.ai_selection.contact_sheets_count || 0 }} 页拼图）· 池内待处理 {{ selReport.funnel.remaining_unscanned }} 张
           </span>
-          <button v-if="batchNumber > 1 || excludedRecordIds.length" type="button" class="sales-link-btn" :disabled="isBusy" @click="resetToFirstBatch">
+          <button v-if="batchNumber > 1" type="button" class="sales-link-btn" :disabled="isBusy" @click="changeBatch(true)">
             回到第 1 批
           </button>
         </div>
+        <p v-if="selReport.ai_selection.retry_record_ids.length">
+          {{ selReport.ai_selection.failed_pages.length }} 页失败，{{ selReport.ai_selection.retry_record_ids.length }} 张待重试。
+          <span v-for="item in selReport.ai_selection.unreviewed" :key="item.record_id">{{ item.record_id }} · {{ item.retry_reason }}　</span>
+        </p>
         <p v-if="selReport.ai_selection.hero_visual_read" class="sales-hero-read">
           <strong>AI 肉眼核验本厂参照款：</strong>{{ selReport.ai_selection.hero_visual_read }}
         </p>
@@ -918,12 +937,12 @@ const filteredCustomers = computed(() => {
           <span class="sales-batch-pill">
             第 {{ batchNumber }} 批 · 待海选 {{ selReport.funnel.scan_pool_size }} 张 · 池内总剩余 {{ selReport.funnel.gate2_scored_pool }} 张
           </span>
-          <button v-if="batchNumber > 1 || excludedRecordIds.length" type="button" class="sales-link-btn" :disabled="isBusy" @click="resetToFirstBatch">
+          <button v-if="batchNumber > 1" type="button" class="sales-link-btn" :disabled="isBusy" @click="changeBatch(true)">
             回到第 1 批
           </button>
         </div>
-        <p class="sales-hero-read">
-          下方先按旧标签展示快速预览（旧标签可能存在个别领型或花纹误差）。点击上方 <strong>「AI 真视觉海选 {{ selReport.funnel.scan_pool_size }} 张 + 1v1 终审」</strong>，千问将直接肉眼核验本厂原图（如精准识别帽衫/翻领）并成批视觉筛图，准确率显著更高。
+        <p v-if="!selReport.ai_blocked_reason" class="sales-hero-read">
+          当前卡片按标签排序。运行 AI 海选后可查看原图终审结论。
         </p>
       </div>
 
@@ -954,8 +973,8 @@ const filteredCustomers = computed(() => {
         <div class="sales-funnel-step">
           <span>第 2 道：4×4 真视觉海选</span>
           <template v-if="selReport.ai_selection">
-            <strong>实扫 {{ selReport.ai_selection.visual_screened_count || selReport.ai_selection.reviewed_count }} 张</strong>
-            <small>肉眼精选 {{ selReport.ai_selection.stage1_picked_count || selReport.ai_selection.reviewed_count }} 张进入 1v1</small>
+            <strong>实扫 {{ selReport.ai_selection.visual_screened_count ?? selReport.ai_selection.reviewed_count }} 张</strong>
+            <small>肉眼精选 {{ selReport.ai_selection.stage1_picked_count ?? selReport.ai_selection.reviewed_count }} 张进入 1v1</small>
           </template>
           <template v-else>
             <strong>待扫 {{ selReport.funnel.scan_pool_size }} 张</strong>
@@ -1086,8 +1105,10 @@ const filteredCustomers = computed(() => {
           <div class="sales-pair-info">
             <header class="sales-pair-head">
               <div>
+                <span>{{ item.review_stage === 'ai_final' ? 'AI 终审' : '标签初筛' }}</span>
+                <span v-if="item.knit_evidence === '待看图' && item.review_stage !== 'ai_final'">横机结构待看图</span>
                 <span v-if="item.tier" class="sales-tier-badge" :class="{ 'is-steady': item.tier.includes('稳妥') }">{{ item.tier }}</span>
-                <span v-if="item.stars" class="sales-stars">{{ '★'.repeat(item.stars) }}</span>
+                <span v-if="item.review_stage === 'ai_final' && item.stars" class="sales-stars">{{ '★'.repeat(item.stars) }}</span>
                 <span v-if="item.visual_screen_score" class="sales-vscreen-pill">视觉海选 {{ item.visual_screen_score }} 分</span>
                 <span class="sales-score-pill">标签初评 {{ item.total_score }} 分（基因 {{ item.gene_score }} + 创新 {{ item.novelty_score }}）</span>
               </div>
@@ -1103,8 +1124,9 @@ const filteredCustomers = computed(() => {
               <p v-if="item.risk_note" class="is-muted"><strong>工艺/落地提示：</strong>{{ item.risk_note }}</p>
             </div>
             <div v-else class="sales-ai-reasons is-prelim">
-              <p><strong>初筛命中高胜率基因：</strong>{{ item.gene_hits.join('、') || item.matched_genes.join('、') || '实穿针织廓形' }}</p>
-              <p class="is-novelty"><strong>初筛识别差异点：</strong>{{ item.diff_points.join('；') || '局部细节差异（点上方 AI 并排看图终审获取完整视觉拆解）' }}</p>
+              <p v-if="item.gene_hits.length"><strong>高胜率基因：</strong>{{ item.gene_hits.join('、') }}</p>
+              <p v-else-if="item.matched_genes.length"><strong>与参照款共有：</strong>{{ item.matched_genes.join('、') }}</p>
+              <p v-if="item.diff_points.length" class="is-novelty"><strong>初筛识别差异点：</strong>{{ item.diff_points.join('；') }}</p>
             </div>
 
             <footer class="sales-decision-bar">
@@ -1112,6 +1134,8 @@ const filteredCustomers = computed(() => {
                 <button
                   type="button"
                   :class="{ 'is-adopted': item.decision === 'adopted' }"
+                  :disabled="isBusy"
+                  @mousedown.prevent
                   @click="setDecision(item, 'adopted')"
                 >
                   ✓ 采纳打版
@@ -1119,6 +1143,8 @@ const filteredCustomers = computed(() => {
                 <button
                   type="button"
                   :class="{ 'is-maybe': item.decision === 'maybe' }"
+                  :disabled="isBusy"
+                  @mousedown.prevent
                   @click="setDecision(item, 'maybe')"
                 >
                   待定备选
@@ -1126,23 +1152,28 @@ const filteredCustomers = computed(() => {
                 <button
                   type="button"
                   :class="{ 'is-rejected': item.decision === 'rejected' }"
+                  :disabled="isBusy"
+                  @mousedown.prevent
                   @click="setDecision(item, 'rejected')"
                 >
                   ✕ 淘汰
                 </button>
               </div>
               <input
-                v-model="item.decision_note"
+                :value="noteDrafts[item.record_id] ?? item.decision_note"
+                @input="noteDrafts[item.record_id] = ($event.target as HTMLInputElement).value"
+                @keydown.enter.prevent="($event.target as HTMLInputElement).blur()"
+                :disabled="isBusy"
                 type="text"
                 placeholder="打版备注 / 改版想法（回车或失焦自动保存）…"
                 maxlength="200"
-                @change="saveNote(item)"
+                @change="setDecision(item, item.decision, $event.target as HTMLInputElement)"
               />
             </footer>
           </div>
         </article>
       </div>
-      <p v-else class="analytics-empty">当前筛选条件下暂无符合品类的外部图库图片。</p>
+      <p v-else class="analytics-empty">{{ selReport.ai_selection ? '本批暂无 AI 终审通过的款式。' : '当前条件下暂无标签候选。' }}</p>
     </div>
 
     <!-- ================================================================ -->
@@ -1249,7 +1280,7 @@ const filteredCustomers = computed(() => {
               </RouterLink>
               <div class="sales-card-body">
                 <div class="sales-card-badges">
-                  <span class="sales-grade-pill is-muted">{{ ex.source_category }}</span>
+                  <span class="sales-grade-pill is-muted">{{ ex.source_category }} · 标签初筛</span>
                   <span class="sales-type-pill">契合 {{ ex.match_score }}%</span>
                 </div>
                 <p class="sales-card-desc">{{ ex.summary }}</p>

@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, model_validator
 
-from src.taxonomy import FABRICS, SLEEVE_LENGTHS, default_labels
+from src.taxonomy import FABRICS, SLEEVE_LENGTHS, canonical_neckline, default_labels
 
 # Fixed two-level labels. Synonyms and edits live in src/taxonomy.py.
 CATEGORY = default_labels()
@@ -16,7 +16,7 @@ STYLE = ["极简", "复古", "甜美", "通勤", "工装", "法式", "休闲", "
 SEASON = ["春", "夏", "秋", "冬", "四季"]
 FIT = ["修身", "宽松", "直筒", "廓形", "其他"]
 COLOR = ["黑色", "白色", "灰色", "米色", "蓝色", "红色", "其他"]
-NECKLINE = ["圆领", "V领", "高领", "翻领", "连帽", "无领", "其他"]
+NECKLINE = ["圆领", "V领", "高领", "翻领", "连帽", "半高领", "堆堆领", "立领", "方领", "一字领", "连领", "无领", "其他"]
 SLEEVE = ["长袖", "短袖", "无袖", "泡泡袖", "其他"]
 PATTERN = [
     "纯色/无明显图案", "条纹", "格纹", "波点", "花卉", "动物纹", "几何图案",
@@ -98,6 +98,10 @@ class FashionTags(BaseModel):
     袖长: str = ""
     面料: str = ""
 
+    面料来源: str = ""
+    袖长来源: str = ""
+    素材风险: list[str] = Field(default_factory=list)
+
     def validate_vocabulary(self) -> None:
         from src.taxonomy import resolve
 
@@ -106,7 +110,8 @@ class FashionTags(BaseModel):
         for key, values in FILTER_FIELDS.items():
             if key == "品类":
                 continue
-            if getattr(self, key) not in values:
+            value = canonical_neckline(self.领型) if key == "领型" else getattr(self, key)
+            if value not in values:
                 raise ValueError(f"{key}不在允许的标签范围内")
         if self.袖长 and self.袖长 not in SLEEVE_LENGTHS:
             raise ValueError("袖长不在允许的标签范围内")
@@ -119,6 +124,7 @@ class FashionTags(BaseModel):
         from src.taxonomy import resolve
 
         values = {key: getattr(self, key).strip() for key in FILTER_FIELDS}
+        values["领型"] = canonical_neckline(values["领型"])
         original = values["品类"]
         placement = resolve(original)
         values["品类"] = placement.label
@@ -129,13 +135,17 @@ class FashionTags(BaseModel):
             else:
                 cleaned[key] = value if value in FILTER_FIELDS[key] else ("未判断" if key == "图案" else "其他")
         sleeve = (self.袖长 or "").strip()
+        sleeve_source = self.袖长来源
         if sleeve not in SLEEVE_LENGTHS:
             sleeve = placement.sleeve if placement.sleeve in SLEEVE_LENGTHS else ""
-            if not sleeve and self.袖型 in SLEEVE_LENGTHS:
-                sleeve = self.袖型
+            sleeve_source = "品名" if any(v in original for v in SLEEVE_LENGTHS) else "词表"
+            if self.袖型 in SLEEVE_LENGTHS and sleeve_source != "品名":
+                sleeve, sleeve_source = self.袖型, "标签"
         fabric = (self.面料 or "").strip()
+        fabric_source = self.面料来源
         if fabric not in FABRICS:
             fabric = placement.fabric if placement.fabric in FABRICS else ""
+            fabric_source = "词表"
         detail_values = [d for d in self.细节元素 if d in DETAILS and d not in LEGACY_DETAILS]
         pattern = cleaned["图案"]
         if "印花" in self.细节元素 and pattern == "未判断":
@@ -145,6 +155,9 @@ class FashionTags(BaseModel):
             **cleaned,
             袖长=sleeve,
             面料=fabric,
+            面料来源=fabric_source if fabric else "",
+            袖长来源=sleeve_source if sleeve else "",
+            素材风险=list(self.素材风险),
             细节元素=detail_values,
             一句话描述=self.一句话描述.strip(),
         )
@@ -258,7 +271,11 @@ class ImageRecord(BaseModel):
         base = self.ai_tags or self.proposed_tags or self.tags
         if not self.human_overrides:
             return base
-        return FashionTags.model_validate({**base.model_dump(), **self.human_overrides})
+        fields = {**base.model_dump(), **self.human_overrides}
+        for name in ("面料", "袖长"):
+            if name in self.human_overrides:
+                fields[name + "来源"] = "人工" if fields[name] else ""
+        return FashionTags.model_validate(fields)
 
     @property
     def has_ai_suggestion(self) -> bool:

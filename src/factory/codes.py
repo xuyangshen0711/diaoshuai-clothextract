@@ -28,6 +28,10 @@ class StyleCode:
     suffix: str
     customer: str
 
+    @property
+    def is_market(self) -> bool:
+        return not self.suffix
+
 
 def normalize_code_text(value) -> str:
     if value is None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from itertools import groupby
 from pathlib import Path
 
 from src import catalog
@@ -16,6 +17,13 @@ from src.db import on_conflict_update
 from src.factory.tables import gap_report, now
 
 
+_ARCHIVE_FIELDS = {
+    "季节": "season", "针型": "needle", "一级品类": "category", "原料名称": "material",
+    "设计款号": "design_code", "设计师": "designer", "工艺师": "craftsman",
+    "二级品类": "subcategory", "颜色": "colors", "尺码": "sizes",
+}
+
+
 def parse_archive_rows(path: Path, *, sheet_rows=None) -> tuple[list[dict], int, list[str], dict]:
     rows = load_sheet_rows(path) if sheet_rows is None else sheet_rows
     detected = table_kind_from_headers(sheet_headers(rows))
@@ -28,7 +36,7 @@ def parse_archive_rows(path: Path, *, sheet_rows=None) -> tuple[list[dict], int,
     if recognized["kind"] != "archive":
         raise ValueError("可能传错了表，这像是销量表，请用下方的销量入口。")
     indexes = {name: column_index(headers, name) for name in ARCHIVE_COLUMNS}
-    warnings = [f"未找到「{name}」列，请按商品资料表范本补齐；本次该字段将留空"
+    warnings = [f"未找到「{name}」列，请按商品资料表范本补齐；已有款保留原值，新款留空"
                 for name in ARCHIVE_COLUMNS if indexes[name] is None]
     parsed: dict[str, dict] = {}
     order: list[str] = []
@@ -45,17 +53,12 @@ def parse_archive_rows(path: Path, *, sheet_rows=None) -> tuple[list[dict], int,
             "variant_code": code.raw,
             "style_code": code.base,
             "customer": code.customer,
-            "season": plain_text(cell_at(row, indexes["季节"])),
-            "needle": plain_text(cell_at(row, indexes["针型"])),
-            "category": plain_text(cell_at(row, indexes["一级品类"])),
-            "material": plain_text(cell_at(row, indexes["原料名称"])),
-            "design_code": plain_text(cell_at(row, indexes["设计款号"])),
-            "designer": plain_text(cell_at(row, indexes["设计师"])),
-            "craftsman": plain_text(cell_at(row, indexes["工艺师"])),
-            "subcategory": plain_text(cell_at(row, indexes["二级品类"])),
-            "colors": split_colors(cell_at(row, indexes["颜色"])),
-            "sizes": split_sizes(cell_at(row, indexes["尺码"])),
         }
+        for header, field in _ARCHIVE_FIELDS.items():
+            if indexes[header] is not None:
+                value = cell_at(row, indexes[header])
+                convert = {"colors": split_colors, "sizes": split_sizes}.get(field, plain_text)
+                item[field] = convert(value)
         if code.raw not in parsed:
             order.append(code.raw)
         parsed[code.raw] = item
@@ -84,9 +87,14 @@ def import_archive(path: Path, source_name: str | None = None) -> dict:
     }
 
 
-def _json(value) -> str:
+def archive_db_fields(item: dict) -> dict:
     import json
-    return json.dumps(value, ensure_ascii=False)
+    return {
+        (key + "_json" if key in {"colors", "sizes"} else key):
+        (json.dumps(value, ensure_ascii=False) if key in {"colors", "sizes"} else value)
+        for key, value in item.items()
+        if key in {"variant_code", "style_code", "customer", *_ARCHIVE_FIELDS.values()}
+    }
 
 
 def write_archive(conn, variants: list[dict], source_name: str) -> tuple[int, int]:
@@ -104,34 +112,25 @@ def write_archive(conn, variants: list[dict], source_name: str) -> tuple[int, in
         marks = ", ".join("?" for _ in codes)
         existing.update(row[0] for row in conn.execute(
             f"SELECT variant_code FROM style_variants WHERE variant_code IN ({marks})", codes))
-    sql = """
-            INSERT INTO style_variants (
-                variant_code, style_code, customer, season, needle, series, category, material,
-                design_code, designer, craftsman, subcategory,
-                colors_json, sizes_json, source_file, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """ + on_conflict_update("variant_code", [
-                "style_code", "customer", "season", "needle", "category", "material",
-                "design_code", "designer", "craftsman", "subcategory",
-                "colors_json", "sizes_json", "source_file", "updated_at",
-            ])
-    timestamp = now()
+    columns = ("variant_code", "style_code", "customer", "season", "needle", "series", "category", "material",
+               "design_code", "designer", "craftsman", "subcategory", "colors_json", "sizes_json", "source_file", "updated_at")
+    insert = f"INSERT INTO style_variants ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)}) "
+    defaults = {"colors_json": "[]", "sizes_json": "[]", "source_file": source_name, "updated_at": now()}
     imported = updated = 0
-    for offset in range(0, len(variants), batch_size):
-        values = []
-        for item in variants[offset:offset + batch_size]:
-            values.append((
-                item["variant_code"], item["style_code"], item["customer"], item["season"], item["needle"],
-                "", item["category"], item["material"],
-                item["design_code"], item["designer"], item["craftsman"], item["subcategory"],
-                _json(item["colors"]), _json(item["sizes"]), source_name, timestamp,
-            ))
-            if item["variant_code"] in existing:
-                updated += 1
-            else:
-                imported += 1
-                existing.add(item["variant_code"])
-        conn.executemany(sql, values)
+    for start in range(0, len(variants), batch_size):
+        rows = map(archive_db_fields, variants[start:start + batch_size])
+        for fields, group in groupby(rows, key=lambda row: tuple(sorted(row))):
+            updates = [key for key in fields if key != "variant_code"] + ["source_file", "updated_at"]
+            values = []
+            for row in group:
+                code = row["variant_code"]
+                if code in existing:
+                    updated += 1
+                else:
+                    imported += 1
+                    existing.add(code)
+                values.append(tuple(row.get(key, defaults.get(key, "")) for key in columns))
+            conn.executemany(insert + on_conflict_update("variant_code", updates), values)
     from src.factory.library import invalidate_factory_snapshot
 
     invalidate_factory_snapshot()

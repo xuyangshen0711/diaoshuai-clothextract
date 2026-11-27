@@ -28,10 +28,11 @@ from src.analytics_yarn import YarnReportFilters, build_yarn_preview, render_yar
 from src.analytics_season import ExportScope, SeasonFilters, build_season_report, load_thumbnails, render_season_workbook, season_options
 from src.analytics_sales import (
     AttributionFilters, CustomerInsightFilters, DecisionUpdate, SalesInsightError, SelectionFilters,
-    build_attribution_preview, build_customer_insights, build_selection_preview,
-    run_attribution_ai, run_selection_ai, sales_options, save_decision, search_own_factory_styles,
+    analyze_attribution_inputs, analyze_selection_inputs, build_customer_insights, load_frozen_images, load_sales_report,
+    preview_attribution_inputs, preview_selection_inputs, read_attribution_inputs, read_selection_inputs, sales_options,
+    save_report_decision, search_own_factory_styles, selection_asset_path,
 )
-from src.analytics_sales_pdf import load_record_thumbs, render_attribution_pdf, render_selection_pdf, render_selection_xlsx
+from src.analytics_sales_pdf import render_attribution_pdf, render_selection_pdf, render_selection_xlsx
 from src.db import _load_env, mysql_config
 from src.site_gate import site_password
 from src.tag.tagger import provider_ready
@@ -62,7 +63,7 @@ class AnalyticsRoute(APIRoute):
             except AnalyticsUnavailable as exc:
                 response = JSONResponse({"detail": str(exc)}, status_code=503)
             except SalesInsightError as exc:
-                response = JSONResponse({"detail": str(exc)}, status_code=502)
+                response = JSONResponse({"detail": str(exc)}, status_code=exc.status_code)
             response.headers.update(NO_STORE)
             return response
 
@@ -387,12 +388,16 @@ class SalesSelectionRequest(BaseModel):
 
     filters: SelectionFilters
     force: bool = False
+    snapshot: str | None = None
 
 
-class SalesSelectionExportRequest(BaseModel):
+class SalesReportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    filters: SelectionFilters
+    report_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class SalesSelectionExportRequest(SalesReportRequest):
     only_adopted: bool = False
 
 
@@ -412,21 +417,22 @@ def sales_insight_options():
 def sales_attribution_preview(body: SalesAttributionRequest, request: Request):
     _throttle(request, "sales-preview", 40)
     with read_business_data() as conn:
-        return _season_call(lambda: build_attribution_preview(conn, body.filters))
+        inputs = _season_call(lambda: read_attribution_inputs(conn, body.filters))
+    return preview_attribution_inputs(inputs, body.filters)
 
 
 @router.post("/sales/attribution/analyze", dependencies=[Depends(_require_access)])
 def sales_attribution_analyze(body: SalesAttributionRequest, request: Request):
     _throttle(request, "sales-ai", 12)
     with read_business_data() as conn:
-        return _season_call(lambda: run_attribution_ai(conn, body.filters, force=body.force))
+        inputs = _season_call(lambda: read_attribution_inputs(conn, body.filters))
+    return analyze_attribution_inputs(inputs, body.filters, force=body.force)
 
 
 @router.post("/sales/attribution/pdf", dependencies=[Depends(_require_access)])
-def sales_attribution_export_pdf(body: SalesAttributionRequest, request: Request):
+def sales_attribution_export_pdf(body: SalesReportRequest, request: Request):
     _throttle(request, "sales-export", 15)
-    with read_business_data() as conn:
-        report, thumbs = _season_call(lambda: _load_attribution_export(conn, body.filters))
+    report, thumbs = _load_sales_export(body.report_id, "attribution")
     payload = render_attribution_pdf(report, thumbs)
     from urllib.parse import quote
     seasons_part = "_".join(report["scope"]["seasons"])
@@ -436,16 +442,6 @@ def sales_attribution_export_pdf(body: SalesAttributionRequest, request: Request
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename=\"sales-attribution.pdf\"; filename*=UTF-8''{quoted}"},
     )
-
-
-def _load_attribution_export(conn, filters: AttributionFilters):
-    report = build_attribution_preview(conn, filters)
-    ids = [
-        c["record_id"]
-        for c in [*(report.get("top_winners") or []), *(report.get("sample_laggards") or [])]
-        if c.get("record_id")
-    ]
-    return report, load_record_thumbs(conn, ids)
 
 
 @router.get("/sales/styles/search", dependencies=[Depends(_require_access)])
@@ -464,41 +460,42 @@ def sales_search_styles(q: str = "", limit: int = 12, request: Request = None):
 def sales_selection_preview(body: SalesSelectionRequest, request: Request):
     _throttle(request, "sales-preview", 40)
     with read_business_data() as conn:
-        return _season_call(lambda: build_selection_preview(conn, body.filters))
+        inputs = _season_call(lambda: read_selection_inputs(conn, body.filters))
+    return preview_selection_inputs(inputs, body.filters)
 
 
 @router.post("/sales/selection/analyze", dependencies=[Depends(_require_access)])
 def sales_selection_analyze(body: SalesSelectionRequest, request: Request):
     _throttle(request, "sales-ai", 10)
     with read_business_data() as conn:
-        return _season_call(lambda: run_selection_ai(conn, body.filters, force=body.force))
+        inputs = _season_call(lambda: read_selection_inputs(conn, body.filters))
+    return analyze_selection_inputs(inputs, body.filters, force=body.force, expected_snapshot=body.snapshot)
 
 
 @router.post("/sales/selection/decision", dependencies=[Depends(_require_access)])
 def sales_selection_decision(body: DecisionUpdate, request: Request):
     _throttle(request, "sales-decision", 90)
-    return save_decision(body.record_id, body.status, body.note)
+    return save_report_decision(body)
 
 
-def _load_selection_export(conn, filters: SelectionFilters):
-    report = build_selection_preview(conn, filters)
-    ai_sel = report.get("ai_selection")
-    items = (ai_sel.get("recommendations") or []) if ai_sel else (report.get("shortlist") or [])
-    ids: list[str] = []
-    for item in items:
-        if item.get("record_id"):
-            ids.append(item["record_id"])
-        ref = item.get("reference_winner")
-        if ref and ref.get("record_id"):
-            ids.append(ref["record_id"])
-    return report, load_record_thumbs(conn, ids)
+@router.get("/sales/reports/images/{key}", dependencies=[Depends(_require_access)])
+def sales_report_image(key: str):
+    from fastapi.responses import FileResponse
+    path = selection_asset_path(key)
+    if not path.is_file():
+        raise HTTPException(404, "批次图片不存在")
+    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
+
+
+def _load_sales_export(report_id: str, kind="selection"):
+    report = load_sales_report(report_id, kind)
+    return report, load_frozen_images(report["image_assets"])
 
 
 @router.post("/sales/selection/pdf", dependencies=[Depends(_require_access)])
 def sales_selection_export_pdf(body: SalesSelectionExportRequest, request: Request):
     _throttle(request, "sales-export", 15)
-    with read_business_data() as conn:
-        report, thumbs = _season_call(lambda: _load_selection_export(conn, body.filters))
+    report, thumbs = _load_sales_export(body.report_id)
     payload = render_selection_pdf(report, thumbs, only_adopted=body.only_adopted)
     from urllib.parse import quote
     tag = "已采纳打版清单" if body.only_adopted else "外部图库微创新选款"
@@ -514,8 +511,7 @@ def sales_selection_export_pdf(body: SalesSelectionExportRequest, request: Reque
 @router.post("/sales/selection/xlsx", dependencies=[Depends(_require_access)])
 def sales_selection_export_xlsx(body: SalesSelectionExportRequest, request: Request):
     _throttle(request, "sales-export", 15)
-    with read_business_data() as conn:
-        report, thumbs = _season_call(lambda: _load_selection_export(conn, body.filters))
+    report, thumbs = _load_sales_export(body.report_id)
     payload = render_selection_xlsx(report, thumbs, only_adopted=body.only_adopted)
     from urllib.parse import quote
     tag = "已采纳打版清单" if body.only_adopted else "选款打版清单"

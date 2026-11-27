@@ -377,10 +377,11 @@ export type AttributionAiInsight = {
 }
 
 export type AttributionReport = {
+  report_id: string
   scope: { seasons: string[]; category: string; cutoff: string | null; include_brand: boolean; excluded_brand_sku: number }
   category_tabs: { name: string; sku: number }[]
   overview: {
-    sku: number; imaged_sku: number; image_coverage: number
+    sku: number; imaged_sku: number; image_coverage: number; independent_styles: number; independent_images: number
     ordered_sku: number; sell_through: number; produced_sku: number; production_ratio: number
     winner_sku: number; winner_rate: number; broad_winner_sku: number; vip_winner_sku: number
     total_quantity: number; total_amount: number; replenishment_quantity: number
@@ -396,6 +397,9 @@ export type AttributionReport = {
 export type DecisionStatus = 'adopted' | 'maybe' | 'rejected' | 'none'
 
 export type SelectionCandidate = {
+  review_stage: 'tag_preview' | 'ai_final' | 'retry'
+  knit_evidence?: string
+  retry_reason?: string
   record_id: string
   image_url: string | null
   source_category: string
@@ -417,7 +421,7 @@ export type SelectionCandidate = {
   visual_screen_score?: number
   visual_screen_reason?: string
   hero_visual_note?: string
-  verdict?: 'recommend' | 'too_similar' | 'drop'
+  verdict?: 'recommend' | 'too_similar' | 'drop' | 'unreviewed'
   tier?: string
   stars?: number
   similarity_note?: string
@@ -457,6 +461,8 @@ export type OwnStyleSearchHit = {
 }
 
 export type SelectionReport = {
+  report_id: string
+  ai_blocked_reason: string
   scope: SelectionFilters & { exclude_record_ids_count?: number }
   target_hero: SalesStyleCard | null
   target_hero_notice?: string
@@ -491,7 +497,10 @@ export type SelectionReport = {
     contact_sheets_count?: number
     stage1_picked_count?: number
     stage1_rejected_summary?: string
-    scanned_record_ids?: string[]
+    scanned_record_ids: string[]
+    retry_record_ids: string[]
+    failed_pages: { page: number; reason: string; record_ids: string[] }[]
+    unreviewed: SelectionCandidate[]
     reviewed_count: number
     recommended_count: number
     rejected_similar_count: number
@@ -547,23 +556,23 @@ export const previewSalesAttribution = (filters: AttributionFilters) =>
   request<AttributionReport>(base + '/sales/attribution/preview', jsonPost({ filters }))
 export const analyzeSalesAttribution = (filters: AttributionFilters, force = false) =>
   request<AttributionReport>(base + '/sales/attribution/analyze', jsonPost({ filters, force }))
-export async function exportSalesAttributionPdf(filters: AttributionFilters) {
-  const response = await requestResponse(base + '/sales/attribution/pdf', jsonPost({ filters }))
+export async function exportSalesAttributionPdf(report_id: string) {
+  const response = await requestResponse(base + '/sales/attribution/pdf', jsonPost({ report_id }))
   return response.blob()
 }
 
 export const previewSalesSelection = (filters: SelectionFilters) =>
   request<SelectionReport>(base + '/sales/selection/preview', jsonPost({ filters }))
-export const analyzeSalesSelection = (filters: SelectionFilters, force = false) =>
-  request<SelectionReport>(base + '/sales/selection/analyze', jsonPost({ filters, force }))
-export const saveSalesDecision = (record_id: string, status: DecisionStatus, note = '') =>
-  request<{ record_id: string; status: DecisionStatus; note: string }>(base + '/sales/selection/decision', jsonPost({ record_id, status, note }))
-export async function exportSalesSelectionPdf(filters: SelectionFilters, only_adopted = false) {
-  const response = await requestResponse(base + '/sales/selection/pdf', jsonPost({ filters, only_adopted }))
+export const analyzeSalesSelection = (filters: SelectionFilters, force = false, snapshot?: string) =>
+  request<SelectionReport>(base + '/sales/selection/analyze', jsonPost({ filters, force, snapshot }))
+export const saveSalesDecision = (report_id: string, record_id: string, status: DecisionStatus, note = '') =>
+  request<{ report_id: string; record_id: string; status: DecisionStatus; note: string }>(base + '/sales/selection/decision', jsonPost({ report_id, record_id, status, note }))
+export async function exportSalesSelectionPdf(report_id: string, only_adopted = false) {
+  const response = await requestResponse(base + '/sales/selection/pdf', jsonPost({ report_id, only_adopted }))
   return response.blob()
 }
-export async function exportSalesSelectionXlsx(filters: SelectionFilters, only_adopted = false) {
-  const response = await requestResponse(base + '/sales/selection/xlsx', jsonPost({ filters, only_adopted }))
+export async function exportSalesSelectionXlsx(report_id: string, only_adopted = false) {
+  const response = await requestResponse(base + '/sales/selection/xlsx', jsonPost({ report_id, only_adopted }))
   return response.blob()
 }
 

@@ -121,7 +121,7 @@ def _seed_sales_dataset(store):
         ImageRecord(
             id="rec_ext_sim", image_path=ext_sim_img, source_category="网图趋势", review_status="approved",
             source=SourceMeta(source_file="trend_3.jpg", source_type="image", location="上传图片"),
-            tags=FashionTags(品类="上衣>套衫", 风格="通勤", 季节="冬", 版型="宽松", 颜色主色调="白色", 领型="圆领", 袖型="长袖", 袖长="长袖", 面料="针织", 图案="纯色/无明显图案", 细节元素=["罗纹", "开襟"], 一句话描述="白色宽松圆领罗纹通勤套衫"),
+            tags=FashionTags(品类="上衣>套衫", 风格="通勤", 季节="冬", 版型="宽松", 颜色主色调="白色", 领型="圆领", 袖型="长袖", 袖长="长袖", 面料="针织", 图案="纯色/无明显图案", 细节元素=["罗纹", "拼接"], 一句话描述="白色宽松圆领罗纹通勤套衫"),
         ),
     ]
     catalog.save_catalog(records)
@@ -142,7 +142,8 @@ def test_attribution_selection_and_customer_engines(store, monkeypatch):
         attr = build_attribution_preview(conn, AttributionFilters(seasons=["2026冬"], category="长袖套衫"))
     assert attr["overview"]["sku"] == 3
     assert attr["overview"]["winner_sku"] == 2
-    assert attr["overview"]["broad_winner_sku"] == 2
+    assert attr["overview"]["broad_winner_sku"] == 1
+    assert attr["top_winners"][1]["rep_customer_count"] == 1
     assert attr["top_winners"][0]["code"] == "663169"
     assert attr["top_winners"][0]["winner_type"] == "通吃复购款"
 
@@ -254,32 +255,39 @@ def test_sales_endpoints_decisions_and_pdf_xlsx_exports(store, monkeypatch):
     assert "长袖套衫" in opts["categories"]
 
     # Attribution PDF export
-    attr_pdf = client.post("/api/analytics/sales/attribution/pdf", json={
+    attr_preview = client.post("/api/analytics/sales/attribution/preview", json={
         "filters": {"seasons": ["2026冬"], "category": "长袖套衫", "cutoff": None, "include_brand": False},
     })
+    attr_pdf = client.post("/api/analytics/sales/attribution/pdf", json={"report_id": attr_preview.json()["report_id"]})
     assert attr_pdf.status_code == 200
     with fitz.open(stream=attr_pdf.content, filetype="pdf") as doc:
         full_text = "\n".join(page.get_text() for page in doc)
     assert "本厂爆款归因报告" in full_text and "663169" in full_text
 
     # Save adoption decision & export Selection PDF + Excel (only_adopted=True)
-    save_decision("rec_ext_good", "adopted", "改用深花灰打头样")
     sel_filters = {
         "seasons": ["2026冬"], "category": "长袖套衫",
         "sources": ["品牌资料包", "网图趋势"], "catalog_seasons": [], "include_brand": False, "pool_size": 12,
     }
-    sel_pdf = client.post("/api/analytics/sales/selection/pdf", json={"filters": sel_filters, "only_adopted": True})
+    report = client.post("/api/analytics/sales/selection/preview", json={"filters": sel_filters}).json()
+    decision = client.post("/api/analytics/sales/selection/decision", json={
+        "report_id": report["report_id"], "record_id": "rec_ext_good", "status": "adopted", "note": "改用深花灰打头样"})
+    assert decision.status_code == 200
+    export = {"report_id": decision.json()["report_id"], "only_adopted": True}
+    sel_pdf = client.post("/api/analytics/sales/selection/pdf", json=export)
     assert sel_pdf.status_code == 200
     with fitz.open(stream=sel_pdf.content, filetype="pdf") as doc:
         sel_text = "\n".join(page.get_text() for page in doc)
     assert "已采纳打版" in sel_text and "改用深花灰打头样" in sel_text
+    assert "标签初筛" in sel_text and "★" not in sel_text
 
-    sel_xlsx = client.post("/api/analytics/sales/selection/xlsx", json={"filters": sel_filters, "only_adopted": True})
+    sel_xlsx = client.post("/api/analytics/sales/selection/xlsx", json=export)
     assert sel_xlsx.status_code == 200
     wb = load_workbook(BytesIO(sel_xlsx.content))
     ws = wb["选款打版清单"]
     assert ws.max_row == 3  # header rows 1..2 + 1 adopted item row
     assert ws["C3"].value == "已采纳打版"
+    assert ws["D3"].value == "标签初筛" and "★" not in ws["E3"].value
     assert len(ws._images) == 2  # candidate photo + reference winner photo side-by-side!
 
 
@@ -396,6 +404,11 @@ def test_hoodie_taxonomy_ext_dedup_guardrail_hero_anchor_and_two_stage_contact_s
             tags=FashionTags(品类="上衣>套衫", 风格="极简", 季节="冬", 版型="宽松", 颜色主色调="灰色", 领型="V领", 袖型="长袖", 袖长="长袖", 面料="针织", 图案="纯色/无明显图案", 细节元素=["罗纹", "落肩"], 一句话描述="炭灰落肩V领宽松套衫"),
         ),
     ]
+    for i, color in enumerate(((20, 80, 65), (170, 110, 85), (48, 80, 115))):
+        model = next(r for r in records if r.id == "ext_c1").model_copy(deep=True)
+        model.id = f"ext_knit_hood_{i}"
+        model.image_path = _make_img(img_dir, model.id + ".jpg", color)
+        records.append(model)
     catalog.save_catalog(records)
 
     # Preview anchored specifically to hoodie 663315
@@ -408,7 +421,7 @@ def test_hoodie_taxonomy_ext_dedup_guardrail_hero_anchor_and_two_stage_contact_s
     assert len(pre["hero_styles"]) == 2
     assert pre["funnel"]["gate1_offtone_removed"] == 1  # floral blocked!
     assert pre["funnel"]["gate1_ext_duplicates_removed"] == 1  # ext_dup_b deduplicated!
-    assert pre["funnel"]["gate2_scored_pool"] == 6  # ext_dup_a + ext_c1..c5
+    assert pre["funnel"]["gate2_scored_pool"] == 6  # six eligible hooded pullovers
     assert all(c["reference_winner"]["code"] == "663315" for c in pre["shortlist"])
     # Hoodie candidates should rank at the very top when anchored to 663315
     assert pre["shortlist"][0]["tags"]["领型"] == "连帽"
@@ -604,5 +617,5 @@ def test_style_code_search_cross_season_gallery_only_and_category_autoswitch(sto
         pre_v = build_selection_preview(conn, SelectionFilters(seasons=["2026冬"], category="长袖套衫", target_style_code="669215"))
     assert pre_v["shortlist"][0]["record_id"] == "ext_vneck_real"
     assert pre_v["shortlist"][0]["tags"]["领型"] == "V领"
-    assert pre_v["shortlist"][0]["total_score"] > pre_v["shortlist"][1]["total_score"]
+    assert "ext_hoodie_wrong" not in {c["record_id"] for c in pre_v["shortlist"]}
     assert "V领" in pre_v["target_hero_notice"]

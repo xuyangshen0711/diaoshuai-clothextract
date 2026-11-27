@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -240,25 +241,24 @@ def test_timeout_message_is_chinese(monkeypatch):
 
 
 def test_rejects_oversize_and_unsupported_bytes(tmp_path, monkeypatch):
-    big = tmp_path / "big.jpg"
-    big.write_bytes(b"\xff\xd8\xff" + b"\x00" * 32)
+    big = _png(tmp_path / "valid.png")
+    broken = tmp_path / "broken.jpg"
+    broken.write_bytes(b"\xff\xd8\xff" + b"\x00" * 32)
     text = tmp_path / "notes.txt"
     text.write_bytes(b"hello")
-    monkeypatch.setattr("src.tag.deepseek_tagger.MAX_IMAGE_BYTES", 8)
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-deepseek-key-0123456789")
-    tagger = DeepSeekTagger(http_client=httpx.Client(transport=httpx.MockTransport(lambda request: _completion("{}"))))
-    try:
-        tagger.tag(big)
-    except TaggingError as exc:
-        assert "32 MiB" in exc.user_message
-    else:
-        raise AssertionError("oversize image should fail")
-    try:
-        tagger.tag(text)
-    except TaggingError as exc:
-        assert "JPEG" in exc.user_message
-    else:
-        raise AssertionError("plain text should fail")
+    tagger, seen = _tagger(lambda *_: pytest.fail("invalid input reached the provider"), monkeypatch)
+    with monkeypatch.context() as patch:
+        patch.setattr("src.tag.deepseek_tagger.MAX_IMAGE_BYTES", 8)
+        with pytest.raises(TaggingError, match="图片编码后超过"):
+            tagger.tag(big)
+    with monkeypatch.context() as patch:
+        patch.setattr("src.tag.images.MAX_SOURCE_BYTES", big.stat().st_size - 1)
+        with pytest.raises(TaggingError, match="单张原图超过"):
+            tagger.tag(big)
+    for path in (broken, text):
+        with pytest.raises(TaggingError, match="无法解码"):
+            tagger.tag(path)
+    assert not seen
 
 
 def test_reasoning_content_is_ignored(tmp_path, monkeypatch):

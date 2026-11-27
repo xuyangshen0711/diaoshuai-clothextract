@@ -177,6 +177,10 @@ class _PdfBuilder:
 
 
 # ---------------------------------------------------------------- 1. Attribution PDF
+def _missing_image_label(report: dict, record_id: str | None, fallback: str = "暂无图片") -> str:
+    return "冻结图不可用" if report.get("image_assets", {}).get(record_id) else fallback
+
+
 def render_attribution_pdf(report: dict, thumbs: dict[str, bytes]) -> bytes:
     scope = report["scope"]
     ov = report["overview"]
@@ -234,7 +238,7 @@ def render_attribution_pdf(report: dict, thumbs: dict[str, bytes]) -> bytes:
 
         if ai.get("losing_pitfalls"):
             pdf.ensure(24)
-            pdf.line_text("滞销 / 无产量共性避坑提示：", LEFT, pdf.y + 12, 10.5, CRIMSON)
+            pdf.line_text("已生产低销量共性避坑提示：", LEFT, pdf.y + 12, 10.5, CRIMSON)
             pdf.y += 18
             for p in ai["losing_pitfalls"]:
                 codes = "、".join(p.get("example_codes") or [])
@@ -309,7 +313,7 @@ def render_attribution_pdf(report: dict, thumbs: dict[str, bytes]) -> bytes:
 
     # Visual Cards: Top Winners & Sample Laggards
     for group_title, cards in (("代表高卖爆款样本（按销量排序）", report.get("top_winners") or []),
-                               ("滞销 / 无产量对照样本", report.get("sample_laggards") or [])):
+                               ("已生产低销量对照样本", report.get("sample_laggards") or [])):
         if not cards:
             continue
         pdf.section_heading(group_title)
@@ -322,7 +326,7 @@ def render_attribution_pdf(report: dict, thumbs: dict[str, bytes]) -> bytes:
                 cx = LEFT + j * (pair_w + 12)
                 pdf.box(cx, pdf.y, pair_w, card_h, PANEL, stroke=LINE)
                 blob = thumbs.get(card.get("record_id") or "")
-                pdf.image_in_rect(blob, cx + 6, pdf.y + 6, 66, 84, card["code"])
+                pdf.image_in_rect(blob, cx + 6, pdf.y + 6, 66, 84, _missing_image_label(report, card.get("record_id")))
                 tx = cx + 78
                 tw = pair_w - 84
                 badge = f"{card['grade']}级 · {card['winner_type']}" if card.get("winner_type") else card["grade"]
@@ -349,6 +353,13 @@ def _pick_selection_items(report: dict, only_adopted: bool) -> list[dict]:
     if only_adopted:
         items = [i for i in items if i.get("decision") == "adopted"]
     return items
+
+
+def _review_rating(item):
+    stars = item.get("stars")
+    if item.get("review_stage") == "ai_final" and item.get("verdict") == "recommend" and type(stars) is int and 1 <= stars <= 5:
+        return "AI 终审", "★" * stars
+    return "标签初筛", ""
 
 
 def render_selection_pdf(report: dict, thumbs: dict[str, bytes], *, only_adopted: bool = False) -> bytes:
@@ -414,60 +425,52 @@ def render_selection_pdf(report: dict, thumbs: dict[str, bytes], *, only_adopted
         pdf.y += 32
 
     for idx, item in enumerate(items, 1):
-        card_h = 158
+        tx = LEFT + 188
+        tw = RIGHT - tx - 8
+        stage, stars = _review_rating(item)
+        tier = " ".join(filter(None, (stage, item.get("tier"))))
+        fields = [
+            ("视觉描述", item["tags"].get("一句话描述"), INK),
+            ("卖好原因", item.get("gene_reason") or "、".join(item.get("gene_hits") or item.get("matched_genes") or []), INK),
+            ("微创新点", item.get("novelty_point") or "；".join(item.get("diff_points") or []), OLIVE),
+            ("纱线建议", item.get("yarn_and_price_advice"), BRASS),
+            ("落地提示", item.get("risk_note"), MUTED),
+            ("打版备注", item.get("decision_note"), CRIMSON),
+        ]
+        lines = [(line, color) for label, body, color in fields if body
+                 for line in _wrap_text(pdf.font, f"【{label}】{body}", 8.1, tw)]
+        page_lines = 54
+        card_h = max(158, 39 + min(page_lines, len(lines)) * 12)
         pdf.ensure(card_h + 10)
         pdf.box(LEFT, pdf.y, CONTENT_W, card_h, PANEL, stroke=LINE, width=0.7)
         # Left: External candidate photo + Right: Reference factory winner photo
         cand_blob = thumbs.get(item["record_id"])
-        pdf.image_in_rect(cand_blob, LEFT + 8, pdf.y + 8, 92, 118, "外部候选图")
+        pdf.image_in_rect(cand_blob, LEFT + 8, pdf.y + 8, 92, 118, _missing_image_label(report, item["record_id"]))
         pdf.line_text(f"候选 #{idx} · {item['source_category']}", LEFT + 54, pdf.y + 138, 7.8, INK, max_width=92, align="center")
         dec_txt = DECISION_LABELS.get(item.get("decision", "none"), "未标记")
         pdf.line_text(dec_txt, LEFT + 54, pdf.y + 150, 7.8, OLIVE if item.get("decision") == "adopted" else BRASS, align="center")
 
         ref = item.get("reference_winner")
         ref_blob = thumbs.get(ref["record_id"]) if ref and ref.get("record_id") else None
-        pdf.image_in_rect(ref_blob, LEFT + 106, pdf.y + 8, 72, 94, ref["code"] if ref else "无参照")
+        pdf.image_in_rect(ref_blob, LEFT + 106, pdf.y + 8, 72, 94,
+                          _missing_image_label(report, ref.get("record_id")) if ref else "无参照")
         if ref:
             pdf.line_text(f"参照:{ref['code']}", LEFT + 142, pdf.y + 114, 7.6, INK, max_width=72, align="center")
             pdf.line_text(f"{ref['quantity']:,}件/补{ref['replenishment']:,}", LEFT + 142, pdf.y + 126, 7.2, MUTED, max_width=72, align="center")
             pdf.line_text(ref["material_short"], LEFT + 142, pdf.y + 138, 7.2, OLIVE, max_width=72, align="center")
 
-        tx = LEFT + 188
-        tw = RIGHT - tx - 8
-        stars = "★" * int(item.get("stars") or 4)
-        tier = item.get("tier") or "微创新候选"
-        title_line = f"{tier}  {stars}   综合分 {item.get('total_score', 0)}（基因 {item.get('gene_score', 0)} + 创新 {item.get('novelty_score', 0)}）"
+        title_line = f"{tier}  {stars}   标签分 {item.get('total_score', 0)}（基因 {item.get('gene_score', 0)} + 创新 {item.get('novelty_score', 0)}）"
         pdf.line_text(title_line, tx, pdf.y + 18, 9.5, OLIVE, max_width=tw)
-        pdf.line_text(f"视觉描述：{item['tags'].get('一句话描述', '')}", tx, pdf.y + 33, 8.4, INK, max_width=tw)
-
-        cy = pdf.y + 48
-        gene_txt = item.get("gene_reason") or ("命中本厂基因：" + "、".join(item.get("gene_hits") or item.get("matched_genes") or ["基础实穿廓形"]))
-        nov_txt = item.get("novelty_point") or ("差异改动点：" + "；".join(item.get("diff_points") or ["局部细节变化"]))
-        yarn_txt = item.get("yarn_and_price_advice") or ""
-        risk_txt = item.get("risk_note") or ""
-        note_txt = item.get("decision_note") or ""
-
-        for prefix, body, col in (
-            ("【卖好原因】", gene_txt, INK),
-            ("【微创新点】", nov_txt, OLIVE),
-            ("【纱线建议】", yarn_txt, BRASS),
-            ("【落地提示】", risk_txt, MUTED),
-            ("【老板备注】", note_txt, CRIMSON),
-        ):
-            if not body:
-                continue
-            max_y = pdf.y + card_h - 8
-            if cy > max_y:
-                break
-            lines = _wrap_text(pdf.font, f"{prefix}{body}", 8.1, tw)[:2]
-            for ln in lines:
-                if cy <= max_y:
-                    pdf.line_text(ln, tx, cy, 8.1, col, max_width=tw)
-                    cy += 11.8
-
+        for index, (line, color) in enumerate(lines):
+            offset = index % page_lines
+            if index and offset == 0:
+                pdf.new_page()
+                card_h = 39 + min(page_lines, len(lines) - index) * 12
+                pdf.line_text(f"候选 #{idx}（续）", LEFT + 8, pdf.y + 18, 9.5, INK)
+            pdf.line_text(line, tx, pdf.y + 33 + offset * 12, 8.1, color)
         pdf.y += card_h + 9
 
-    return pdf.finish("销售端 · 外部图库微创新选款报告")
+    return pdf.finish("销售端 · 外部图库微创新选款报告 " + report.get("report_id", "")[:12])
 
 
 def render_selection_xlsx(report: dict, thumbs: dict[str, bytes], *, only_adopted: bool = False) -> bytes:
@@ -480,6 +483,7 @@ def render_selection_xlsx(report: dict, thumbs: dict[str, bytes], *, only_adopte
     wb = Workbook()
     ws = wb.active
     ws.title = "选款打版清单"
+    wb.properties.identifier = report.get("report_id", "")
 
     thin = Side(style="thin", color="BFBFBF")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -489,8 +493,9 @@ def render_selection_xlsx(report: dict, thumbs: dict[str, bytes], *, only_adopte
     left_wrap = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
     scope = report["scope"]
+    batch = report.get("report_id", "")[:12]
     hero_suffix = f" · 锚定款号 {scope['target_style_code']}" if scope.get("target_style_code") else ""
-    ws.cell(1, 1, f"外部图库微创新选款打版清单 · {scope['category']}{hero_suffix}（参考季：{'、'.join(scope['seasons'])}）").font = Font(bold=True, size=13)
+    ws.cell(1, 1, f"外部图库微创新选款打版清单 · {scope['category']}{hero_suffix}（参考季：{'、'.join(scope['seasons'])}） {batch}").font = Font(bold=True, size=13)
     ws.merge_cells("A1:L1")
     ws.row_dimensions[1].height = 26
 
@@ -523,7 +528,8 @@ def render_selection_xlsx(report: dict, thumbs: dict[str, bytes], *, only_adopte
         ref = item.get("reference_winner")
         dec_code = item.get("decision", "none")
         dec_label = DECISION_LABELS.get(dec_code, "未标记")
-        stars_txt = f"{'★' * int(item.get('stars') or 4)}\n({item.get('total_score', 0)}分)"
+        stage, stars = _review_rating(item)
+        stars_txt = f"{stars} 标签分 {item.get('total_score', 0)}".strip()
         ref_txt = (
             f"{ref['code']} ({ref['grade']}级)\n销量 {ref['quantity']:,} 件 / 补单 {ref['replenishment']:,} 件\n材质：{ref['material']}"
             if ref else "—"
@@ -532,8 +538,13 @@ def render_selection_xlsx(report: dict, thumbs: dict[str, bytes], *, only_adopte
         nov_txt = item.get("novelty_point") or "；".join(item.get("diff_points") or [])
         note_parts = [p for p in (item.get("risk_note"), f"备注：{item['decision_note']}" if item.get("decision_note") else "") if p]
 
+        cand_id = item["record_id"]
+        ref_id = ref.get("record_id") if ref else None
+        cand_image, ref_image = thumbs.get(cand_id), thumbs.get(ref_id)
         row_vals = [
-            "", "", dec_label, item.get("tier") or "候选款", stars_txt, item["source_category"],
+            "" if cand_image else _missing_image_label(report, cand_id),
+            "" if ref_image else _missing_image_label(report, ref_id, "暂无图片" if ref else "无参照"),
+            dec_label, " ".join(filter(None, (stage, item.get("tier")))), stars_txt, item["source_category"],
             item["tags"].get("一句话描述", ""), gene_txt, nov_txt, ref_txt,
             item.get("yarn_and_price_advice") or "", "\n".join(note_parts),
         ]
@@ -544,9 +555,8 @@ def render_selection_xlsx(report: dict, thumbs: dict[str, bytes], *, only_adopte
             if dec_code == "adopted" and j == 3:
                 c.fill = adopted_fill
                 c.font = Font(bold=True, color="274E13")
-        embed(thumbs.get(item["record_id"]), f"A{idx}")
-        if ref and ref.get("record_id"):
-            embed(thumbs.get(ref["record_id"]), f"B{idx}", box=(92, 116))
+        embed(cand_image, f"A{idx}")
+        embed(ref_image, f"B{idx}", box=(92, 116))
 
     ws.freeze_panes = "C3"
     out = BytesIO()

@@ -66,6 +66,8 @@ def test_rules_category_material_grade_and_customer_type():
     assert material_group("表面：60支100%极细美丽诺羊毛内里：100%混纺物")[0] == "其他原料"
     assert material_short("42支50.50/AB") == "50/50"
     assert [grade_of(q) for q in (8000, 7999, 3000, 2999, 1000, 999, 300, 299, 0)] == list("SAABBCCDD")
+    assert customer_type("7A933") == "市场" and customer_type("7A933若宇") == "品牌"
+    assert customer_type("633125*7") == "市场"
     assert customer_type("663636T") == "市场" and customer_type("663169索菲娅") == "品牌"
 
 

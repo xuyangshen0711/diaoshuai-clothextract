@@ -15,7 +15,7 @@ MAX_PIXELS = 40_000_000
 MAX_SOURCE_BYTES = 100 * 1024 * 1024
 
 
-def image_data_url(path, max_encoded_bytes=32 * 1024 * 1024) -> str:
+def image_data_url(path, max_encoded_bytes=32 * 1024 * 1024, *, max_side=MAX_SIDE) -> str:
     path = local_file(path)
     if path.stat().st_size > MAX_SOURCE_BYTES:
         raise TaggingError("单张原图超过 100 MiB，请压缩图片后重试；原文件已保留。")
@@ -28,7 +28,7 @@ def image_data_url(path, max_encoded_bytes=32 * 1024 * 1024) -> str:
                 # Animated images use the first frame. Orientation is applied only to the derivative.
                 source.seek(0)
                 picture = ImageOps.exif_transpose(source)
-                picture.thumbnail((MAX_SIDE, MAX_SIDE), Image.Resampling.LANCZOS)
+                picture.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
                 has_alpha = picture.mode in {"RGBA", "LA"} or "A" in picture.getbands() or "transparency" in picture.info
                 if has_alpha:
                     rgba = picture.convert("RGBA")

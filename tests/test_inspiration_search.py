@@ -11,7 +11,8 @@ from test_review_workflow import store, make_record, approve
 from api import main as api
 from src import catalog
 from src.index import embeddings
-from src.schema import FashionTags
+from src.schema import ImageRecord
+from src.tag.tagger import apply_suggestion
 from src.search.inspiration import parse_inspiration
 from src.search.query import search_by_text
 
@@ -19,9 +20,7 @@ from src.search.query import search_by_text
 def styled(store, name, **values):
     record = make_record(store, name)
     tags = record.tags.model_copy(update=values)
-    record.tags = tags
-    record.ai_tags = tags.model_copy(deep=True)
-    record.proposed_tags = tags.model_copy(deep=True)
+    apply_suggestion(record, tags, "mock")
     return record
 
 
@@ -44,13 +43,14 @@ def test_inspiration_understands_mood_synonyms_and_negation(store):
     assert not parse_inspiration('不要羊毛，宽松外套').accepts(cream)
 
 
-def test_pending_is_opt_in_and_rejected_and_samples_never_leak(store, monkeypatch):
+def test_ready_records_are_searchable_and_rejected_untagged_samples_never_leak(store, monkeypatch):
     cream = styled(store, 'coat-cream', 品类='外套', 风格='法式', 版型='宽松', 颜色主色调='米色')
     red = styled(store, 'coat-red', 品类='外套', 风格='休闲', 版型='宽松', 颜色主色调='红色')
     bad = styled(store, 'coat-rejected', 品类='外套', 风格='法式', 颜色主色调='米色')
     sample = styled(store, 'coat-sample', 品类='外套', 风格='法式', 颜色主色调='米色')
     sample.source.source_type = 'sample'
-    catalog.save_catalog([cream, red, bad, sample])
+    untagged = ImageRecord(image_path=str(store / "raw/plain.png"), source=cream.source)
+    catalog.save_catalog([cream, red, bad, sample, untagged])
     approve(red)
     catalog.review_record(bad.id, action='reject', reviewer='甲', note='无效图', expected_revision=bad.revision)
     before = [r.model_dump() for r in catalog.load_catalog()]
@@ -58,44 +58,44 @@ def test_pending_is_opt_in_and_rejected_and_samples_never_leak(store, monkeypatc
     monkeypatch.setattr(OpenAITagger, '__init__', lambda *_a, **_k: (_ for _ in ()).throw(AssertionError('Search must not call paid tagger')))
     client = TestClient(api.app)
     default = client.get('/api/search/text', params={'q': '宽松外套'}).json()
-    assert {x['id'] for x in default['items']} == {red.id}
+    assert {x['id'] for x in default['items']} == {red.id, cream.id}
     result = client.get('/api/search/text', params={'q': '奶油色，松弛感，不要红色', 'include_pending': True}).json()
     assert [x['id'] for x in result['items']] == [cream.id]
-    assert result['items'][0]['review_status'] == 'pending'
+    assert result['items'][0]['entry_ready'] and result['items'][0]['review_status'] == 'approved'
     assert result['search_info']['local_only'] and result['search_info']['engine'] == 'local-lite'
     assert result['search_info']['concepts'] == ['奶油色', '松弛感', '排除：红色']
     assert [r.model_dump() for r in catalog.load_catalog()] == before
 
 
-def test_latest_proposal_is_searchable_without_overwriting_human_tags(store):
+def test_search_uses_manual_category_and_new_ai_color_without_overwriting_either(store):
     record = styled(store, 'coat-old', 品类='外套')
     catalog.save_catalog([record])
-    record = approve(record)
-    record.review_status = 'pending'
-    record.proposed_tags = record.tags.model_copy(update={'品类': '裤装', '颜色主色调': '米色'})
+    record = catalog.update_tags(record.id, expected_revision=record.revision, changes={'品类': '裤装'}, reset_fields=[])
+    apply_suggestion(record, record.ai_tags.model_copy(update={'品类': '外套', '颜色主色调': '米色'}), 'mock')
     record.notes.灵感价值 = '城市轻旅，周末舒适穿着'
     catalog.save_catalog([record])
     client = TestClient(api.app)
-    result = client.get('/api/search/text', params={'q': '奶油色裤子', 'category': '裤装', 'include_pending': True}).json()
-    assert len(result['items']) == 1
-    assert result['items'][0]['tags']['品类'] == '外套'
-    assert result['items'][0]['display_tags']['品类'] == '裤装'
-    assert not client.get('/api/search/text', params={'q': '奶油色外套', 'include_pending': True}).json()['items']
-    assert client.get('/api/search/text', params={'q': '城市轻旅', 'include_pending': True}).json()['count'] == 1
-    assert client.get('/api/search/text', params={'q': '量子计算机', 'include_pending': True}).json()['count'] == 0
+    result = client.get('/api/search/text', params={'q': '奶油色裤子', 'category': '裤装'}).json()
+    item, = result['items']
+    assert item['ai_tags']['品类'] == '外套' and item['display_tags']['品类'] == item['tags']['品类'] == '裤装'
+    assert item['display_tags']['颜色主色调'] == '米色' and item['tag_overrides'] == {'品类': '裤装'}
+    assert not client.get('/api/search/text', params={'q': '奶油色外套'}).json()['items']
+    assert client.get('/api/search/text', params={'q': '城市轻旅'}).json()['count'] == 1
+    assert client.get('/api/search/text', params={'q': '量子计算机'}).json()['count'] == 0
 
 
-def test_image_and_similar_search_support_same_explicit_scope(store):
+def test_image_and_similar_search_share_membership_with_legacy_scope_parameter(store):
     first, second = styled(store, 'coat-first'), styled(store, 'coat-second')
-    catalog.save_catalog([first, second])
+    hidden = styled(store, 'coat-hidden')
+    hidden.review_status = 'rejected'
+    catalog.save_catalog([first, second, hidden])
     client = TestClient(api.app)
     image = Path(first.image_path).read_bytes()
-    assert client.post('/api/search/image', files={'file': ('query.png', image)}).json()['count'] == 0
-    result = client.post('/api/search/image?include_pending=true', files={'file': ('query.png', image)}).json()
-    assert {x['id'] for x in result['items']} == {first.id, second.id}
-    assert client.get(f'/api/records/{first.id}/similar').json()['count'] == 0
-    similar = client.get(f'/api/records/{first.id}/similar?include_pending=true').json()
-    assert [x['id'] for x in similar['items']] == [second.id]
+    for params in ({}, {'include_pending': 'true'}):
+        hits = client.post('/api/search/image', params=params, files={'file': ('query.png', image)}).json()
+        assert {x['id'] for x in hits['items']} == {first.id, second.id}
+        similar = client.get(f'/api/records/{first.id}/similar', params=params).json()
+        assert [x['id'] for x in similar['items']] == [second.id]
 
 
 def test_index_scopes_and_image_cache_survive_review_but_refresh_changed_pixels(store):
@@ -112,7 +112,7 @@ def test_index_scopes_and_image_cache_survive_review_but_refresh_changed_pixels(
     assert len(calls) == 2
     approve(first)
     _, ids, _ = embeddings.current_index(catalog.load_catalog(), backend)
-    assert ids == [first.id] and len(calls) == 2
+    assert ids == [first.id, second.id] and len(calls) == 2
     _, inclusive, _ = embeddings.current_index(catalog.load_catalog(), backend, include_pending=True)
     assert inclusive == [first.id, second.id] and len(calls) == 2
     Image.new('RGB', (300, 400), 'red').save(first.image_path)

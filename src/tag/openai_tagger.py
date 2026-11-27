@@ -54,6 +54,10 @@ def _coerce_tags(data: dict) -> FashionTags | None:
         **{key: str(data.get(key) or ("未判断" if key == "图案" else "其他")) for key in FILTER_FIELDS},
         袖长=str(data.get("袖长") or ""),
         面料=str(data.get("面料") or ""),
+        面料来源="目视" if data.get("面料") in {"针织", "梭织"} else "",
+        袖长来源="目视" if data.get("袖长") else "",
+        素材风险=[v for v in ("多商品购物卡", "大面积卡通贴布", "卫衣布裁剪缝制", "男装", "儿童款")
+              if isinstance(data.get("素材风险"), list) and v in data["素材风险"]],
         细节元素=[str(d).strip() for d in details],
         一句话描述=str(data.get("一句话描述") or ""),
     ).normalized()

@@ -33,12 +33,12 @@ from src.factory.season_rules import (
 )
 
 MARKET, BRAND = "市场", "品牌"
-_MARKET_RE = re.compile(r"^[A-Za-z]*\d+[A-Za-z]?(?:\*\d+[A-Za-z]?)?$")
 _SPLIT_COLOR = re.compile(r"[+＋]")
 
 
 def customer_type(variant_code: str) -> str:
-    return MARKET if _MARKET_RE.fullmatch((variant_code or "").strip()) else BRAND
+    code = parse_style_code(variant_code)
+    return MARKET if code and code.is_market else BRAND
 
 
 ExportScope = Literal["all", "tracking", "review"]

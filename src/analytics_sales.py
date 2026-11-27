@@ -9,7 +9,8 @@
 from __future__ import annotations
 
 import base64
-from collections import Counter, defaultdict
+import fcntl
+from collections import Counter, OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 import hashlib
@@ -24,22 +25,27 @@ from typing import Literal
 
 import httpx
 from openai import OpenAI
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from src import catalog
+from src import catalog, storage
 from src.analytics_season import BRAND, MARKET, customer_type
-from src.db import _load_env
+from src.db import _load_env, json_extract
+from src.factory.aliases import customer_short_name
+from src.factory.codes import OWN_CUSTOMER, normalize_code_text, parse_style_code
+from src.factory.sales_policy import counted_from_rows, historical_range
 from src.factory.colors import classify_color
 from src.factory.periods import parse_order_date
 from src.factory.season_rules import (
     CATEGORY_ORDER, GRADES, NO_PRODUCTION, OTHER_MATERIAL, category_plan, grade_of, material_group, material_short,
 )
-from src.images import cover_path
-from src.schema import ImageRecord
+from src.garment_structure import SMALL_FLOWER, Structure, eligible, garment_structure
+from src.images import cover_path, image_version, original_data_url
+from src.schema import STYLE, ImageRecord
+from src.tag.tagger import sales_evidence_tags
 
 EXTERNAL_SOURCES: tuple[str, ...] = ("网图趋势", "品牌资料包", "市调拍照")
-STYLE_FILTER_OPTIONS: tuple[str, ...] = ("极简", "通勤", "法式", "休闲", "复古", "甜美", "工装", "街头")
+STYLE_FILTER_OPTIONS: tuple[str, ...] = tuple(v for v in STYLE if v != "其他")
 BUSY_PATTERNS: set[str] = {"花卉", "迷彩", "抽象/泼墨", "动物纹", "混合图案"}
 BUSY_DESC_KEYWORDS: tuple[str, ...] = (
     "大花", "碎花", "满印", "满身花", "满身小图", "满身图", "花卉", "豹纹", "斑马纹", "迷彩", "满身印花",
@@ -52,7 +58,7 @@ DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 AI_TIMEOUT = httpx.Timeout(150.0, connect=25.0)
 _CACHE_LOCK = Lock()
 _FP_LOCK = Lock()
-_FINGERPRINT_CACHE: dict[tuple[str, int, str], tuple[int | None, str | None, tuple[int, ...] | None]] = {}
+_FINGERPRINT_CACHE: OrderedDict[tuple[str, int, str], tuple[int | None, str | None, tuple[int, ...] | None]] = OrderedDict()
 _SPLIT_COLOR = re.compile(r"[+＋/、,，]")
 
 PRICE_BANDS: tuple[tuple[str, float, float], ...] = (
@@ -67,7 +73,11 @@ DecisionStatus = Literal["adopted", "maybe", "rejected", "none"]
 
 
 class SalesInsightError(RuntimeError):
-    """User-facing error for AI configuration or invocation failures."""
+    """User-facing failure for a sales insight request."""
+
+    def __init__(self, message: str, *, status_code=502):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class AttributionFilters(BaseModel):
@@ -100,7 +110,7 @@ class SelectionFilters(BaseModel):
     exclude_busy_patterns: bool = True
     styles: list[str] = Field(default_factory=list, max_length=12)
     scan_limit: int = Field(default=128, ge=16, le=256)
-    exclude_record_ids: list[str] = Field(default_factory=list, max_length=2000)
+    exclude_record_ids: list[str] = Field(default_factory=list, max_length=50000)
     skip_rejected: bool = True
 
     @model_validator(mode="after")
@@ -108,10 +118,12 @@ class SelectionFilters(BaseModel):
         self.seasons = sorted({s.strip() for s in self.seasons if s and s.strip()})
         self.category = self.category.strip() or "长袖套衫"
         valid_sources = [s for s in self.sources if s in EXTERNAL_SOURCES]
-        self.sources = valid_sources or list(EXTERNAL_SOURCES)
+        self.sources = sorted(set(valid_sources)) or sorted(EXTERNAL_SOURCES)
         self.catalog_seasons = sorted({s.strip() for s in self.catalog_seasons if s and s.strip()})
         self.target_style_code = (self.target_style_code or "").strip()
         self.styles = sorted({s.strip() for s in self.styles if s and s.strip()})
+        if set(self.styles) - set(STYLE_FILTER_OPTIONS):
+            raise ValueError("包含未收录的风格筛选项")
         self.exclude_record_ids = sorted({r.strip() for r in self.exclude_record_ids if r and r.strip()})
         if not self.seasons:
             raise ValueError("请至少选择一个本厂参考季节")
@@ -137,6 +149,7 @@ class CustomerInsightFilters(BaseModel):
 class DecisionUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    report_id: str = Field(pattern=r"^[a-f0-9]{64}$")
     record_id: str = Field(min_length=1, max_length=128)
     status: DecisionStatus
     note: str = Field(default="", max_length=300)
@@ -169,7 +182,8 @@ def _read_cached_json(key: str) -> dict | None:
     if not path.is_file():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) and value else None
     except (OSError, ValueError):
         return None
 
@@ -191,7 +205,8 @@ def load_decisions() -> dict[str, dict]:
 
 
 def save_decision(record_id: str, status: DecisionStatus, note: str = "") -> dict:
-    with _CACHE_LOCK:
+    with _CACHE_LOCK, (_cache_dir() / "decisions.lock").open("a+b") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
         decisions = load_decisions()
         if status == "none" and not note.strip():
             decisions.pop(record_id, None)
@@ -229,6 +244,12 @@ def sales_ai_status() -> dict:
     return {"ready": False, "provider": None, "model": "", "label": "未配置深度视觉模型"}
 
 
+def _model_identity(status, client):
+    if client is None:
+        return [status["provider"], status["model"], status["label"]]
+    return [getattr(client, "provider", None), getattr(client, "model", ""), client.label]
+
+
 def _extract_json(text: str) -> dict:
     cleaned = (text or "").strip()
     if cleaned.startswith("```"):
@@ -248,27 +269,35 @@ def _extract_json(text: str) -> dict:
 
 def _record_data_url(record: ImageRecord, max_side: int = 520) -> str | None:
     try:
-        path = cover_path(record)
-        with Image.open(path) as img:
-            rgb = img.convert("RGB")
-            rgb.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
-            buf = BytesIO()
-            rgb.save(buf, format="JPEG", quality=84)
-            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-            return f"data:image/jpeg;base64,{b64}"
+        return original_data_url(record, max_side=max_side)
     except Exception:
         return None
 
 
+def _image_stamp(record: ImageRecord) -> str:
+    if not record.image_path:
+        return "missing"
+    try:
+        return image_version(record.image_path)
+    except Exception:
+        return "missing"
+
+
+def _record_version(record):
+    return [record.image_path, record.revision, _image_stamp(record),
+            record.cover_crop.model_dump() if record.cover_crop else None]
+
+
 def _image_fingerprints(record: ImageRecord) -> tuple[int | None, str | None, tuple[int, ...] | None]:
     """Return cached (64-bit h+v gradient dHash, 16-hex byte SHA256, 2x2 RGB quad signature)."""
-    cache_key = (record.id, int(record.revision or 0), record.image_path)
+    cache_key = (record.image_path, int(record.revision or 0), _image_stamp(record))
     with _FP_LOCK:
         hit = _FINGERPRINT_CACHE.get(cache_key)
-    if hit is not None:
-        return hit
+        if hit is not None:
+            _FINGERPRINT_CACHE.move_to_end(cache_key)
+            return hit
     try:
-        path = cover_path(record)
+        path = storage.local_file(record.image_path)
         raw_bytes = path.read_bytes()
         sha = hashlib.sha256(raw_bytes).hexdigest()[:16]
         with Image.open(BytesIO(raw_bytes)) as img:
@@ -290,11 +319,11 @@ def _image_fingerprints(record: ImageRecord) -> tuple[int | None, str | None, tu
         dhash = None if (bits.bit_count() < 4 or bits.bit_count() > 60) else bits
         result = (dhash, sha, rgb_sig)
     except Exception:
-        result = (None, None, None)
+        return None, None, None
     with _FP_LOCK:
-        if len(_FINGERPRINT_CACHE) > 4000:
-            _FINGERPRINT_CACHE.clear()
         _FINGERPRINT_CACHE[cache_key] = result
+        if len(_FINGERPRINT_CACHE) > 8192:
+            _FINGERPRINT_CACHE.popitem(last=False)
     return result
 
 
@@ -328,42 +357,42 @@ def _make_contact_sheet(
     tile_w: int = 290,
     tile_h: int = 350,
     cols: int = 4,
-) -> str | None:
+) -> tuple[str | None, dict[int, str]]:
     """Stitch up to 16 candidate covers into a numbered 4x4 JPEG contact sheet for Qwen4-Max visual screening."""
     if not items_with_recs:
-        return None
+        return None, {}
     pad = 8
     rows = max(1, (len(items_with_recs) + cols - 1) // cols)
     canvas = Image.new("RGB", (cols * tile_w + (cols + 1) * pad, rows * tile_h + (rows + 1) * pad), (246, 245, 242))
     draw = ImageDraw.Draw(canvas)
     font = _badge_font(20)
-    rendered = 0
+    rendered: dict[int, str] = {}
     for idx, (slot_num, rec) in enumerate(items_with_recs):
         r, c = divmod(idx, cols)
         x0 = pad + c * (tile_w + pad)
         y0 = pad + r * (tile_h + pad)
         draw.rectangle([x0, y0, x0 + tile_w, y0 + tile_h], fill=(255, 255, 255), outline=(214, 210, 202), width=1)
         try:
-            path = cover_path(rec)
+            path = storage.local_file(rec.image_path)
             with Image.open(path) as img:
-                rgb = img.convert("RGB")
-                rgb.thumbnail((tile_w - 6, tile_h - 6), Image.Resampling.LANCZOS)
+                rgb = ImageOps.exif_transpose(img).convert("RGB")
+                rgb.thumbnail((tile_w - 6, tile_h - 39), Image.Resampling.LANCZOS)
                 ox = x0 + (tile_w - rgb.width) // 2
-                oy = y0 + (tile_h - rgb.height) // 2
+                oy = y0 + 36 + (tile_h - 39 - rgb.height) // 2
                 canvas.paste(rgb, (ox, oy))
-                rendered += 1
+                rendered[slot_num] = rec.id
         except Exception:
-            pass
+            continue
         # High-contrast ASCII badge: 01..16
         label = f"{slot_num:02d}"
         draw.rectangle([x0 + 4, y0 + 4, x0 + 50, y0 + 34], fill=(24, 28, 25))
         draw.text((x0 + 13, y0 + 8), label, fill=(255, 255, 255), font=font)
-    if rendered == 0:
-        return None
+    if not rendered:
+        return None, {}
     buf = BytesIO()
     canvas.save(buf, format="JPEG", quality=84)
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:image/jpeg;base64,{b64}"
+    return f"data:image/jpeg;base64,{b64}", rendered
 
 
 def _make_hero_reference_image(hero_pairs: list[tuple[str, ImageRecord]]) -> str | None:
@@ -387,16 +416,16 @@ def _make_hero_reference_image(hero_pairs: list[tuple[str, ImageRecord]]) -> str
         y0 = pad + r * (tile_h + pad)
         draw.rectangle([x0, y0, x0 + tile_w, y0 + tile_h], fill=(255, 255, 255), outline=(205, 200, 190), width=1)
         try:
-            path = cover_path(rec)
+            path = storage.local_file(rec.image_path)
             with Image.open(path) as img:
-                rgb = img.convert("RGB")
+                rgb = ImageOps.exif_transpose(img).convert("RGB")
                 rgb.thumbnail((tile_w - 8, tile_h - 38), Image.Resampling.LANCZOS)
                 ox = x0 + (tile_w - rgb.width) // 2
                 oy = y0 + 34 + (tile_h - 38 - rgb.height) // 2
                 canvas.paste(rgb, (ox, oy))
                 rendered += 1
         except Exception:
-            pass
+            continue
         ascii_code = "".join(ch for ch in str(code) if 32 <= ord(ch) < 127)[:14] or f"#{idx + 1}"
         draw.rectangle([x0 + 4, y0 + 4, x0 + tile_w - 4, y0 + 30], fill=(42, 68, 52))
         draw.text((x0 + 12, y0 + 7), f"HERO {ascii_code}", fill=(255, 255, 255), font=font)
@@ -500,51 +529,29 @@ def _thumb_url(record: ImageRecord | None) -> str | None:
 
 
 def _matches_category_plan(record: ImageRecord, plan: str) -> bool:
-    if plan in {"全部", "全部品类", ""}:
-        return True
-    cat = (record.tags.品类 or "").strip()
-    sleeve_len = (record.tags.袖长 or "").strip()
-    sleeve_type = (record.tags.袖型 or "").strip()
-    desc = (record.tags.一句话描述 or "").strip()
-    is_short_or_mid = sleeve_len in {"短袖", "中袖"} or sleeve_type == "短袖" or any(k in desc for k in ("短袖", "五分袖", "七分袖", "半袖"))
-    is_sleeveless = sleeve_len == "无袖" or sleeve_type == "无袖"
-    is_full_zip_outer = (
-        any(k in desc for k in ("拉链开衫", "拉链外套", "连帽开衫", "开襟外套", "拉链卫衣外套"))
-        and "半拉链" not in desc
-    )
-    if plan == "长袖套衫":
-        return (
-            cat in {"上衣>套衫", "上衣>假两件套衫", "上衣>卫衣", "上衣"}
-            and not is_short_or_mid
-            and not is_sleeveless
-            and not is_full_zip_outer
-        )
-    if plan == "长袖开衫":
-        return cat in {"上衣>开衫", "外套>针织外套"} and not is_short_or_mid and not is_sleeveless
-    if plan == "短/中袖套衫":
-        return (cat in {"上衣>套衫", "上衣>假两件套衫", "上衣>衬衫", "上衣"} and is_short_or_mid) or cat == "上衣>T恤"
-    if plan == "短袖开衫":
-        return cat in {"上衣>开衫", "外套>针织外套"} and is_short_or_mid
-    if plan == "下半身/连衣裙":
-        return cat.startswith(("半身裙", "裤装", "连衣裙")) or cat == "套装"
-    if plan == "小品类":
-        return cat in {"上衣>背心/马甲", "配饰"} or (cat.startswith("上衣") and is_sleeveless)
-    if plan == "童装":
-        return "童" in desc or "儿童" in desc
-    return False
+    return eligible(record, plan)
 
 
-def _load_records(conn) -> tuple[dict[str, ImageRecord], list[ImageRecord]]:
+def _load_records(conn, *, own_only=False) -> tuple[dict[str, ImageRecord], list[ImageRecord]]:
     own_by_code: dict[str, ImageRecord] = {}
     external_records: list[ImageRecord] = []
-    for row in conn.execute("SELECT id, revision, review_status, payload FROM records"):
-        if row["review_status"] == "rejected":
-            continue
+    query = "SELECT id, revision, review_status, payload FROM records WHERE review_status <> 'rejected'"
+    if own_only:
+        query += " AND " + json_extract("payload", "$.source_category") + " = '本厂产品'"
+    for row in conn.execute(query):
         try:
             rec = ImageRecord.model_validate_json(row["payload"])
             rec.revision = int(row["revision"] or rec.revision or 0)
         except Exception:
             continue
+        mock = rec.ai_tags_source == "mock" or rec.tags_source == "mock"
+        rec.tag_overrides = dict(rec.human_overrides)
+        rec.tags = sales_evidence_tags(rec)
+        if mock:
+            rec.category_raw = ""
+            rec.sleeve_length, rec.fabric = rec.tags.袖长, rec.tags.面料
+            if rec.source_category != "本厂产品" and not rec.human_overrides:
+                continue
         if not rec.image_path:
             continue
         if rec.source_category == "本厂产品":
@@ -600,11 +607,19 @@ def sales_options(conn) -> dict:
     }
 
 
-def _collect_factory_styles(conn, seasons: list[str], *, cutoff: date | None = None, include_brand: bool = False):
-    own_images, external_records = _load_records(conn)
-    styles: dict[str, dict] = {}
+def _collect_factory_styles(conn, seasons: list[str], *, cutoff: date | None = None, include_brand: bool = False,
+                            own_only: bool = False):
+    own_images, external_records = _load_records(conn, own_only=own_only)
+    rows = list(conn.execute(f"SELECT * FROM style_variants WHERE season IN ({_marks(seasons)})", seasons))
+    orders = list(conn.execute(f"SELECT * FROM style_order_lines WHERE season IN ({_marks(seasons)})", seasons))
+    stats = _factory_stats(conn, rows, orders, own_images, cutoff=cutoff, include_brand=include_brand)
+    return {**stats, "own_images": own_images, "external_records": external_records}
+
+
+def _factory_stats(conn, rows, orders, own_images, *, cutoff=None, include_brand=True):
+    styles = {}
     excluded_brand = 0
-    for row in conn.execute(f"SELECT * FROM style_variants WHERE season IN ({_marks(seasons)})", seasons):
+    for row in rows:
         vcode = row["variant_code"]
         ctype = customer_type(vcode)
         if not include_brand and ctype == BRAND:
@@ -612,7 +627,7 @@ def _collect_factory_styles(conn, seasons: list[str], *, cutoff: date | None = N
             continue
         mat_group, mat_ab = material_group(row["material"])
         mat_label = f"{mat_group}/AB" if mat_ab and mat_group != OTHER_MATERIAL else mat_group
-        rec = own_images.get((row["style_code"] or "").strip())
+        rec = own_images.get(vcode) or own_images.get((row["style_code"] or "").strip())
         try:
             raw_colors = json.loads(row["colors_json"] or "[]")
             colors = [c.get("name", "") if isinstance(c, dict) else str(c) for c in raw_colors]
@@ -635,6 +650,7 @@ def _collect_factory_styles(conn, seasons: list[str], *, cutoff: date | None = N
             "colors": colors,
             "ctype": ctype,
             "record": rec,
+            "order_lines": 0, "summary_qty": 0, "has_summary": False,
             "qty": 0,
             "amt": 0.0,
             "rep_qty": 0,
@@ -644,11 +660,7 @@ def _collect_factory_styles(conn, seasons: list[str], *, cutoff: date | None = N
         }
 
     order_rows = []
-    for row in conn.execute(
-        "SELECT variant_code, style_code, color, quantity, amount, order_kind, order_date, customer, customer_raw, season "
-        f"FROM style_order_lines WHERE season IN ({_marks(seasons)})",
-        seasons,
-    ):
+    for row in orders:
         vcode = row["variant_code"]
         if not include_brand and customer_type(vcode) == BRAND:
             continue
@@ -658,7 +670,8 @@ def _collect_factory_styles(conn, seasons: list[str], *, cutoff: date | None = N
         qty = int(row["quantity"] or 0)
         amt = float(row["amount"] or 0.0)
         kind = row["order_kind"] or "订单"
-        cust = (row["customer_raw"] or "").strip() or (row["customer"] or "").strip() or "未知客户"
+        raw_customer = (row["customer_raw"] or "").strip()
+        cust = customer_short_name(row["customer"] or raw_customer)
         color = (row["color"] or "").strip()
         order_rows.append({
             "code": vcode,
@@ -668,46 +681,68 @@ def _collect_factory_styles(conn, seasons: list[str], *, cutoff: date | None = N
             "amt": amt,
             "kind": kind,
             "day": day,
-            "cust": cust,
+            "cust": cust, "customer_raw": raw_customer or cust,
         })
         if vcode in styles:
             st = styles[vcode]
             st["qty"] += qty
             st["amt"] += amt
-            st["customers"][cust] += qty
+            st["order_lines"] += 1
+            if cust and cust != OWN_CUSTOMER and qty > 0:
+                st["customers"][cust] += qty
             if color:
                 st["color_qty"][color] += qty
             if kind == "补单":
                 st["rep_qty"] += qty
-                st["rep_customers"].add(cust)
+                if cust and cust != OWN_CUSTOMER and qty > 0:
+                    st["rep_customers"].add(cust)
 
     prod_codes = set()
-    for row in conn.execute("SELECT DISTINCT variant_code FROM style_production"):
-        vcode = row["variant_code"]
-        if vcode in styles:
-            prod_codes.add(vcode)
+    codes = list(styles)
+    for start in range(0, len(codes), 500):
+        batch = codes[start:start + 500]
+        marks = _marks(batch)
+        prod_codes.update(r[0] for r in conn.execute(
+            f"SELECT DISTINCT variant_code FROM style_production WHERE quantity > 0 AND variant_code IN ({marks})", batch))
+        summaries = list(conn.execute(f"SELECT * FROM style_sales WHERE variant_code IN ({marks})", batch))
+        if not summaries:
+            continue
+        covered_orders = conn.execute(
+            f"SELECT variant_code, order_date FROM style_order_lines WHERE variant_code IN ({marks})", batch)
+        for summary in counted_from_rows(summaries, covered_orders):
+            st = styles[summary["variant_code"]]
+            st["has_summary"] = True
+            scope = historical_range(summary)
+            if cutoff and (not scope or scope[1] > cutoff.isoformat()):
+                continue
+            st["summary_qty"] += int(summary["quantity"])
+            st["qty"] += int(summary["quantity"])
+            st["amt"] += float(summary["amount"])
 
-    has_prod_table = bool(prod_codes)
     for vcode, st in styles.items():
         qty = st["qty"]
-        produced = (vcode in prod_codes) if has_prod_table else (qty > 0)
-        st["produced"] = produced
-        st["grade"] = grade_of(qty) if produced else NO_PRODUCTION
+        st["produced"] = vcode in prod_codes
+        st["sales_coverage"] = ("仅销量汇总" if st["has_summary"] and not st["order_lines"] else
+                                "生产及订单已确认" if st["produced"] and st["order_lines"] else "生产或订单覆盖未知")
+        st["grade"] = grade_of(qty) if qty > 0 or st["produced"] else NO_PRODUCTION
         st["unit_price"] = round(st["amt"] / qty, 1) if qty > 0 else 0.0
         st["price_band"] = _price_band(st["unit_price"])
         cust_counts = st["customers"]
         cust_n = len(cust_counts)
-        top1_share = (max(cust_counts.values()) / qty) if (qty > 0 and cust_counts) else 0.0
+        known_quantity = sum(cust_counts.values())
+        top1_share = max(cust_counts.values()) / known_quantity if known_quantity else 0.0
         st["customer_count"] = cust_n
         st["rep_customer_count"] = len(st["rep_customers"])
         st["top1_customer_share"] = round(top1_share, 3)
         # Winner definition: S/A/B (>=1000) OR (>=500 with replenishment >=150 & >=3 customers)
-        is_winner = st["grade"] in {"S", "A", "B"} or (qty >= 500 and st["rep_qty"] >= 150 and cust_n >= 3)
+        is_winner = st["grade"] in {"S", "A", "B"} or (qty >= 500 and st["rep_qty"] >= 150 and len(st["rep_customers"]) >= 2 and cust_n >= 3)
         st["is_winner"] = is_winner
         if is_winner:
-            if cust_n >= 3 and st["rep_qty"] > 0 and top1_share < 0.70:
+            if st["sales_coverage"] == "仅销量汇总":
+                st["winner_type"] = "汇总高销量款"
+            elif cust_n >= 3 and len(st["rep_customers"]) >= 2 and top1_share < 0.70:
                 st["winner_type"] = "通吃复购款"
-            elif top1_share >= 0.70 or cust_n <= 2:
+            elif cust_n and (top1_share >= 0.70 or cust_n <= 2):
                 st["winner_type"] = "大客户包场款"
             else:
                 st["winner_type"] = "稳健走量款"
@@ -729,83 +764,32 @@ def _collect_factory_styles(conn, seasons: list[str], *, cutoff: date | None = N
     return {
         "styles": styles,
         "orders": order_rows,
-        "own_images": own_images,
-        "external_records": external_records,
         "excluded_brand": excluded_brand,
-        "has_prod_table": has_prod_table,
+        "has_prod_table": bool(prod_codes),
     }
 
 
+def _own_structure(st: dict) -> Structure:
+    if "structure" not in st:
+        st["structure"] = garment_structure(st.get("record"), st.get("cat1", ""), st.get("cat2", ""), st.get("series", ""))
+    return st["structure"]
+
+
 def _own_structural_hints(st: dict) -> tuple[str, list[str]]:
-    """Fuse ERP subcategory/series with catalog tags to correct mislabeled necklines (e.g. hoodie -> 连帽)."""
-    cat2 = (st.get("cat2") or "").strip()
-    series = (st.get("series") or "").strip()
-    rec: ImageRecord | None = st.get("record")
-    tag_neck = (rec.tags.领型 if rec else "") or ""
-    desc = (rec.tags.一句话描述 if rec else "") or ""
-    details = list(rec.tags.细节元素) if rec else []
-    erp_text = f"{cat2} {series}".strip()
-
-    effective_neck = tag_neck
-    if any(k in erp_text or k in desc or k in details for k in ("连帽", "帽衫", "带帽", "卫衣帽")):
-        effective_neck = "连帽"
-    elif any(k in cat2 for k in ("半高领", "中领")):
-        effective_neck = "半高领"
-    elif any(k in cat2 for k in ("高领", "堆堆领")):
-        effective_neck = "高领"
-    elif any(k in cat2 for k in ("POLO", "polo", "Polo", "翻领")):
-        effective_neck = "翻领"
-    elif any(k in cat2 for k in ("V领", "v领")):
-        effective_neck = "V领"
-    elif "圆领" in cat2 and tag_neck in {"", "其他", "未判断"}:
-        effective_neck = "圆领"
-
-    hints: list[str] = []
-    if cat2:
-        hints.append(f"ERP细分:{cat2}")
-    if series and series != cat2:
-        hints.append(f"系列:{series}")
-    if effective_neck and effective_neck != tag_neck and effective_neck not in {"", "其他", "未判断"}:
-        hints.append(f"结构校正:{effective_neck}")
-    return effective_neck, hints
-
-
-_NECKLINE_COMPATIBLE: dict[str, set[str]] = {
-    "V领": {"翻领", "方领", "系带领", "荡领"},
-    "连帽": {"立领", "翻领"},
-    "半高领": {"高领", "立领", "圆领"},
-    "高领": {"半高领", "立领", "堆堆领"},
-    "翻领": {"V领", "立领", "方领"},
-    "圆领": {"半高领", "一字领", "方领"},
-    "方领": {"V领", "一字领", "圆领"},
-    "一字领": {"方领", "圆领", "荡领"},
-}
+    shape = _own_structure(st)
+    hints = [st.get("cat2", ""), st.get("series", ""), shape.piece, shape.opening, shape.layer, *shape.conflicts]
+    return shape.neck, list(dict.fromkeys(h for h in hints if h))
 
 
 def _cand_effective_neckline(rec: ImageRecord) -> str:
-    desc = (rec.tags.一句话描述 or "").strip()
-    details = rec.tags.细节元素 or []
-    tag_neck = (rec.tags.领型 or "").strip()
-    if "连帽" in details or any(k in desc for k in ("连帽", "帽衫", "带帽", "卫衣帽")):
-        return "连帽"
-    if any(k in desc for k in ("V领", "v领", "鸡心领", "深V", "大V")):
-        return "V领"
-    if any(k in desc for k in ("半高领", "小高领", "中领")):
-        return "半高领"
-    if any(k in desc for k in ("高领", "堆堆领", "翻高领")):
-        return "高领"
-    if any(k in desc for k in ("POLO", "polo", "Polo", "翻领", "海军领", "娃娃领")):
-        return "翻领"
-    if "方领" in desc:
-        return "方领"
-    if any(k in desc for k in ("一字领", "船领")):
-        return "一字领"
-    return tag_neck
+    return garment_structure(rec).neck
 
 
 def _is_busy_pattern(rec: ImageRecord) -> tuple[bool, str]:
     pat = (rec.tags.图案 or "").strip()
     desc = (rec.tags.一句话描述 or "").strip()
+    if SMALL_FLOWER.search(desc) and not any(k in desc for k in ("满身", "满印", "大花", "满版")):
+        return False, ""
     if pat in BUSY_PATTERNS:
         return True, f"图案为「{pat}」"
     for kw in BUSY_DESC_KEYWORDS:
@@ -817,7 +801,7 @@ def _is_busy_pattern(rec: ImageRecord) -> tuple[bool, str]:
 def _serialize_style_card(st: dict) -> dict:
     rec: ImageRecord | None = st["record"]
     effective_neck, structural_hints = _own_structural_hints(st)
-    tags_dict = {}
+    tags_dict = {"领型": effective_neck} if effective_neck else {}
     if rec:
         tags_dict = {
             "品类": rec.tags.品类,
@@ -828,6 +812,7 @@ def _serialize_style_card(st: dict) -> dict:
             "颜色主色调": rec.tags.颜色主色调,
             "图案": rec.tags.图案,
             "面料": rec.tags.面料,
+            "面料来源": rec.tags.面料来源 or "历史未记录",
             "细节元素": list(rec.tags.细节元素),
             "一句话描述": rec.tags.一句话描述,
         }
@@ -841,6 +826,9 @@ def _serialize_style_card(st: dict) -> dict:
         "cat2": st.get("cat2") or "",
         "series": st.get("series") or "",
         "structural_hints": structural_hints,
+        "structure": vars(_own_structure(st)).copy(),
+        "sales_coverage": st.get("sales_coverage", "生产或订单覆盖未知"),
+        "summary_quantity": st.get("summary_qty", 0),
         "plan": st["plan"],
         "material": st["material"],
         "material_short": st["material_short"],
@@ -861,6 +849,32 @@ def _serialize_style_card(st: dict) -> dict:
     }
 
 
+def _visual_units(styles: list[dict]) -> list[dict]:
+    """One observation per original image. Any winning version makes that observation a win."""
+    groups = defaultdict(list)
+    image_keys = {}
+    for st in styles:
+        rec = st.get("record")
+        if rec is None or ((rec.tags_source == "mock" or rec.ai_tags_source == "mock") and not rec.human_overrides):
+            continue
+        if rec.id not in image_keys:
+            image_keys[rec.id] = _image_fingerprints(rec)[1] or rec.image_path or rec.id
+        groups[image_keys[rec.id]].append(st)
+    units = []
+    for versions in groups.values():
+        best = min(versions, key=lambda st: (not st["is_winner"], -st["qty"], st["code"]))
+        unit = {**best, "qty": sum(st["qty"] for st in versions),
+                "rep_qty": sum(st["rep_qty"] for st in versions)}
+        if any(st["winner_type"] == "通吃复购款" for st in versions):
+            unit["winner_type"] = "通吃复购款"
+        units.append(unit)
+    return units
+
+
+def _digest(payload) -> str:
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 def _compute_dimension_tables(style_list: list[dict]) -> list[dict]:
     """Compute empirical win-rate, sell-through, and replenishment lift across 8 dimensions."""
     dimensions: list[tuple[str, str, bool]] = [
@@ -874,9 +888,10 @@ def _compute_dimension_tables(style_list: list[dict]) -> list[dict]:
         ("细节元素", "针织纹理与工艺细节（有图款多选）", True),
     ]
     out = []
+    visual_units = _visual_units(style_list)
     for key, title, needs_image in dimensions:
         buckets: dict[str, list[dict]] = defaultdict(list)
-        base_pool = [s for s in style_list if (s["record"] is not None if needs_image else True)]
+        base_pool = visual_units if needs_image else style_list
         if key == "price_band":
             base_pool = [s for s in base_pool if s["qty"] > 0]
         for s in base_pool:
@@ -937,8 +952,16 @@ def _attribution_cache_key(snapshot: str) -> str:
     return f"attr_{snapshot[:32]}"
 
 
-def build_attribution_preview(conn, filters: AttributionFilters) -> dict:
-    bundle = _collect_factory_styles(conn, filters.seasons, cutoff=filters.cutoff, include_brand=filters.include_brand)
+def read_attribution_inputs(conn, filters: AttributionFilters):
+    return _collect_factory_styles(conn, filters.seasons, cutoff=filters.cutoff,
+                                   include_brand=filters.include_brand, own_only=True)
+
+
+def build_attribution_preview(conn, filters: AttributionFilters, *, client=None) -> dict:
+    return preview_attribution_inputs(read_attribution_inputs(conn, filters), filters, client=client)
+
+
+def preview_attribution_inputs(bundle, filters: AttributionFilters, *, client=None) -> dict:
     all_styles = list(bundle["styles"].values())
     cat_styles = [
         s for s in all_styles
@@ -951,24 +974,21 @@ def build_attribution_preview(conn, filters: AttributionFilters) -> dict:
     broad_winners = [s for s in winners if s["winner_type"] == "通吃复购款"]
     vip_winners = [s for s in winners if s["winner_type"] == "大客户包场款"]
     laggards = sorted(
-        [s for s in cat_styles if not s["is_winner"] and (s["grade"] == NO_PRODUCTION or s["qty"] < 150)],
+        [s for s in cat_styles if not s["is_winner"] and s["sales_coverage"] == "生产及订单已确认" and s["qty"] < 150],
         key=lambda s: (0 if s["record"] is not None else 1, s["qty"], s["code"]),
     )
+    winning_images = {_image_fingerprints(s["record"])[1] or s["record"].image_path for s in winners if s["record"]}
+    laggards = [s for s in laggards if not s["record"] or
+                (_image_fingerprints(s["record"])[1] or s["record"].image_path) not in winning_images]
     imaged_count = sum(1 for s in cat_styles if s["record"] is not None)
     dimensions = _compute_dimension_tables(cat_styles)
 
-    snapshot_payload = [
-        filters.seasons,
-        filters.category,
-        str(filters.cutoff),
-        filters.include_brand,
-        sku,
-        sum(s["qty"] for s in cat_styles),
-        sum(s["rep_qty"] for s in cat_styles),
-        imaged_count,
-        [(s["code"], s["qty"], s["rep_qty"], s["record"].revision if s["record"] else -1) for s in winners[:12]],
-    ]
-    snapshot = hashlib.sha256(json.dumps(snapshot_payload, ensure_ascii=False).encode()).hexdigest()
+    status = sales_ai_status()
+    snapshot = _digest([
+        "sales-attribution-v3", filters.model_dump(mode="json"), _model_identity(status, client), ATTRIBUTION_SYSTEM_PROMPT, dimensions,
+        [(_serialize_style_card(st), _record_version(st["record"]) if st["record"] else None)
+         for st in sorted(cat_styles, key=lambda st: st["code"])],
+    ])
     cached_ai = _read_cached_json(_attribution_cache_key(snapshot))
 
     # Category switcher summary pills
@@ -980,7 +1000,8 @@ def build_attribution_preview(conn, filters: AttributionFilters) -> dict:
     ]
     category_tabs.append({"name": "全部品类", "sku": len(all_styles)})
 
-    return {
+    report = {
+        "report_type": "attribution",
         "scope": {
             "seasons": filters.seasons,
             "category": filters.category,
@@ -992,6 +1013,8 @@ def build_attribution_preview(conn, filters: AttributionFilters) -> dict:
         "overview": {
             "sku": sku,
             "imaged_sku": imaged_count,
+            "independent_styles": len({s["style_code"] for s in cat_styles}),
+            "independent_images": len(_visual_units(cat_styles)),
             "image_coverage": _ratio(imaged_count, sku),
             "ordered_sku": len(ordered),
             "sell_through": _ratio(len(ordered), sku),
@@ -1001,6 +1024,7 @@ def build_attribution_preview(conn, filters: AttributionFilters) -> dict:
             "winner_rate": _ratio(len(winners), sku),
             "broad_winner_sku": len(broad_winners),
             "vip_winner_sku": len(vip_winners),
+            "coverage_counts": dict(Counter(s["sales_coverage"] for s in cat_styles)),
             "total_quantity": sum(s["qty"] for s in cat_styles),
             "total_amount": round(sum(s["amt"] for s in cat_styles), 2),
             "replenishment_quantity": sum(s["rep_qty"] for s in cat_styles),
@@ -1009,13 +1033,15 @@ def build_attribution_preview(conn, filters: AttributionFilters) -> dict:
         "top_winners": [_serialize_style_card(s) for s in winners[:10]],
         "sample_laggards": [_serialize_style_card(s) for s in laggards[:8]],
         "ai_insight": cached_ai,
-        "ai_status": sales_ai_status(),
+        "ai_status": status,
         "snapshot": snapshot,
     }
 
+    return _freeze_report(report, {rec.id: rec for rec in bundle["own_images"].values()})
+
 
 ATTRIBUTION_SYSTEM_PROMPT = """你是资深女装针织商品企划总监与销售复盘专家。
-请结合给定的【本厂真实销售统计对照表】以及【爆款原图 vs 无产量/滞销对照原图】，深度归纳该品类在本厂卖得好的核心原因、滞销坑点，以及可直接用于下一轮选款打版的方法论。
+请结合给定的【本厂真实销售统计对照表】以及【爆款原图 vs 有生产且有订单覆盖的低销量对照原图】，深度归纳该品类在本厂卖得好的核心原因、滞销坑点，以及可直接用于下一轮选款打版的方法论。
 
 严格要求：
 1. 杜绝“简约百搭、显瘦高级”这类空泛套话！每一条结论必须同时结合【硬数据指标（爆款率/动销率/补单量/客单价/材质）】和【肉眼可见的服装版型、领型、织法纹理、色彩细节】，并点名具体的本厂款号作为证据。
@@ -1034,8 +1060,8 @@ ATTRIBUTION_SYSTEM_PROMPT = """你是资深女装针织商品企划总监与销�
   ],
   "losing_pitfalls": [
     {
-      "title": "滞销/无产量主要坑点",
-      "reason": "结合数据与滞销图分析为什么客户不买单或未进大货生产",
+      "title": "已生产低销量款的风险",
+      "reason": "结合数据与滞销图分析为什么客户不买单",
       "example_codes": ["款号A", "款号B"]
     }
   ],
@@ -1051,15 +1077,17 @@ ATTRIBUTION_SYSTEM_PROMPT = """你是资深女装针织商品企划总监与销�
 
 
 def run_attribution_ai(conn, filters: AttributionFilters, *, force: bool = False, client: SalesVisionClient | None = None) -> dict:
-    preview = build_attribution_preview(conn, filters)
+    """Compatibility entry point for callers that manage their own connection."""
+    return analyze_attribution_inputs(read_attribution_inputs(conn, filters), filters, force=force, client=client)
+
+
+def analyze_attribution_inputs(bundle, filters: AttributionFilters, *, force=False, client=None) -> dict:
+    preview = preview_attribution_inputs(bundle, filters, client=client)
     if preview["overview"]["sku"] == 0:
         raise SalesInsightError("当前季节与品类下暂无款式数据，请切换品类或季节。")
     cache_key = _attribution_cache_key(preview["snapshot"])
-    if not force:
-        cached = _read_cached_json(cache_key)
-        if cached:
-            preview["ai_insight"] = cached
-            return preview
+    if not force and preview["ai_insight"] is not None:
+        return preview
 
     own_client = client is None
     llm = client or SalesVisionClient()
@@ -1084,30 +1112,27 @@ def run_attribution_ai(conn, filters: AttributionFilters, *, force: bool = False
             f"爆款 {preview['overview']['winner_sku']} 款（其中多客户通吃复购款 {preview['overview']['broad_winner_sku']} 款，"
             f"大客户包场款 {preview['overview']['vip_winner_sku']} 款），"
             f"总订单 {preview['overview']['total_quantity']:,} 件，总补单 {preview['overview']['replenishment_quantity']:,} 件。\n\n"
+            f"数据覆盖：{preview['overview']['coverage_counts']}。仅销量汇总和覆盖未知的版本不能推断滞销。"
+            f"低销量归因只可引用随后明确列出的对照款，缺少对照款则返回空 losing_pitfalls。\n"
             f"各维度真实胜率统计：\n{json.dumps(compact_dims, ensure_ascii=False, indent=2)}\n"
         )
         blocks: list[dict] = [{"type": "text", "text": summary_text}]
 
-        # Load ImageRecords for top winners & laggards with photos
-        wanted_ids = [
-            c["record_id"]
-            for c in [*preview["top_winners"][:6], *preview["sample_laggards"][:4]]
-            if c.get("record_id")
-        ]
-        rec_map: dict[str, ImageRecord] = {}
-        if wanted_ids:
-            for row in conn.execute(f"SELECT id, payload FROM records WHERE id IN ({_marks(wanted_ids)})", wanted_ids):
-                try:
-                    rec_map[row["id"]] = ImageRecord.model_validate_json(row["payload"])
-                except Exception:
-                    pass
+        rec_map = {r.id: r for r in bundle["own_images"].values()}
 
+        seen_images = set()
         attached_winners = 0
         for card in preview["top_winners"]:
             if attached_winners >= 6:
                 break
             rid = card.get("record_id")
-            url = _record_data_url(rec_map[rid]) if rid and rid in rec_map else None
+            rec = rec_map.get(rid)
+            image_key = (_image_fingerprints(rec)[1] or rec.id) if rec else None
+            if image_key and image_key in seen_images:
+                continue
+            if image_key:
+                seen_images.add(image_key)
+            url = _record_data_url(rec) if rec else None
             caption = (
                 f"【高卖爆款样本 #{attached_winners + 1}】款号 {card['code']} | {card['winner_type']} | 等级 {card['grade']} | "
                 f"销量 {card['quantity']:,} 件（补单 {card['replenishment']:,} 件，客户 {card['customer_count']} 家）| "
@@ -1123,9 +1148,15 @@ def run_attribution_ai(conn, filters: AttributionFilters, *, force: bool = False
             if attached_laggards >= 4:
                 break
             rid = card.get("record_id")
-            url = _record_data_url(rec_map[rid]) if rid and rid in rec_map else None
+            rec = rec_map.get(rid)
+            image_key = (_image_fingerprints(rec)[1] or rec.id) if rec else None
+            if image_key and image_key in seen_images:
+                continue
+            if image_key:
+                seen_images.add(image_key)
+            url = _record_data_url(rec) if rec else None
             caption = (
-                f"【滞销/无产量对照样本 #{attached_laggards + 1}】款号 {card['code']} | 状态 {card['grade']} | "
+                f"【已生产低销量对照样本 #{attached_laggards + 1}】款号 {card['code']} | 状态 {card['grade']} | "
                 f"销量 {card['quantity']} 件 | 材质 {card['material']} | 标签：{card['tags'].get('一句话描述', '')}"
             )
             blocks.append({"type": "text", "text": caption})
@@ -1139,23 +1170,30 @@ def run_attribution_ai(conn, filters: AttributionFilters, *, force: bool = False
             "model": llm.label,
             "headline": str(raw.get("headline") or "").strip(),
             "winning_drivers": list(raw.get("winning_drivers") or []),
-            "losing_pitfalls": list(raw.get("losing_pitfalls") or []),
+            "losing_pitfalls": list(raw.get("losing_pitfalls") or []) if preview["sample_laggards"] else [],
             "selection_methodology": list(raw.get("selection_methodology") or []),
         }
         _write_cached_json(cache_key, insight)
         preview["ai_insight"] = insight
-        return preview
+        return _store_report(preview)
     finally:
         if own_client:
             llm.close()
 
 
 # ---------------------------------------------------------------- Module 2: External Selection Funnel
+def _gene_value(record, field):
+    if field == "面料" and record.tags.面料来源 not in {"目视", "人工"}:
+        return ""
+    return getattr(record.tags, field, "") or ""
+
+
 def _tag_similarity_and_diffs(
     cand: ImageRecord,
     own: ImageRecord,
     *,
     own_neck_override: str = "",
+    candidate_neck: str | None = None,
 ) -> tuple[float, list[str], list[str]]:
     """Return (0..1 tag overlap ratio, matched_genes, diff_points) between external candidate and an own-factory style."""
     matched: list[str] = []
@@ -1171,14 +1209,14 @@ def _tag_similarity_and_diffs(
         ("颜色主色调", 0.8),
         ("面料", 0.8),
     ]
-    cand_neck = _cand_effective_neckline(cand)
+    cand_neck = _cand_effective_neckline(cand) if candidate_neck is None else candidate_neck
     for field_name, w in weights:
         if field_name == "领型":
             cv = cand_neck
             ov = own_neck_override or (own.tags.领型 or "")
         else:
-            cv = getattr(cand.tags, field_name, "") or ""
-            ov = getattr(own.tags, field_name, "") or ""
+            cv = _gene_value(cand, field_name)
+            ov = _gene_value(own, field_name)
         if cv in {"", "其他", "未判断", "待归类"} or ov in {"", "其他", "未判断", "待归类"}:
             continue
         total_w += w
@@ -1207,7 +1245,7 @@ def _tag_similarity_and_diffs(
 
 def _build_empirical_lift(cat_styles: list[dict]) -> dict[str, dict[str, float]]:
     """Compute smoothed win-rate lift per visual tag value from own-factory performance."""
-    imaged = [s for s in cat_styles if s["record"] is not None]
+    imaged = [s for s in _visual_units(cat_styles) if s["is_winner"] or s["sales_coverage"] == "生产及订单已确认"]
     if not imaged:
         return {}
     base_rate = max(0.08, sum(1 for s in imaged if s["is_winner"]) / len(imaged))
@@ -1215,7 +1253,7 @@ def _build_empirical_lift(cat_styles: list[dict]) -> dict[str, dict[str, float]]
     for field_name in ("领型", "版型", "风格", "图案", "颜色主色调", "面料"):
         groups = defaultdict(list)
         for s in imaged:
-            val = _own_structural_hints(s)[0] if field_name == "领型" else (getattr(s["record"].tags, field_name, "") or "")
+            val = _own_structural_hints(s)[0] if field_name == "领型" else _gene_value(s["record"], field_name)
             if val and val not in {"其他", "未判断", "待归类"}:
                 groups[val].append(s)
         for val, grp in groups.items():
@@ -1271,142 +1309,47 @@ def _selection_cache_key(snapshot: str) -> str:
 
 
 def _plan_from_record(rec: ImageRecord) -> str:
-    for plan in CATEGORY_ORDER:
-        if _matches_category_plan(rec, plan):
-            return plan
-    return "长袖套衫"
+    return garment_structure(rec).plan() or "未知"
 
 
-def _build_single_style_from_db(conn, row, rec: ImageRecord | None, *, lookup_source: str = "other_season") -> dict:
-    vcode = (row["variant_code"] or "").strip()
-    scode = (row["style_code"] or "").strip()
-    mat_group, mat_ab = material_group(row["material"])
-    mat_label = f"{mat_group}/AB" if mat_ab and mat_group != OTHER_MATERIAL else mat_group
-    qty = 0
-    amt = 0.0
-    rep_qty = 0
-    customers: dict[str, int] = defaultdict(int)
-    rep_customers: set[str] = set()
-    color_qty: dict[str, int] = defaultdict(int)
-    for orow in conn.execute(
-        "SELECT color, quantity, amount, order_kind, customer, customer_raw FROM style_order_lines WHERE variant_code = ?",
-        (vcode,),
-    ):
-        q = int(orow["quantity"] or 0)
-        a = float(orow["amount"] or 0.0)
-        qty += q
-        amt += a
-        cust = (orow["customer_raw"] or "").strip() or (orow["customer"] or "").strip() or "未知客户"
-        customers[cust] += q
-        col = (orow["color"] or "").strip()
-        if col:
-            color_qty[col] += q
-        if (orow["order_kind"] or "") == "补单":
-            rep_qty += q
-            rep_customers.add(cust)
-    prod_hit = conn.execute("SELECT 1 FROM style_production WHERE variant_code = ? LIMIT 1", (vcode,)).fetchone()
-    produced = bool(prod_hit) or qty > 0
-    grade = grade_of(qty) if produced else NO_PRODUCTION
-    cust_n = len(customers)
-    top1_share = (max(customers.values()) / qty) if (qty > 0 and customers) else 0.0
-    is_winner = grade in {"S", "A", "B"} or (qty >= 500 and rep_qty >= 150 and cust_n >= 3)
-    if is_winner:
-        if cust_n >= 3 and rep_qty > 0 and top1_share < 0.70:
-            winner_type = "通吃复购款"
-        elif top1_share >= 0.70 or cust_n <= 2:
-            winner_type = "大客户包场款"
-        else:
-            winner_type = "稳健走量款"
-    else:
-        winner_type = ""
-    if color_qty:
-        top_col = max(color_qty.items(), key=lambda kv: kv[1])[0]
-        main_color = classify_color(_SPLIT_COLOR.split(top_col)[0].strip() or top_col)
-    elif rec:
-        main_color = rec.tags.颜色主色调
-    else:
-        main_color = "未填"
-    plan = category_plan(row["category"])
-    if plan not in CATEGORY_ORDER and rec is not None:
-        plan = _plan_from_record(rec)
-    return {
-        "code": vcode,
-        "style_code": scode or vcode,
-        "season": (row["season"] or "").strip(),
-        "cat1": (row["category"] or "").strip(),
-        "cat2": (row["subcategory"] or "").strip(),
-        "series": (row["series"] or "").strip(),
-        "plan": plan,
-        "material": mat_label,
-        "material_short": material_short(mat_label),
-        "material_raw": (row["material"] or "").strip(),
-        "needle": (row["needle"] or "").strip(),
-        "designer": (row["designer"] or "").strip() or "（未填）",
-        "colors": [],
-        "ctype": customer_type(vcode),
-        "record": rec,
-        "qty": qty,
-        "amt": amt,
-        "rep_qty": rep_qty,
-        "customers": customers,
-        "rep_customers": rep_customers,
-        "color_qty": color_qty,
-        "produced": produced,
-        "grade": grade,
-        "unit_price": round(amt / qty, 1) if qty > 0 else 0.0,
-        "price_band": _price_band(round(amt / qty, 1) if qty > 0 else 0.0),
-        "customer_count": cust_n,
-        "rep_customer_count": len(rep_customers),
-        "top1_customer_share": round(top1_share, 3),
-        "is_winner": is_winner,
-        "winner_type": winner_type,
-        "main_color_family": main_color,
-        "lookup_source": lookup_source,
-    }
+def _build_single_style_from_db(conn, row, rec, *, lookup_source="other_season"):
+    code = row["variant_code"]
+    orders = conn.execute("SELECT * FROM style_order_lines WHERE variant_code = ?", (code,))
+    images = {code: rec} if rec else {}
+    style = _factory_stats(conn, [row], orders, images)["styles"][code]
+    style["lookup_source"] = lookup_source
+    return style
 
 
 def _resolve_target_hero(
     conn,
     target_code: str,
-    cat_own: list[dict],
     all_own: list[dict],
     own_images: dict[str, ImageRecord],
 ) -> tuple[dict | None, str]:
-    raw_q = (target_code or "").strip()
+    raw_q = normalize_code_text(target_code)
     if not raw_q:
         return None, ""
     q_up = raw_q.upper()
-    own_img_ci: dict[str, ImageRecord] = {k.upper(): v for k, v in own_images.items()}
-
-    # 1. Exact match in current category or current seasons
-    for pool in (cat_own, all_own):
-        for s in pool:
-            if s["code"].upper() == q_up or s["style_code"].upper() == q_up:
-                notice = ""
-                if s["record"] is None:
-                    notice = f"已定位本厂款号 {s['code']}，但图库暂缺该款原图，建议先上传本厂产品图后再用 AI 视觉海选。"
-                return s, notice
-
-    # 2. Cross-season ERP lookup across all seasons
-    row = conn.execute(
-        "SELECT * FROM style_variants WHERE UPPER(variant_code) = ? OR UPPER(style_code) = ? ORDER BY season DESC LIMIT 1",
-        (q_up, q_up),
-    ).fetchone()
-    if row is not None:
-        vcode = (row["variant_code"] or "").strip()
-        scode = (row["style_code"] or "").strip()
-        rec = own_img_ci.get(scode.upper()) or own_img_ci.get(vcode.upper())
-        st = _build_single_style_from_db(conn, row, rec, lookup_source="other_season")
+    own_img_ci = {k.upper(): v for k, v in own_images.items()}
+    rows = _lookup_style_rows(conn, q_up, exact=True)
+    if rows:
+        row = rows[0]
+        vcode = row["variant_code"]
+        st = next((s for s in all_own if s["code"] == vcode), None)
+        rec = own_img_ci.get(vcode.upper()) or own_img_ci.get(row["style_code"].upper())
+        notice = ""
+        if st is None:
+            st = _build_single_style_from_db(conn, row, rec)
+            notice = f"已定位本厂款号 {vcode}（{st['season']} · {st['plan']}）。"
+        if vcode.upper() != q_up:
+            versions = "、".join(r["variant_code"] for r in rows[:8])
+            notice += f"基础款 {raw_q} 仅有客户版本（{versions}），本轮锁定 {vcode}。"
         if rec is None:
-            return st, f"已跨季定位本厂款号 {st['code']}（{st['season']}），但图库暂缺原图，建议先上传本厂图。"
-        return st, f"已跨季定位本厂款号 {st['code']}（{st['season']} · {st['plan']}），将以该款原图作为视觉参照。"
+            notice += f"款号 {vcode} 缺少本厂原图，当前仅显示标签预览。"
+        return st, notice
 
-    # 3. Own-factory photo-only fallback (brand-new sample uploaded to 本厂产品 without ERP variant/orders)
     rec = own_img_ci.get(q_up)
-    if rec is None and len(q_up) >= 4:
-        prefix_hits = [r for k, r in own_img_ci.items() if k.startswith(q_up)]
-        if len(prefix_hits) == 1:
-            rec = prefix_hits[0]
     if rec is not None:
         code = (rec.style_code or raw_q).strip()
         plan = _plan_from_record(rec)
@@ -1418,8 +1361,8 @@ def _resolve_target_hero(
             "cat2": "",
             "series": "",
             "plan": plan,
-            "material": rec.tags.面料 or "针织",
-            "material_short": rec.tags.面料 or "针织",
+            "material": rec.tags.面料 or "未确认",
+            "material_short": rec.tags.面料 or "未确认",
             "material_raw": "",
             "needle": "",
             "designer": "",
@@ -1434,6 +1377,7 @@ def _resolve_target_hero(
             "color_qty": {},
             "produced": False,
             "grade": "新样衣",
+            "sales_coverage": "生产或订单覆盖未知",
             "unit_price": 0.0,
             "price_band": "未定价/无订单",
             "customer_count": 0,
@@ -1446,37 +1390,34 @@ def _resolve_target_hero(
         }
         return virtual_st, f"已从本厂产品图库定位样衣 {code}（{plan}），将直接按其原图执行真视觉挑款。"
 
-    return None, f"未找到款号「{raw_q}」的本厂档案或图片，请核对款号（已暂按全品类爆款综合展示）。"
+    return None, f"未找到款号「{raw_q}」的本厂档案或图片，请核对款号，视觉挑款已暂停。"
+
+
+def _lookup_style_rows(conn, query: str, *, exact: bool):
+    op = "=" if exact else "LIKE"
+    pattern = query if exact else f"%{query}%"
+    return conn.execute(
+        f"SELECT * FROM style_variants WHERE UPPER(variant_code) {op} ? OR UPPER(style_code) {op} ? "
+        "ORDER BY CASE WHEN UPPER(variant_code) = ? THEN 0 WHEN UPPER(style_code) = ? THEN 1 ELSE 2 END, "
+        "season DESC, variant_code LIMIT 120", (pattern, pattern, query, query)).fetchall()
 
 
 def search_own_factory_styles(conn, query: str, *, limit: int = 12) -> list[dict]:
     """Fast autocomplete search across ALL own-factory style codes (all seasons + gallery-only samples)."""
-    q = (query or "").strip()
+    q = normalize_code_text(query)
     if not q:
         return []
     q_up = q.upper()
-    own_images, _ = _load_records(conn)
+    own_images, _ = _load_records(conn, own_only=True)
     own_img_ci: dict[str, ImageRecord] = {k.upper(): v for k, v in own_images.items()}
 
-    like_pat = f"%{q_up}%"
-    variant_rows = conn.execute(
-        "SELECT variant_code, style_code, season, category, subcategory, material "
-        "FROM style_variants "
-        "WHERE UPPER(variant_code) LIKE ? OR UPPER(style_code) LIKE ? "
-        "ORDER BY season DESC LIMIT 120",
-        (like_pat, like_pat),
-    ).fetchall()
+    variant_rows = _lookup_style_rows(conn, q_up, exact=False)
 
     vcodes = sorted({(r["variant_code"] or "").strip() for r in variant_rows if (r["variant_code"] or "").strip()})
-    qty_map: dict[str, int] = {}
+    order_rows = []
     if vcodes:
-        for offset in range(0, len(vcodes), 100):
-            chunk = vcodes[offset:offset + 100]
-            for orow in conn.execute(
-                f"SELECT variant_code, COALESCE(SUM(quantity), 0) AS q FROM style_order_lines WHERE variant_code IN ({_marks(chunk)}) GROUP BY variant_code",
-                chunk,
-            ):
-                qty_map[orow["variant_code"]] = int(orow["q"] or 0)
+        order_rows = conn.execute(f"SELECT * FROM style_order_lines WHERE variant_code IN ({_marks(vcodes)})", vcodes)
+    stats = _factory_stats(conn, variant_rows, order_rows, own_images)["styles"]
 
     merged: dict[str, dict] = {}
     for r in variant_rows:
@@ -1484,8 +1425,8 @@ def search_own_factory_styles(conn, query: str, *, limit: int = 12) -> list[dict
         scode = (r["style_code"] or "").strip() or vcode
         if not vcode or vcode.upper() in merged:
             continue
-        rec = own_img_ci.get(scode.upper()) or own_img_ci.get(vcode.upper())
-        qty = qty_map.get(vcode, 0)
+        rec = own_img_ci.get(vcode.upper()) or own_img_ci.get(scode.upper())
+        qty = stats[vcode]["qty"]
         plan = category_plan(r["category"])
         if plan not in CATEGORY_ORDER and rec is not None:
             plan = _plan_from_record(rec)
@@ -1501,13 +1442,14 @@ def search_own_factory_styles(conn, query: str, *, limit: int = 12) -> list[dict
             "cat2": (r["subcategory"] or "").strip(),
             "material_short": material_short(mat_label),
             "quantity": qty,
-            "grade": grade_of(qty) if qty > 0 else NO_PRODUCTION,
+            "grade": stats[vcode]["grade"],
             "summary": rec.tags.一句话描述 if rec else "",
         }
 
     # Include gallery-only own-factory photos not yet present in style_variants
+    archive_bases = {r["style_code"].upper() for r in variant_rows}
     for code_up, rec in own_img_ci.items():
-        if q_up not in code_up or code_up in merged:
+        if q_up not in code_up or code_up in merged or code_up in archive_bases:
             continue
         code = (rec.style_code or code_up).strip()
         merged[code_up] = {
@@ -1518,7 +1460,7 @@ def search_own_factory_styles(conn, query: str, *, limit: int = 12) -> list[dict
             "season": rec.tags.季节 or "新样衣",
             "plan": _plan_from_record(rec),
             "cat2": "",
-            "material_short": rec.tags.面料 or "针织",
+            "material_short": rec.tags.面料 or "未确认",
             "quantity": 0,
             "grade": "新样衣",
             "summary": rec.tags.一句话描述,
@@ -1527,42 +1469,94 @@ def search_own_factory_styles(conn, query: str, *, limit: int = 12) -> list[dict
     def rank_key(item: dict):
         cu = item["code"].upper()
         su = item["style_code"].upper()
-        exact = 0 if (cu == q_up or su == q_up) else (1 if (cu.startswith(q_up) or su.startswith(q_up)) else 2)
-        has_img = 0 if item["image_url"] else 1
-        return (exact, has_img, -item["quantity"], item["code"])
+        if cu == q_up:
+            return (0,)
+        if su == q_up:
+            return (1, row_order.get(cu, 999))
+        return (2 if cu.startswith(q_up) or su.startswith(q_up) else 3, not item["image_url"], -item["quantity"], cu)
+
+    row_order = {r["variant_code"].upper(): i for i, r in enumerate(variant_rows)}
 
     items = sorted(merged.values(), key=rank_key)
     return items[: max(1, min(30, limit))]
 
 
-def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, list[dict], dict | None, list[dict], dict[str, ImageRecord]]:
+def _deduplicate_candidates(records, own_images, own_styles, shapes):
+    """Stable representatives over the whole eligible library, before batching or exclusions."""
+    own = list(own_images.values())
+    recs = sorted(records, key=lambda rec: rec.id)
+    with ThreadPoolExecutor(max_workers=8, thread_name_prefix="sales-fingerprint") as pool:
+        prints = dict(zip((r.id for r in [*own, *recs]), pool.map(_image_fingerprints, [*own, *recs])))
+    own_sha = {prints[r.id][1]: r for r in own if prints[r.id][1]}
+    own_visual = [r for r in own if prints[r.id][0] is not None]
+    seen_sha = {}
+    seen_visual = []
+    survivors, rejected_own, rejected_ext = [], [], []
+    neighbors = {}
+
+    def same_picture(rec, other, distance):
+        dh, _, rgb = prints[rec.id]
+        oh, _, orgb = prints[other.id]
+        colors = {rec.tags.颜色主色调, other.tags.颜色主色调} - {"", "其他", "未判断"}
+        return len(colors) <= 1 and _hamming(dh, oh) <= distance and _rgb_close(rgb, orgb, 9)
+
+    for rec in recs:
+        dh, sha, _ = prints[rec.id]
+        match = own_sha.get(sha)
+        if not match and dh is not None:
+            match = next((r for r in own_visual if same_picture(rec, r, 7)), None)
+        reason = "原图与本厂款重复"
+        nearest, best = None, -1.0
+        if not match:
+            for st in own_styles:
+                sim, hits, _ = _tag_similarity_and_diffs(
+                    rec, st["record"], own_neck_override=_own_structure(st).neck, candidate_neck=shapes[rec.id].neck)
+                if sim > best:
+                    best, nearest = sim, st["code"]
+                if (sim >= .96 and len(hits) >= 5 and rec.tags.颜色主色调 == st["record"].tags.颜色主色调
+                    and (not sha or not prints[st["record"].id][1] or _rgb_close(prints[rec.id][2], prints[st["record"].id][2]))):
+                    match, reason = st["record"], "多项结构、色系及工艺标签与本厂款重复"
+                    break
+        neighbors[rec.id] = (nearest or "", max(0., best))
+        own_match = match is not None
+        if not match:
+            match = seen_sha.get(sha)
+            if not match and dh is not None:
+                match = next((r for r in seen_visual if same_picture(rec, r, 6)), None)
+            reason = "与外部图库另一张候选图重复"
+        if match:
+            bucket = rejected_own if own_match else rejected_ext
+            bucket.append({"record_id": rec.id, "image_url": _thumb_url(rec), "source_category": rec.source_category,
+                           "summary": rec.tags.一句话描述, "matched_own_code": match.style_code if own_match else match.id,
+                           "reason": reason})
+        else:
+            survivors.append(rec)
+            if sha:
+                seen_sha[sha] = rec
+            if dh is not None:
+                seen_visual.append(rec)
+    return survivors, rejected_own, rejected_ext, neighbors, prints
+
+
+def read_selection_inputs(conn, filters):
     bundle = _collect_factory_styles(conn, filters.seasons, include_brand=filters.include_brand)
+    target, notice = _resolve_target_hero(conn, filters.target_style_code, list(bundle["styles"].values()), bundle["own_images"])
+    return bundle, target, notice
+
+
+def _build_selection_context(inputs, filters, *, client=None):
+    bundle, target_hero, target_hero_notice = inputs
     all_own = list(bundle["styles"].values())
-    initial_cat_own = [s for s in all_own if filters.category in {"全部", "全部品类"} or s["plan"] == filters.category]
-
-    target_hero, target_hero_notice = _resolve_target_hero(
-        conn, filters.target_style_code, initial_cat_own, all_own, bundle["own_images"],
-    )
-
-    # Auto-align target category when the searched style belongs to another concrete category
+    target = _own_structure(target_hero) if target_hero else None
     effective_category = filters.category
-    if (
-        target_hero is not None
-        and target_hero.get("plan") in CATEGORY_ORDER
-        and filters.category != "全部品类"
-        and target_hero["plan"] != filters.category
-    ):
-        effective_category = target_hero["plan"]
-        switch_note = f"已自动将目标品类切换为「{effective_category}」以匹配款号 {target_hero['code']}。"
-        target_hero_notice = f"{target_hero_notice} {switch_note}".strip() if target_hero_notice else switch_note
-
+    if target_hero:
+        effective_category = target.plan() or target_hero["plan"]
+        if effective_category != filters.category:
+            target_hero_notice += f" 已将目标品类锁定为「{effective_category}」。"
     cat_own = [s for s in all_own if effective_category in {"全部", "全部品类"} or s["plan"] == effective_category]
     imaged_own = [s for s in cat_own if s["record"] is not None]
-    own_winners = sorted(
-        [s for s in imaged_own if s["is_winner"]] or sorted(imaged_own, key=lambda x: -x["qty"])[:8],
-        key=lambda x: (-x["qty"], -x["rep_qty"], x["code"]),
-    )
-
+    own_winners = sorted([s for s in imaged_own if s["is_winner"]] or imaged_own,
+                         key=lambda s: (-s["qty"], -s["rep_qty"], s["code"]))
     hero_ranked = sorted(
         imaged_own,
         key=lambda x: (0 if x["is_winner"] else 1, -x["qty"], -x["rep_qty"], x["code"]),
@@ -1573,116 +1567,71 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
     if target_hero_card is not None and not any(h["code"] == target_hero_card["code"] for h in hero_styles):
         hero_styles.insert(0, target_hero_card)
     target_hero_neck = _own_structural_hints(target_hero)[0] if target_hero else ""
-    target_hero_is_busy = bool(
-        target_hero and target_hero.get("record") and _is_busy_pattern(target_hero["record"])[0]
-    )
-
-    # Filter external pool by source, effective_category, catalog season
+    shapes = {r.id: garment_structure(r) for r in bundle["external_records"]}
     ext_pool_cat = [
-        r for r in bundle["external_records"]
-        if r.source_category in filters.sources
-        and _matches_category_plan(r, effective_category)
+        r for r in bundle["external_records"] if r.source_category in filters.sources
         and (not filters.catalog_seasons or r.tags.季节 in filters.catalog_seasons)
+        and eligible(r, effective_category, structure=shapes[r.id])
     ]
-    trend_radar = _scan_external_trends(ext_pool_cat)
-    lifts = _build_empirical_lift(cat_own)
+    offtone_filtered = []
+    style_filtered_count = 0
+    eligible_records = []
+    for rec in ext_pool_cat:
+        if filters.styles and rec.tags.风格 not in filters.styles:
+            style_filtered_count += 1
+            continue
+        busy, reason = _is_busy_pattern(rec)
+        if busy and filters.exclude_busy_patterns:
+            offtone_filtered.append({"record_id": rec.id, "image_url": _thumb_url(rec), "source_category": rec.source_category,
+                                     "summary": rec.tags.一句话描述, "reason": reason})
+            continue
+        if target and not shapes[rec.id].compatible(target):
+            continue
+        eligible_records.append(rec)
 
-    mat_dims = _compute_dimension_tables(cat_own)[0]["rows"][:4]
-    top_yarns = [
-        {"material": r["label"], "sku": r["sku"], "winner_rate": r["winner_rate"], "avg_quantity": r["avg_quantity"]}
-        for r in mat_dims
-    ]
-
+    eligible_records, own_duplicate_filtered, ext_duplicate_filtered, neighbors, fingerprints = _deduplicate_candidates(
+        eligible_records, bundle["own_images"], imaged_own, shapes)
+    # The board and the pair reviewer must draw from the same readable reference photos.
+    if not filters.target_style_code:
+        skipped_refs = [st["code"] for st in own_winners[:4] if not fingerprints[st["record"].id][1]]
+        own_winners = [st for st in own_winners if fingerprints[st["record"].id][1]]
+        if skipped_refs and own_winners:
+            board_codes = "、".join(st["code"] for st in own_winners[:4])
+            target_hero_notice = f"已跳过不可读的参照原图（{'、'.join(skipped_refs)}），本轮综合参照为 {board_codes}。"
     decisions = load_decisions()
     excluded_ids = set(filters.exclude_record_ids)
     if filters.skip_rejected:
-        for rid, dec in decisions.items():
-            if dec.get("status") == "rejected":
-                excluded_ids.add(rid)
-
-    own_necks: dict[str, str] = {s["code"]: _own_structural_hints(s)[0] for s in imaged_own}
-    own_fps: dict[str, tuple[int | None, str | None, tuple[int, ...] | None]] = {}
-    if imaged_own:
-        with ThreadPoolExecutor(max_workers=min(8, len(imaged_own)), thread_name_prefix="sales-own-fp") as pool:
-            fp_list = list(pool.map(lambda s: _image_fingerprints(s["record"]), imaged_own))
-        own_fps = {s["code"]: fp for s, fp in zip(imaged_own, fp_list)}
-
-    trend_top_details = {
-        item["label"]
-        for h in trend_radar["highlights"] if h["dimension"] == "细节元素"
-        for item in h["top"][:3]
-    }
-
-    own_duplicate_filtered: list[dict] = []
-    offtone_filtered: list[dict] = []
+        excluded_ids.update(rid for rid, d in decisions.items() if d.get("status") == "rejected")
+    # If a previously seen sibling now has a different canonical representative, exclude the group.
+    excluded_ids.update(d["matched_own_code"] for d in ext_duplicate_filtered if d["record_id"] in excluded_ids)
+    stat_own = [s for s in cat_own if not _own_structure(s).conflicts and (
+        not target or _own_structure(s).compatible(target, exact=True))]
+    if target_hero and not target.conflicts and target_hero not in stat_own:
+        stat_own.append(target_hero)
+    trend_radar = _scan_external_trends([r for r in eligible_records if r.id not in excluded_ids
+                                         and (not target or shapes[r.id].compatible(target, exact=True))])
+    lifts = _build_empirical_lift(stat_own)
+    mat_dims = _compute_dimension_tables(stat_own)[0]["rows"][:4]
+    top_yarns = [{"material": r["label"], "sku": r["sku"], "winner_rate": r["winner_rate"], "avg_quantity": r["avg_quantity"]}
+                 for r in mat_dims]
+    trend_top_details = {t["label"] for h in trend_radar["highlights"] if h["dimension"] == "细节元素" for t in h["top"][:3]}
+    raw_scored = []
+    ext_rec_map = {r.id: r for r in [*bundle["external_records"], *bundle["own_images"].values()]}
     skipped_seen_count = 0
-    style_filtered_count = 0
-    raw_scored: list[tuple[dict, ImageRecord]] = []
-    ext_rec_map: dict[str, ImageRecord] = {r.id: r for r in ext_pool_cat}
-    for s in imaged_own:
-        if s["record"] is not None:
-            ext_rec_map[s["record"].id] = s["record"]
-    if target_hero and target_hero.get("record") is not None:
-        ext_rec_map[target_hero["record"].id] = target_hero["record"]
-
-    for rec in ext_pool_cat:
-        if filters.styles and (rec.tags.风格 or "") not in filters.styles:
-            style_filtered_count += 1
-            continue
-        if filters.exclude_busy_patterns and not target_hero_is_busy:
-            busy, busy_reason = _is_busy_pattern(rec)
-            if busy:
-                offtone_filtered.append({
-                    "record_id": rec.id,
-                    "image_url": _thumb_url(rec),
-                    "source_category": rec.source_category,
-                    "summary": rec.tags.一句话描述,
-                    "reason": f"风格花纹拦截：{busy_reason}",
-                })
-                continue
-
-        closest_any = None
-        max_any_sim = -1.0
-        for own in imaged_own:
-            sim, _, _ = _tag_similarity_and_diffs(rec, own["record"], own_neck_override=own_necks.get(own["code"], ""))
-            if sim > max_any_sim:
-                max_any_sim = sim
-                closest_any = own
-
-        # Gate 1A: near-identical visual perceptual hash / exact byte check against own-factory style
-        if max_any_sim >= 0.82 and closest_any is not None:
-            cand_dhash, cand_sha, cand_rgb = _image_fingerprints(rec)
-            own_dhash, own_sha, own_rgb = own_fps.get(closest_any["code"], (None, None, None))
-            ham = _hamming(cand_dhash, own_dhash)
-            if (cand_sha and own_sha and cand_sha == own_sha) or (ham <= 7 and _rgb_close(cand_rgb, own_rgb)):
-                own_duplicate_filtered.append({
-                    "record_id": rec.id,
-                    "image_url": _thumb_url(rec),
-                    "source_category": rec.source_category,
-                    "summary": rec.tags.一句话描述,
-                    "matched_own_code": closest_any["code"],
-                    "reason": f"图像与本厂已有款 {closest_any['code']} 高度重合（汉明距离 {ham}）",
-                })
-                continue
-        # Gate 1B: 96%+ identical structured tag combination + same details
-        if max_any_sim >= 0.96 and closest_any is not None:
-            own_duplicate_filtered.append({
-                "record_id": rec.id,
-                "image_url": _thumb_url(rec),
-                "source_category": rec.source_category,
-                "summary": rec.tags.一句话描述,
-                "matched_own_code": closest_any["code"],
-                "reason": f"版型/领型/图案/色系/细节标签与本厂 {closest_any['code']} 几乎完全一致，跳过重复开款",
-            })
+    for rec in eligible_records:
+        if rec.id in excluded_ids:
+            skipped_seen_count += 1
             continue
 
         # Gate 2A: Calibrated Gene score (0..60, wider dynamic range so fewer cards clamp at 100)
         field_weights = [("领型", 12.0), ("版型", 11.0), ("风格", 9.0), ("图案", 9.0), ("颜色主色调", 7.0), ("面料", 6.0)]
         raw_gene = 0.0
         gene_hits: list[str] = []
-        cand_neck = _cand_effective_neckline(rec)
+        cand_neck = shapes[rec.id].neck
         for fn, fw in field_weights:
-            val = cand_neck if fn == "领型" else (getattr(rec.tags, fn, "") or "")
+            val = cand_neck if fn == "领型" else _gene_value(rec, fn)
+            if val in {"", "其他", "未判断", "待归类"}:
+                continue
             lift = lifts.get(fn, {}).get(val, 0.85)
             pts = fw * min(max(lift, 0.4), 1.65) / 1.60
             raw_gene += pts
@@ -1708,10 +1657,15 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
             best_win_sim, best_matched, best_diffs = _tag_similarity_and_diffs(
                 rec, target_hero["record"], own_neck_override=target_hero_neck,
             )
-        else:
-            for w_own in own_winners[:15]:
+        elif target_hero:
+            best_winner = target_hero
+        elif not filters.target_style_code:
+            for w_own in own_winners:
+                if (_own_structure(w_own).conflicts or shapes[rec.id].plan() != _own_structure(w_own).plan()
+                        or not shapes[rec.id].compatible(_own_structure(w_own), match_neck=False)):
+                    continue
                 sim, m_list, d_list = _tag_similarity_and_diffs(
-                    rec, w_own["record"], own_neck_override=own_necks.get(w_own["code"], ""),
+                    rec, w_own["record"], own_neck_override=_own_structure(w_own).neck, candidate_neck=cand_neck,
                 )
                 if sim > best_win_sim:
                     best_win_sim = sim
@@ -1732,8 +1686,6 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
         trend_hits = [d for d in (rec.tags.细节元素 or []) if d in trend_top_details]
         if trend_hits:
             novelty_score += 3.5
-        if rec.notes.text():
-            novelty_score += 1.5
         # Structural neckline tiering when targeting a specific hero style (e.g. V领 -> V领 first, hoodies penalized)
         neck_tier = 0
         neck_bonus = 0.0
@@ -1741,9 +1693,6 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
             if cand_neck == target_hero_neck:
                 neck_tier = 0
                 neck_bonus = 10.0
-            elif cand_neck in _NECKLINE_COMPATIBLE.get(target_hero_neck, set()):
-                neck_tier = 1
-                neck_bonus = 0.0
             else:
                 neck_tier = 2
                 neck_bonus = -16.0
@@ -1757,12 +1706,12 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
             cand_pat = (rec.tags.图案 or "").strip()
             if (
                 ref_pat == "纯色/无明显图案"
-                and cand_pat not in {"纯色/无明显图案", "条纹", "格子", "未判断", ""}
+                and cand_pat not in {"纯色/无明显图案", "条纹", "格纹", "未判断", ""}
                 and (rec.tags.颜色主色调 or "") in BOLD_COLORS
                 and (ref_rec.tags.颜色主色调 or "") in NEUTRAL_COLORS
             ):
                 penalty += 12.0
-            if (ref_rec.tags.风格 or "") in {"极简", "通勤"} and (rec.tags.风格 or "") in {"甜美", "街头", "运动"}:
+            if (ref_rec.tags.风格 or "") in {"极简", "通勤"} and (rec.tags.风格 or "") in {"甜美"}:
                 penalty += 7.0
 
         total_score = round(max(15.0, min(98.0, gene_score + novelty_score + neck_bonus - penalty)), 1)
@@ -1782,6 +1731,7 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
                 "颜色主色调": rec.tags.颜色主色调,
                 "图案": rec.tags.图案,
                 "面料": rec.tags.面料,
+                "面料来源": rec.tags.面料来源 or "历史未记录",
                 "细节元素": list(rec.tags.细节元素),
                 "一句话描述": rec.tags.一句话描述,
             },
@@ -1794,72 +1744,17 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
             "diff_points": best_diffs[:4],
             "trend_hits": trend_hits[:2],
             "reference_winner": ref_card,
-            "closest_any_code": closest_any["code"] if closest_any else "",
-            "closest_any_sim": round(max_any_sim, 2) if closest_any else 0.0,
+            "closest_any_code": neighbors[rec.id][0],
+            "closest_any_sim": round(neighbors[rec.id][1], 2),
+            "review_stage": "tag_preview",
+            "knit_evidence": shapes[rec.id].knit,
             "_neck_tier": neck_tier,
         }
         raw_scored.append((cand_obj, rec))
 
     raw_scored.sort(key=lambda pair: (pair[0]["_neck_tier"], -pair[0]["total_score"], -pair[0]["gene_score"], pair[0]["record_id"]))
 
-    # Gate 1C: External-vs-External visual deduplication across canonical score order
-    # (run BEFORE skipping excluded_ids so duplicate siblings never resurface in Batch 2+!)
-    dedup_window = min(len(raw_scored), len(excluded_ids) + max(filters.scan_limit + 64, filters.pool_size * 3))
-    window_fps: list[tuple[int | None, str | None, tuple[int, ...] | None]] = []
-    if dedup_window > 0:
-        window_recs = [pair[1] for pair in raw_scored[:dedup_window]]
-        if dedup_window > 8:
-            with ThreadPoolExecutor(max_workers=8, thread_name_prefix="sales-ext-fp") as pool:
-                window_fps = list(pool.map(_image_fingerprints, window_recs))
-        else:
-            window_fps = [_image_fingerprints(r) for r in window_recs]
-
-    ext_duplicate_filtered: list[dict] = []
-    scored_candidates: list[dict] = []
-    kept_shas: set[str] = set()
-    kept_visuals: list[tuple[int, tuple[int, ...] | None]] = []
-    kept_text_keys: set[tuple[str, str]] = set()
-
-    for idx, (cand_obj, rec) in enumerate(raw_scored):
-        text_key = ((rec.source.source_file or "").strip(), (rec.tags.一句话描述 or "").strip())
-        is_dup = False
-        dup_reason = ""
-        if idx < dedup_window:
-            dhash, sha, rgb_sig = window_fps[idx]
-            if sha and sha in kept_shas:
-                is_dup = True
-                dup_reason = "与外部图库另一张候选图完全相同，自动去重"
-            elif dhash is not None and any(_hamming(dhash, kh) <= 6 and _rgb_close(rgb_sig, k_rgb) for kh, k_rgb in kept_visuals):
-                is_dup = True
-                dup_reason = "与外部图库另一张候选图画面高度重合（重复上传/同款同图），自动去重"
-            elif text_key[0] and text_key[1] and text_key in kept_text_keys:
-                is_dup = True
-                dup_reason = "与外部图库另一条同文件同描述候选重复，自动去重"
-            if not is_dup:
-                if sha:
-                    kept_shas.add(sha)
-                if dhash is not None:
-                    kept_visuals.append((dhash, rgb_sig))
-        elif text_key[0] and text_key[1] and text_key in kept_text_keys:
-            is_dup = True
-            dup_reason = "与外部图库已有候选重复，自动去重"
-
-        if is_dup:
-            ext_duplicate_filtered.append({
-                "record_id": rec.id,
-                "image_url": _thumb_url(rec),
-                "source_category": rec.source_category,
-                "summary": rec.tags.一句话描述,
-                "matched_own_code": "外部图库重复",
-                "reason": dup_reason,
-            })
-            continue
-        if text_key[0] and text_key[1]:
-            kept_text_keys.add(text_key)
-        if rec.id in excluded_ids:
-            skipped_seen_count += 1
-            continue
-        scored_candidates.append(cand_obj)
+    scored_candidates = [card for card, _ in raw_scored]
 
     target_neck_matched = (
         sum(1 for c in scored_candidates if c.get("_neck_tier") == 0)
@@ -1869,12 +1764,8 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
     for c in scored_candidates:
         c.pop("_neck_tier", None)
 
-    if target_hero is not None and target_hero_neck and target_hero_neck not in {"其他", "未判断"} and target_hero.get("record") is not None:
-        neck_hint = (
-            f"已将外部图库中 {target_neck_matched} 张「{target_hero_neck}」同领型候选优先排在最前（点击下方绿色「AI 真视觉海选」按钮由千问肉眼进一步精筛）。"
-            if target_neck_matched > 0
-            else f"外部图库当前旧标签中暂未标出「{target_hero_neck}」，建议点击下方绿色「AI 真视觉海选」让千问直接肉眼搜图。"
-        )
+    if target_hero and target_hero_neck and not target.conflicts and target_hero.get("record") is not None:
+        neck_hint = f"锁定领型为{target_hero_neck}，本批候选池有 {target_neck_matched} 张同领型记录。"
         target_hero_notice = f"{target_hero_notice} {neck_hint}".strip() if target_hero_notice else neck_hint
 
     scan_pool = scored_candidates[: filters.scan_limit]
@@ -1887,25 +1778,32 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
     all_duplicates = [*own_duplicate_filtered, *ext_duplicate_filtered]
     scan_candidate_ids = [c["record_id"] for c in scan_pool]
 
-    snapshot_payload = [
-        "v3-neck-priority",
-        filters.seasons,
-        effective_category,
-        filters.sources,
-        filters.catalog_seasons,
-        filters.include_brand,
-        filters.pool_size,
-        target_hero["code"] if target_hero else filters.target_style_code,
-        filters.exclude_busy_patterns,
-        filters.styles,
-        filters.scan_limit,
-        filters.skip_rejected,
-        len(filters.exclude_record_ids),
-        hashlib.sha256(",".join(filters.exclude_record_ids).encode()).hexdigest()[:12] if filters.exclude_record_ids else "",
-        len(scan_candidate_ids),
-        scan_candidate_ids[:48],
-    ]
-    snapshot = hashlib.sha256(json.dumps(snapshot_payload, ensure_ascii=False).encode()).hexdigest()
+    heroes = [target_hero] if target_hero else own_winners[:4]
+    ai_blocked_reason = ""
+    hero_url = None
+    if filters.target_style_code and not target_hero:
+        ai_blocked_reason = target_hero_notice
+    elif target and target.conflicts:
+        ai_blocked_reason = "；".join(target.conflicts) + "。请核对档案后再进行视觉挑款。"
+    else:
+        hero_url = _make_hero_reference_image([(st["code"], st["record"]) for st in heroes])
+        if not hero_url:
+            ai_blocked_reason = (f"款号 {target_hero['code']} 的本厂原图缺失或不可读，仅显示标签预览。"
+                                 if target_hero else "本轮没有可读的本厂参照原图，仅显示标签预览。")
+        elif target and not target.plan():
+            ai_blocked_reason = "锁定款的主体结构或袖长尚未确认，仅显示标签预览。"
+    if ai_blocked_reason and ai_blocked_reason not in target_hero_notice:
+        target_hero_notice += " " + ai_blocked_reason
+    status = sales_ai_status()
+    ref_ids = {c["reference_winner"]["record_id"] for c in scan_pool if c["reference_winner"]}
+    board = [(st["code"], st["record"].id) for st in heroes if st["record"]]
+    ref_ids.update(record_id for _, record_id in board)
+    versions = {rid: _record_version(ext_rec_map[rid])
+                for rid in set(scan_candidate_ids) | ref_ids if rid in ext_rec_map}
+    snapshot = _digest(["sales-selection-v6", {**filters.model_dump(mode="json"), "category": effective_category, "target_style_code": target_hero["code"] if target_hero else filters.target_style_code}, effective_category, target_hero_card,
+                        top_yarns, trend_radar, [{k: v for k, v in c.items() if k not in {"decision", "decision_note"}} for c in scan_pool],
+                        versions, board, _model_identity(status, client), CONTACT_SHEET_SYSTEM_PROMPT, SELECTION_PAIR_SYSTEM_PROMPT,
+                        _selection_rules(filters, effective_category, target), ai_blocked_reason])
     cached_ai = _read_cached_json(_selection_cache_key(snapshot))
     if cached_ai:
         for rec_item in cached_ai.get("recommendations", []):
@@ -1914,6 +1812,7 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
             rec_item["decision_note"] = d.get("note", "")
 
     preview = {
+        "report_type": "selection",
         "scope": {
             "seasons": filters.seasons,
             "category": effective_category,
@@ -1926,8 +1825,10 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
             "styles": filters.styles,
             "scan_limit": filters.scan_limit,
             "exclude_record_ids_count": len(filters.exclude_record_ids),
+            "exclude_record_ids": filters.exclude_record_ids,
             "skip_rejected": filters.skip_rejected,
         },
+        "ai_blocked_reason": ai_blocked_reason,
         "target_hero": target_hero_card,
         "target_hero_notice": target_hero_notice,
         "hero_styles": hero_styles,
@@ -1953,327 +1854,296 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
         "scan_candidate_ids": scan_candidate_ids,
         "shortlist": shortlist,
         "ai_selection": cached_ai,
-        "ai_status": sales_ai_status(),
+        "ai_status": status,
         "snapshot": snapshot,
     }
-    return preview, scan_pool, target_hero, own_winners, ext_rec_map
+    if cached_ai:
+        preview["funnel"]["remaining_unscanned"] = len(scored_candidates) - len(cached_ai["scanned_record_ids"])
+    return preview, scan_pool, target_hero, hero_url, ext_rec_map
+
+
+def _store_report(report):
+    content = {k: v for k, v in report.items() if k != "report_id"}
+    report_id = _digest(content)
+    path = _cache_dir() / "reports" / (report_id + ".json")
+    if not path.is_file():
+        _atomic_write_json(path, content)
+    return {**content, "report_id": report_id}
+
+
+def selection_asset_path(key: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{64}", key):
+        raise SalesInsightError("选款图片标识无效")
+    return _cache_dir() / "report-images" / (key + ".jpg")
+
+
+def load_frozen_images(assets: dict[str, str | None]) -> dict[str, bytes]:
+    """Use only readable bytes matching this report's content-addressed images."""
+    blobs = {}
+    for key in {key for key in assets.values() if key}:
+        path = selection_asset_path(key)
+        try:
+            blob = path.read_bytes()
+            if hashlib.sha256(blob).hexdigest() != key:
+                continue
+            with Image.open(BytesIO(blob), formats=("JPEG", "PNG")) as image:
+                image.load()
+        except (OSError, ValueError, Image.DecompressionBombError):
+            continue
+        blobs[key] = blob
+    return {rid: blobs[key] for rid, key in assets.items() if key in blobs}
+
+
+def _freeze_report(report, records):
+    """Make display images and report content immutable, including the preview and its decisions."""
+    assets = {}
+    def visit(node):
+        if isinstance(node, list):
+            for child in node:
+                visit(child)
+        elif isinstance(node, dict):
+            rid = node.get("record_id")
+            if rid in records and "image_url" in node:
+                if rid not in assets:
+                    try:
+                        blob = cover_path(records[rid]).read_bytes()
+                    except Exception:
+                        assets[rid] = None
+                    else:
+                        key = hashlib.sha256(blob).hexdigest()
+                        path = selection_asset_path(key)
+                        if not path.is_file():
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as tmp:
+                                tmp.write(blob)
+                            try:
+                                os.replace(tmp.name, path)
+                            finally:
+                                Path(tmp.name).unlink(missing_ok=True)
+                        assets[rid] = key
+                key = assets[rid]
+                node["image_url"] = f"/api/analytics/sales/reports/images/{key}" if key else None
+            for child in node.values():
+                if isinstance(child, (dict, list)):
+                    visit(child)
+    visit(report)
+    report["image_assets"] = assets
+    return _store_report(report)
+
+
+def load_sales_report(report_id, kind="selection"):
+    if not re.fullmatch(r"[a-f0-9]{64}", report_id):
+        raise SalesInsightError("选款报告编号无效", status_code=422)
+    payload = _read_cached_json("reports/" + report_id)
+    if not payload or payload.get("report_type") != kind:
+        raise SalesInsightError("对应的批次报告不存在，请刷新预览", status_code=404)
+    return {**payload, "report_id": report_id}
+
+
+def save_report_decision(update: DecisionUpdate):
+    report = load_sales_report(update.report_id)
+    ai = report["ai_selection"]
+    visible = ai["recommendations"] if ai is not None else report["shortlist"]
+    if not any(item["record_id"] == update.record_id for item in visible):
+        raise SalesInsightError("该候选不在当前展示的批次报告中", status_code=409)
+    note = update.note.strip()
+    for item in [*visible, *report["shortlist"]]:
+        if item["record_id"] == update.record_id:
+            item.update(decision=update.status, decision_note=note)
+    new_id = _store_report(report)["report_id"]
+    return {**save_decision(update.record_id, update.status, note), "report_id": new_id}
 
 
 def build_selection_preview(conn, filters: SelectionFilters) -> dict:
-    preview, _, _, _, _ = _build_selection_context(conn, filters)
-    return preview
+    return preview_selection_inputs(read_selection_inputs(conn, filters), filters)
 
 
-CONTACT_SHEET_SYSTEM_PROMPT = """你是女装针织服装厂的首席买手与视觉选款总监，正在执行【4×4 编号拼图真视觉海选】。
-你会看到两张图：
-- 图 1：【本厂目标参照爆款原图】（单款参照原图，或 2×2 本厂主力爆款拼图）
-- 图 2：【外部候选图 4×4 编号网格图】（每格左上角有黑底白字编号 01..16）
-
-严厉选款铁律（务必以你肉眼看到的真实图片为准，绝不盲信可能出错的旧文字标签！）：
-1. 先肉眼精准读出【图 1 本厂参照款】的真实外观特征（领型，如连帽/帽衫、POLO翻领、V领、半高领、圆领；版型廓形；整体调性如极简气质/通勤/休闲；主色与图案克制程度），写在 hero_visual_read 中。
-2. 逐格审视【图 2】中的所有编号格子：
-   - 必须直接淘汰：大花卉/碎花/满身俗艳印花、高饱和土气花纹、明显跑偏的品类（如男装/裤子/连衣裙/童装）、与本厂参照款长得几乎一模一样的撞款、或网格里重复出现的同一件衣服。
-   - 重点精选：整体气质调性与本厂参照款高度契合（高级耐看、适合针织厂大货落地），同时在领口结构、局部绞花/提花/肌理、撞色边饰、门襟细节或版型比例上有【清晰微创新亮点】的格子！
-   - 若本轮锚定了特定本厂单款（例如连帽帽衫或翻领款），优先挑出同结构大类或能自然承接该款客群的微创新升级款。
-3. 每张网格图最多挑 4 个最值得进入 1v1 终审的格子（若整页质量差、花哨或跑偏居多，可只选 0–2 个，宁缺毋滥）。
-4. 每个文本字段精炼清晰（60 字以内，严禁在字符串内使用未转义英文双引号）。
-
-请只输出严格 JSON 对象：
-{
-  "hero_visual_read": "肉眼看到的本厂参照款真实领型（如连帽/翻领/圆领等）、版型与调性总结",
-  "picks": [
-    {
-      "slot": 1,
-      "visual_score": 88,
-      "quick_reason": "一眼看中的微创新亮点与气质契合原因"
-    }
-  ],
-  "rejected_summary": "本页主要淘汰了哪些花哨/跑偏/撞款类型（一句话）"
-}"""
+def preview_selection_inputs(inputs, filters):
+    preview, _, _, _, records = _build_selection_context(inputs, filters)
+    return _freeze_report(preview, records)
 
 
-SELECTION_PAIR_SYSTEM_PROMPT = """你是女装针织工厂的资深买手与研发总监，正在做【外部资料库微创新选款 1v1 高清终审】。
-你会同时看到两张高清原图：
-- 图 1：【外部候选图】（来自网图趋势/品牌资料包/市调拍照）
-- 图 2：【本厂参照爆款原图】（附真实销量、补单、ERP细分与材质数据）
+CONTACT_SHEET_SYSTEM_PROMPT = """你正在执行女装横机毛衫厂的 4×4 编号拼图真视觉海选。图1为本厂参照原图或参照板，图2是编号候选。
+逐格阅读真实图片，核对主体和本轮要求。对看不清、缺少横机依据、撞款或没有明确微创新的候选不入选。
+最多选4个互异的有效编号，可返回空数组。只输出 JSON 对象
+{"hero_visual_read":"参照图可见结构","picks":[{"slot":1,"visual_score":88,"quick_reason":"可见证据"}],"rejected_summary":"淘汰原因"}。"""
 
-老板的核心选款铁律（请一切以两张原图肉眼视觉为准，若旧文字标签有错如把帽衫标成圆领，直接以原图为准纠正！）：
-1. **撞款一票否决 (`"verdict": "too_similar"`)**：如果图 1 和图 2 在整体版型、领型、织法纹理、门襟结构上高度雷同，属于“本厂已经做过、没必要再重复开版”，请直接判 `"too_similar"`！
-2. **调性跑偏/花哨俗气一票否决 (`"verdict": "drop"`)**：如果图 1 是大花卉/碎花/满身乱印、高饱和土气印花、非针织/错误品类、或与本厂参照款的极简气质/实穿调性严重违和，请直接判 `"drop"` 并在 similarity_note 写明原因！
-3. **有爆款基因 + 有微创新才入选 (`"verdict": "recommend"`)**：入选款必须既承接本厂已验证能卖动的实穿骨架与气质调性，又在局部有清晰可落地的微创新（如领口结构变化、局部绞花/提花/镂空肌理、撞色门襟/边饰、假两件层次等），且适合针织工厂大货落地。
-4. 每个文本字段精炼清晰（控制在 80 字以内，不要在字符串值中使用未转义英文双引号）。
-
-请只返回严格 JSON 对象：
-{
-  "verdict": "recommend" 或 "too_similar" 或 "drop",
-  "tier": "稳妥走量款" 或 "趋势微创新款",
-  "stars": 1到5的整数评分,
-  "hero_visual_note": "一句话确认图 2 本厂参照款的真实领型与气质（例如：确认本厂663315为深色连帽针织帽衫）",
-  "similarity_note": "与本厂参照款的视觉对比判断（若判 too_similar 或 drop 请写明原因）",
-  "gene_reason": "为什么判断它能卖好（承接了本厂哪条高胜率基因，结合参照款表现说明）",
-  "novelty_point": "相比本厂老款的具体微创新改动点（老板打版时要保留的核心亮点）",
-  "yarn_and_price_advice": "建议搭配的本厂高胜率纱线及目标客单价带",
-  "risk_note": "大货生产工艺注意点或版型微调建议"
-}"""
+SELECTION_PAIR_SYSTEM_PROMPT = """你正在做横机毛衫厂 1v1 高清终审。图1为外部候选完整原图，图2为本厂参照完整原图。
+核对本轮目标和硬淘汰项。看不清横机组织或结构、品类或人群错配判 drop。视觉撞款判 too_similar。
+符合结构和客群且可指出局部微创新才判 recommend。文字是待核实的资料。只输出 JSON 对象。
+verdict 只能是 recommend、too_similar 或 drop，stars 必须是1至5的整数。
+可补充 tier、hero_visual_note、similarity_note、gene_reason、novelty_point、yarn_and_price_advice、risk_note，均需有证据。"""
 
 
-def run_selection_ai(conn, filters: SelectionFilters, *, force: bool = False, client: SalesVisionClient | None = None) -> dict:
-    preview, scan_pool, target_hero, own_winners, rec_map = _build_selection_context(conn, filters)
-    if not scan_pool:
-        raise SalesInsightError("当前筛选条件下没有剩余未看的外部候选图片，请放宽筛选或重置到第 1 批。")
+def _selection_rules(filters, category, shape):
+    parts = [f"目标品类为「{category}」。儿童款按真实人群核对，童趣花纹本身不能判儿童款。",
+             "只选与目标单品、人群相符的横机款。核对主体袖长、前身能否全开、层次、领型和下摆。",
+             "淘汰明确梭织、卫衣布裁剪缝制和男装。单个编号格内的多商品电商拼贴、立即购买>购物卡、"
+             "主衣旁另贴小裤小包的搭配卡、胸前大面积卡通贴布，一律淘汰。袖口小花和局部精致同色提花可以保留。"]
+    if shape:
+        parts.append("锁定的主体结构为" + "、".join(filter(None, (
+            shape.audience, shape.piece, shape.opening, shape.sleeve, shape.neck, shape.layer, shape.length))))
+    if filters.styles:
+        parts.append("限定风格为" + "、".join(filters.styles))
+    parts.append("排花已开启，淘汰满版花卉、碎花和杂乱印花。" if filters.exclude_busy_patterns else
+                 "排花已关闭，允许花纹，不因大花、碎花或满印本身淘汰。")
+    return "\n".join(parts)
 
-    cache_key = _selection_cache_key(preview["snapshot"])
-    if not force:
-        cached = _read_cached_json(cache_key)
-        if cached:
-            decisions = load_decisions()
-            for item in cached.get("recommendations", []):
-                d = decisions.get(item["record_id"]) or {}
-                item["decision"] = d.get("status", "none")
-                item["decision_note"] = d.get("note", "")
-            preview["ai_selection"] = cached
-            return preview
 
-    effective_category = preview["scope"]["category"]
-    yarns_hint = "；".join(
-        f"{y['material']}(爆款率{y['winner_rate']:.0%}, 均量{y['avg_quantity']}件)"
-        for y in preview["top_yarns"]
-    ) or "按本厂常规主力羊毛/羊绒混纺纱线"
-
-    own_client = client is None
-    llm = client or SalesVisionClient()
-    try:
-        hero_visual_read = ""
-        contact_sheets_count = 0
-        stage1_picked_count = 0
-        stage1_rejected_notes: list[str] = []
-        pipeline_mode = "direct_1v1"
-
-        # Stage 1: True-Visual 4x4 Contact-Sheet Screening when scan_pool has >= 5 candidates
-        if len(scan_pool) >= 5:
-            pipeline_mode = "two_stage_contact_sheet"
-            if target_hero and target_hero.get("record") is not None:
-                hero_pairs = [(target_hero["code"], target_hero["record"])]
-                t_neck, t_hint_list = _own_structural_hints(target_hero)
-                t_hints = "、".join(t_hint_list)
-                neck_strict = (
-                    f"【领型强对齐要求】本厂参照款核心领型为「{t_neck}」，请优先精选肉眼明确可见为「{t_neck}」（或同颈部修饰逻辑）的微创新款；"
-                    f"与「{t_neck}」结构跨度过大的款（例如目标V领却给连帽卫衣/拉链帽衫外套，或目标连帽却给圆领打底）直接淘汰！"
-                    if t_neck and t_neck not in {"其他", "未判断"}
-                    else ""
-                )
-                hero_brief = (
-                    f"【定向锚定本厂单款 {target_hero['code']}】等级={target_hero['grade']} | "
-                    f"销量={target_hero['qty']:,}件（补单{target_hero['rep_qty']:,}件）| "
-                    f"材质={target_hero['material']} | ERP信息={t_hints or '无'}。\n{neck_strict}"
-                    "请先用肉眼确认图 1 的真实领型与结构，再挑选同结构、同气质调性的微创新升级款！"
-                )
-            else:
-                top_heroes = [w for w in own_winners[:4] if w.get("record") is not None]
-                hero_pairs = [(w["code"], w["record"]) for w in top_heroes]
-                hero_brief = (
-                    f"【全品类主力爆款 2×2 参照板（品类：{effective_category}）】"
-                    + "；".join(
-                        f"{w['code']}({w['grade']}级/{w['qty']:,}件/{w['material_short']})"
-                        for w in top_heroes
-                    )
-                )
-            hero_url = _make_hero_reference_image(hero_pairs)
-
-            chunks = [scan_pool[i:i + 16] for i in range(0, len(scan_pool), 16)]
-            contact_sheets_count = len(chunks)
-            tone_rule = (
-                "本轮要求严格排除大花卉/碎花/满身花纹与俗艳土气印花，确保实穿耐看。"
-                if filters.exclude_busy_patterns
-                else "允许合理花纹图案，但仍需高级耐看且适合大货针织落地。"
-            )
-            style_rule = f"限定风格偏好：{'、'.join(filters.styles)}。" if filters.styles else ""
-
-            def screen_sheet(sheet_idx_chunk: tuple[int, list[dict]]) -> dict:
-                s_idx, chunk = sheet_idx_chunk
-                slot_pairs: list[tuple[int, ImageRecord]] = []
-                for slot_no, cand in enumerate(chunk, 1):
-                    rec = rec_map.get(cand["record_id"])
-                    if rec is not None:
-                        slot_pairs.append((slot_no, rec))
-                sheet_url = _make_contact_sheet(slot_pairs)
-                if not sheet_url:
-                    return {"hero_visual_read": "", "picks": [], "rejected_summary": ""}
-                blocks: list[dict] = [{
-                    "type": "text",
-                    "text": (
-                        f"目标品类：{effective_category} | 海选第 {s_idx + 1}/{len(chunks)} 页（共 {len(slot_pairs)} 格，编号 01..{len(slot_pairs):02d}）\n"
-                        f"{hero_brief}\n{tone_rule} {style_rule}\n"
-                        "请先用肉眼阅读图 1 本厂参照爆款，再从图 2 网格图中精选最值得进入 1v1 终审的 0–4 个编号格子。"
-                    ),
-                }]
-                if hero_url:
-                    blocks.append({"type": "image_url", "image_url": {"url": hero_url}})
-                blocks.append({"type": "image_url", "image_url": {"url": sheet_url}})
-                try:
-                    res = llm.ask_json(CONTACT_SHEET_SYSTEM_PROMPT, blocks, max_tokens=6144)
-                except Exception as exc:
-                    return {"error": str(exc), "hero_visual_read": "", "picks": [], "rejected_summary": ""}
-                picked_out = []
-                for raw_pick in (res.get("picks") or [])[:5]:
-                    try:
-                        slot = int(raw_pick.get("slot") or 0)
-                    except (TypeError, ValueError):
-                        continue
-                    if 1 <= slot <= len(chunk):
-                        try:
-                            vscore = int(raw_pick.get("visual_score") or 80)
-                        except (TypeError, ValueError):
-                            vscore = 80
-                        picked_out.append({
-                            "cand": chunk[slot - 1],
-                            "visual_score": max(1, min(100, vscore)),
-                            "quick_reason": str(raw_pick.get("quick_reason") or "").strip(),
-                        })
-                return {
-                    "hero_visual_read": str(res.get("hero_visual_read") or "").strip(),
-                    "picks": picked_out,
-                    "rejected_summary": str(res.get("rejected_summary") or "").strip(),
-                }
-
-            with ThreadPoolExecutor(max_workers=min(8, len(chunks)), thread_name_prefix="sales-sheet") as pool:
-                sheet_results = list(pool.map(screen_sheet, list(enumerate(chunks))))
-
-            sheet_errors = [r["error"] for r in sheet_results if r.get("error")]
-            if len(sheet_errors) == len(sheet_results) and sheet_errors:
-                raise SalesInsightError(sheet_errors[0])
-
-            merged_picks: dict[str, dict] = {}
-            for sr in sheet_results:
-                if not hero_visual_read and sr.get("hero_visual_read"):
-                    hero_visual_read = sr["hero_visual_read"]
-                if sr.get("rejected_summary"):
-                    stage1_rejected_notes.append(sr["rejected_summary"])
-                for p in sr.get("picks") or []:
-                    cand = p["cand"]
-                    rid = cand["record_id"]
-                    prev_p = merged_picks.get(rid)
-                    if prev_p is None or p["visual_score"] > prev_p["visual_score"]:
-                        merged_picks[rid] = p
-
-            ordered_picks = sorted(
-                merged_picks.values(),
-                key=lambda p: (-p["visual_score"], -p["cand"]["total_score"], p["cand"]["record_id"]),
-            )
-            stage1_picked_count = len(ordered_picks)
-            stage2_pool: list[dict] = []
-            for p in ordered_picks[: filters.pool_size]:
-                stage2_pool.append({
-                    **p["cand"],
-                    "visual_screen_score": p["visual_score"],
-                    "visual_screen_reason": p["quick_reason"],
-                })
-            # If every single sheet rejected all tiles, inspect top 4 in Stage 2 so the user still gets transparent verdicts
-            if not stage2_pool:
-                stage2_pool = list(scan_pool[: min(4, filters.pool_size)])
-        else:
-            stage2_pool = list(scan_pool[: filters.pool_size])
-
-        # Stage 2: High-Resolution 1v1 Side-by-Side Deep Review
-        def review_one(cand: dict) -> dict:
-            cand_rec = rec_map.get(cand["record_id"])
-            ref = cand.get("reference_winner")
-            ref_rec = rec_map.get(ref["record_id"]) if ref and ref.get("record_id") else None
-            ref_hints = "、".join(ref.get("structural_hints") or []) if ref else ""
-            screen_hint = f"\n海选阶段视觉初评：{cand['visual_screen_reason']}" if cand.get("visual_screen_reason") else ""
-            blocks: list[dict] = [{
-                "type": "text",
-                "text": (
-                    f"目标品类：{effective_category} | 本厂该品类高胜率主力纱线参考：{yarns_hint}\n"
-                    f"【图 1：外部候选款】来源={cand['source_category']} | 旧标签仅供参考={cand['tags']['一句话描述']} | "
-                    f"细节={','.join(cand['tags']['细节元素']) or '无'} | 资料备注={cand['notes_text'] or '无'}{screen_hint}\n"
-                    f"（请严格以两张原图肉眼视觉为准，若图 1 出现大花卉/满身杂乱印花/错误品类或与图 2 调性违和，直接判 drop！）"
-                ),
-            }]
-            cand_url = _record_data_url(cand_rec, max_side=560) if cand_rec else None
-            if cand_url:
-                blocks.append({"type": "image_url", "image_url": {"url": cand_url}})
-            if ref:
-                blocks.append({
-                    "type": "text",
-                    "text": (
-                        f"【图 2：本厂参照爆款 {ref['code']}】等级={ref['grade']} | {ref['winner_type']} | "
-                        f"销量={ref['quantity']:,}件（补单{ref['replenishment']:,}件，客户{ref['customer_count']}家）| "
-                        f"材质={ref['material']} | 单价=¥{ref['unit_price']} | ERP信息={ref_hints or '无'} | "
-                        f"旧标签仅供参考={ref['tags'].get('一句话描述', '')}"
-                    ),
-                })
-                ref_url = _record_data_url(ref_rec, max_side=560) if ref_rec else None
-                if ref_url:
-                    blocks.append({"type": "image_url", "image_url": {"url": ref_url}})
-            res = llm.ask_json(SELECTION_PAIR_SYSTEM_PROMPT, blocks, max_tokens=6144)
-            verdict = str(res.get("verdict") or "recommend").strip().lower()
-            if verdict not in {"recommend", "too_similar", "drop"}:
-                verdict = "recommend"
-            try:
-                stars = int(res.get("stars") or 4)
-            except (TypeError, ValueError):
-                stars = 4
-            stars = max(1, min(5, stars))
-            return {
-                **cand,
-                "verdict": verdict,
-                "tier": str(res.get("tier") or "趋势微创新款").strip(),
-                "stars": stars,
-                "hero_visual_note": str(res.get("hero_visual_note") or "").strip(),
-                "similarity_note": str(res.get("similarity_note") or "").strip(),
-                "gene_reason": str(res.get("gene_reason") or "").strip(),
-                "novelty_point": str(res.get("novelty_point") or "").strip(),
-                "yarn_and_price_advice": str(res.get("yarn_and_price_advice") or "").strip(),
-                "risk_note": str(res.get("risk_note") or "").strip(),
-            }
-
-        with ThreadPoolExecutor(max_workers=min(6, len(stage2_pool)), thread_name_prefix="sales-select") as pool:
-            reviewed = list(pool.map(review_one, stage2_pool))
-
-        if not hero_visual_read:
-            for r in reviewed:
-                if r.get("hero_visual_note"):
-                    hero_visual_read = r["hero_visual_note"]
-                    break
-
-        recommended = [r for r in reviewed if r["verdict"] == "recommend"]
-        rejected_similar = [r for r in reviewed if r["verdict"] == "too_similar"]
-        dropped = [r for r in reviewed if r["verdict"] == "drop"]
-        recommended.sort(
-            key=lambda r: (-r["stars"], -(r.get("visual_screen_score") or 0), -r["total_score"], r["record_id"])
-        )
-
-        decisions = load_decisions()
-        for r in recommended:
-            d = decisions.get(r["record_id"]) or {}
-            r["decision"] = d.get("status", "none")
-            r["decision_note"] = d.get("note", "")
-
-        ai_payload = {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "model": llm.label,
-            "pipeline_mode": pipeline_mode,
-            "hero_visual_read": hero_visual_read,
-            "visual_screened_count": len(scan_pool),
-            "contact_sheets_count": contact_sheets_count,
-            "stage1_picked_count": stage1_picked_count,
-            "stage1_rejected_summary": "；".join(stage1_rejected_notes[:2]),
-            "scanned_record_ids": [c["record_id"] for c in scan_pool],
-            "reviewed_count": len(reviewed),
-            "recommended_count": len(recommended),
-            "rejected_similar_count": len(rejected_similar),
-            "dropped_count": len(dropped),
-            "recommendations": recommended,
-            "rejected_similar": rejected_similar,
-            "dropped": dropped,
+def _screen_page(llm, chunk, rec_map, hero_url, instructions):
+    slots = [(i, rec_map[c["record_id"]]) for i, c in enumerate(chunk, 1) if c["record_id"] in rec_map]
+    sheet, rendered = _make_contact_sheet(slots)
+    if not sheet or not hero_url:
+        raise SalesInsightError("参照图或本页候选原图不可读")
+    blocks = [
+        {"type": "text", "text": instructions + "\n本页有效编号 " + "、".join(map(str, rendered))},
+        {"type": "image_url", "image_url": {"url": hero_url}},
+        {"type": "image_url", "image_url": {"url": sheet, "detail": "high"}},
+    ]
+    raw = llm.ask_json(CONTACT_SHEET_SYSTEM_PROMPT, blocks, max_tokens=6144)
+    picks = raw.get("picks")
+    if not isinstance(picks, list):
+        raise SalesInsightError("海选缺少 picks 列表")
+    accepted = {}
+    for item in picks:
+        if not isinstance(item, dict):
+            continue
+        slot = item.get("slot")
+        if isinstance(slot, str) and re.fullmatch(r"0?[1-9]|1[0-6]", slot):
+            slot = int(slot)
+        if type(slot) is not int or slot not in rendered or rendered[slot] in accepted:
+            continue
+        score = item.get("visual_score")
+        accepted[rendered[slot]] = {
+            "visual_screen_score": score if type(score) is int and 1 <= score <= 100 else None,
+            "visual_screen_reason": str(item.get("quick_reason") or "").strip(),
         }
-        _write_cached_json(cache_key, ai_payload)
-        preview["ai_selection"] = ai_payload
-        return preview
+        if len(accepted) == 4:
+            break
+    if picks and not accepted:
+        raise SalesInsightError("海选没有返回可核对的有效格号")
+    return list(rendered.values()), accepted, str(raw.get("hero_visual_read") or ""), str(raw.get("rejected_summary") or "")
+
+
+def _review_candidate(llm, cand, rec_map, instructions):
+    ref = cand.get("reference_winner") or {}
+    try:
+        cand_rec = rec_map.get(cand["record_id"])
+        ref_rec = rec_map.get(ref.get("record_id"))
+        cand_url = _record_data_url(cand_rec, 1600) if cand_rec else None
+        ref_url = _record_data_url(ref_rec, 1600) if ref_rec else None
+        if not cand_url or not ref_url:
+            raise SalesInsightError("候选或本厂参照原图缺失、不可读")
+        blocks = [
+            {"type": "text", "text": f"{instructions}\n图1候选标签 {cand['tags']}；资料备注 {cand['notes_text']}\n"
+             f"图2本厂参照 {ref['code']}，{ref['category']}，{ref['cat2']}，{ref['structural_hints']}，"
+             f"销量{ref['quantity']}件、补单{ref['replenishment']}件、材质{ref['material']}、成交均价{ref['unit_price']}。"},
+            {"type": "image_url", "image_url": {"url": cand_url, "detail": "high"}},
+            {"type": "image_url", "image_url": {"url": ref_url, "detail": "high"}},
+        ]
+        result = llm.ask_json(SELECTION_PAIR_SYSTEM_PROMPT, blocks, max_tokens=6144)
+        verdict, stars = result.get("verdict"), result.get("stars")
+        if verdict not in ("recommend", "too_similar", "drop") or type(stars) is not int or not 1 <= stars <= 5:
+            raise SalesInsightError("终审 verdict 或 stars 不符合约定")
+        evidence = {field: str(result.get(field) or "").strip() for field in (
+            "tier", "hero_visual_note", "similarity_note", "gene_reason", "novelty_point", "yarn_and_price_advice", "risk_note")}
+        return {**cand, **evidence, "verdict": verdict, "stars": stars, "review_stage": "ai_final"}
+    except Exception as exc:
+        return {**cand, "review_stage": "retry", "verdict": "unreviewed", "stars": None, "retry_reason": str(exc)}
+
+
+def run_selection_ai(conn, filters: SelectionFilters, *, force=False, client=None) -> dict:
+    return analyze_selection_inputs(read_selection_inputs(conn, filters), filters, force=force, client=client)
+
+
+def analyze_selection_inputs(inputs, filters: SelectionFilters, *, force=False, client=None, expected_snapshot=None) -> dict:
+    report, scan_pool, target, hero_url, records = _build_selection_context(inputs, filters, client=client)
+    if expected_snapshot and report["snapshot"] != expected_snapshot:
+        raise SalesInsightError("候选数据或参照款已更新，请刷新标签预览后重试。", status_code=409)
+    if report["ai_blocked_reason"]:
+        report["ai_selection"] = None
+        return _freeze_report(report, records)
+    if not scan_pool:
+        raise SalesInsightError("本轮没有符合条件的外部候选款。", status_code=422)
+    if report["ai_selection"] is not None and not force:
+        return _freeze_report(report, records)
+
+    rules = _selection_rules(filters, report["scope"]["category"], _own_structure(target) if target else None)
+    yarns = "、".join(y["material"] for y in report["top_yarns"])
+    instructions = rules + (f"\n本厂参考纱线 {yarns}" if yarns else "")
+    if target:
+        instructions += f"\n锁定本厂款号 {target['code']}，ERP二级为 {target['cat2']}。"
+    two_stage = len(scan_pool) >= 5
+    llm = client or SalesVisionClient()
+    viewed, picked = set(), {}
+    failed_pages, page_notes = [], []
+    hero_read = ""
+    try:
+        if two_stage:
+            chunks = [scan_pool[i:i + 16] for i in range(0, len(scan_pool), 16)]
+            with ThreadPoolExecutor(max_workers=min(8, len(chunks))) as pool:
+                futures = [pool.submit(_screen_page, llm, chunk, records, hero_url, instructions) for chunk in chunks]
+                for page, future in enumerate(futures):
+                    try:
+                        ids, picks, reading, note = future.result()
+                    except Exception as exc:
+                        failed_pages.append({"page": page + 1, "reason": str(exc),
+                                             "record_ids": [c["record_id"] for c in chunks[page]]})
+                        continue
+                    viewed.update(ids)
+                    picked.update(picks)
+                    hero_read = hero_read or reading
+                    if note:
+                        page_notes.append(note)
+            stage2 = [{**c, **picked[c["record_id"]]} for c in scan_pool if c["record_id"] in picked]
+            stage2.sort(key=lambda c: (-(c["visual_screen_score"] or 0), -c["total_score"], c["record_id"]))
+        else:
+            chunks = []
+            stage2 = scan_pool
+        deferred = {c["record_id"] for c in stage2[filters.pool_size:]}
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            reviewed = list(pool.map(lambda c: _review_candidate(llm, c, records, instructions), stage2[:filters.pool_size]))
     finally:
-        if own_client:
+        if client is None:
             llm.close()
+
+    pending = [c for c in reviewed if c["review_stage"] == "retry"]
+    completed = [c for c in reviewed if c["review_stage"] == "ai_final"]
+    viewed.update(c["record_id"] for c in completed)
+    recommendations = sorted((c for c in completed if c["verdict"] == "recommend"),
+                             key=lambda c: (-c["stars"], -(c.get("visual_screen_score") or 0), -c["total_score"], c["record_id"]))
+    similar = [c for c in completed if c["verdict"] == "too_similar"]
+    dropped = [c for c in completed if c["verdict"] == "drop"]
+    decisions = load_decisions()
+    for c in recommendations:
+        d = decisions.get(c["record_id"], {})
+        c.update(decision=d.get("status", "none"), decision_note=d.get("note", ""))
+    batch_ids = report["scan_candidate_ids"]
+    progress = viewed - {c["record_id"] for c in pending} - deferred
+    retry_ids = [rid for rid in batch_ids if rid not in progress and rid not in deferred]
+    ai = {
+        "generated_at": datetime.now(timezone.utc).isoformat(), "model": llm.label,
+        "pipeline_mode": "two_stage_contact_sheet" if two_stage else "direct_1v1",
+        "hero_visual_read": hero_read or next((c["hero_visual_note"] for c in completed if c["hero_visual_note"]), ""),
+        "visual_screened_count": len(viewed), "contact_sheets_count": len(chunks),
+        "stage1_picked_count": len(picked) if two_stage else len(stage2),
+        "stage1_rejected_summary": "；".join(page_notes[:2]), "failed_pages": failed_pages,
+        "viewed_record_ids": [rid for rid in batch_ids if rid in viewed],
+        "unseen_record_ids": [rid for rid in batch_ids if rid not in viewed],
+        "scanned_record_ids": [rid for rid in batch_ids if rid in progress],
+        "retry_record_ids": retry_ids, "deferred_record_ids": sorted(deferred),
+        "reviewed_record_ids": [c["record_id"] for c in completed], "passed_record_ids": [c["record_id"] for c in recommendations],
+        "reviewed_count": len(completed), "recommended_count": len(recommendations),
+        "rejected_similar_count": len(similar), "dropped_count": len(dropped),
+        "recommendations": recommendations, "rejected_similar": similar, "dropped": dropped, "unreviewed": pending,
+    }
+    report["ai_selection"] = ai
+    report["funnel"]["remaining_unscanned"] = report["funnel"]["gate2_scored_pool"] - len(progress)
+    cache_key = _selection_cache_key(report["snapshot"])
+    if not retry_ids:
+        _write_cached_json(cache_key, ai)
+    return _freeze_report(report, records)
+
 
 
 # ---------------------------------------------------------------- Module 3: Customer Preferences & Targeted Push
@@ -2283,13 +2153,14 @@ def build_customer_insights(conn, filters: CustomerInsightFilters) -> dict:
     orders = bundle["orders"]
 
     cust_agg = defaultdict(lambda: {
-        "qty": 0, "amt": 0.0, "rep_qty": 0, "styles": defaultdict(int), "rep_styles": set(), "colors": Counter(),
+        "qty": 0, "amt": 0.0, "rep_qty": 0, "styles": defaultdict(int), "rep_styles": set(), "colors": Counter(), "names": Counter(),
     })
     for o in orders:
         c = o["cust"]
         if not c or c == "本厂自有版本":
             continue
         g = cust_agg[c]
+        g["names"][o["customer_raw"] or c] += o["qty"]
         g["qty"] += o["qty"]
         g["amt"] += o["amt"]
         g["styles"][o["code"]] += o["qty"]
@@ -2302,7 +2173,9 @@ def build_customer_insights(conn, filters: CustomerInsightFilters) -> dict:
 
     customer_list = [
         {
-            "name": name,
+            "customer_id": name,
+            "name": min(g["names"], key=lambda n: (-g["names"][n], n)),
+            "aliases": sorted(g["names"]),
             "quantity": g["qty"],
             "amount": round(g["amt"], 2),
             "style_count": len(g["styles"]),
@@ -2314,7 +2187,10 @@ def build_customer_insights(conn, filters: CustomerInsightFilters) -> dict:
     ]
     customer_list.sort(key=lambda x: (-x["quantity"], -x["replenishment"], x["name"]))
 
-    selected_name = filters.customer if filters.customer in cust_agg else (customer_list[0]["name"] if customer_list else "")
+    chosen = next((entry for entry in customer_list if filters.customer in {entry["customer_id"], *entry["aliases"]}
+                   or customer_short_name(filters.customer) == entry["customer_id"]), None)
+    chosen = chosen or (customer_list[0] if customer_list else None)
+    selected_name = chosen["name"] if chosen else ""
     if not selected_name:
         return {
             "scope": {"seasons": filters.seasons, "customer": "", "include_brand": filters.include_brand},
@@ -2324,8 +2200,17 @@ def build_customer_insights(conn, filters: CustomerInsightFilters) -> dict:
             "external_recommendations": [],
         }
 
-    cg = cust_agg[selected_name]
+    cg = cust_agg[chosen["customer_id"]]
     bought_codes = set(cg["styles"].keys())
+    # Lifetime purchases also protect a different season or another client version of the same base.
+    purchased = set(bought_codes)
+    for row in conn.execute("SELECT DISTINCT customer, customer_raw, variant_code, style_code FROM style_order_lines WHERE quantity > 0"):
+        if customer_short_name(row["customer"] or row["customer_raw"]) == chosen["customer_id"]:
+            purchased.update((row["variant_code"], row["style_code"]))
+    for row in conn.execute("SELECT DISTINCT customer, variant_code, style_code FROM style_sales WHERE quantity > 0"):
+        if customer_short_name(row["customer"]) == chosen["customer_id"]:
+            purchased.update((row["variant_code"], row["style_code"]))
+    purchased_bases = {parsed.base for code in purchased if (parsed := parse_style_code(code))}
     bought_styles = [(styles[c], qty) for c, qty in cg["styles"].items() if c in styles]
     bought_styles.sort(key=lambda pair: -pair[1])
 
@@ -2339,7 +2224,7 @@ def build_customer_insights(conn, filters: CustomerInsightFilters) -> dict:
         rec = st["record"]
         if rec:
             for fn in ("领型", "版型", "风格", "图案"):
-                val = getattr(rec.tags, fn, "")
+                val = _own_structure(st).neck if fn == "领型" else getattr(rec.tags, fn, "")
                 if val and val not in {"其他", "未判断", "待归类"}:
                     tag_weights[fn][val] += w
             for d in rec.tags.细节元素 or []:
@@ -2354,7 +2239,7 @@ def build_customer_insights(conn, filters: CustomerInsightFilters) -> dict:
     # 1) Unbought own-factory winners matching customer's profile (Zero-sample immediate sales push!)
     own_recs = []
     for code, st in styles.items():
-        if code in bought_codes or not st["is_winner"]:
+        if code in purchased or st["style_code"] in purchased_bases or not st["is_winner"]:
             continue
         match_pts = 0.0
         reasons = []
@@ -2374,13 +2259,13 @@ def build_customer_insights(conn, filters: CustomerInsightFilters) -> dict:
         rec = st["record"]
         if rec:
             for fn in ("领型", "版型", "风格"):
-                val = getattr(rec.tags, fn, "")
+                val = _own_structure(st).neck if fn == "领型" else getattr(rec.tags, fn, "")
                 if val in fav_tags.get(fn, [])[:2]:
                     match_pts += 7
                     reasons.append(f"偏好{val}")
         if st["winner_type"] == "通吃复购款":
             match_pts += 12
-            reasons.append(f"全厂{st['customer_count']}家客户已验证复购")
+            reasons.append(f"全厂{st['rep_customer_count']}家客户已补单")
         if match_pts >= 35:
             card = _serialize_style_card(st)
             card["match_score"] = round(min(99.0, match_pts), 1)
@@ -2389,15 +2274,26 @@ def build_customer_insights(conn, filters: CustomerInsightFilters) -> dict:
     own_recs.sort(key=lambda x: (-x["match_score"], -x["quantity"], x["code"]))
 
     # 2) External library fresh proposals tailored to this customer's top category & visual taste
-    target_plan = fav_plans[0] if fav_plans else "长袖套衫"
+    target_plan = fav_plans[0] if fav_plans else "未知"
     ext_recs = []
-    for rec in bundle["external_records"]:
-        if not _matches_category_plan(rec, target_plan):
+    targets = [_own_structure(st) for st, _ in bought_styles if st["plan"] == target_plan and not _own_structure(st).conflicts]
+    shapes = {r.id: garment_structure(r) for r in bundle["external_records"]}
+    decisions = load_decisions()
+    candidates = [r for r in bundle["external_records"] if shapes[r.id].knit == "横机特征"
+                  and eligible(r, target_plan, structure=shapes[r.id]) and not _is_busy_pattern(r)[0]
+                  and any(shapes[r.id].compatible(t, exact=True) for t in targets)]
+    own = [st for st in styles.values() if st["record"] and st["plan"] == target_plan]
+    candidates, _, duplicates, _, prints = _deduplicate_candidates(candidates, bundle["own_images"], own, shapes)
+    rejected = {rid for rid, d in decisions.items() if d.get("status") == "rejected"}
+    rejected.update(d["matched_own_code"] for d in duplicates if d["record_id"] in rejected)
+    for rec in candidates:
+        if rec.id in rejected or not prints[rec.id][1]:
             continue
         pts = 20.0
         hits = [target_plan]
+        neckline = shapes[rec.id].neck
         for fn, boost in (("领型", 18), ("版型", 16), ("风格", 16), ("图案", 12)):
-            val = getattr(rec.tags, fn, "")
+            val = neckline if fn == "领型" else getattr(rec.tags, fn, "")
             if val and val in fav_tags.get(fn, [])[:2]:
                 pts += boost
                 hits.append(val)
@@ -2415,12 +2311,13 @@ def build_customer_insights(conn, filters: CustomerInsightFilters) -> dict:
                 "source_category": rec.source_category,
                 "summary": rec.tags.一句话描述,
                 "match_score": round(min(98.0, pts), 1),
+                "review_stage": "tag_preview",
                 "matched_preferences": list(dict.fromkeys(hits))[:5],
                 "tags": {
                     "品类": rec.tags.品类,
                     "风格": rec.tags.风格,
                     "版型": rec.tags.版型,
-                    "领型": rec.tags.领型,
+                    "领型": neckline,
                     "颜色主色调": rec.tags.颜色主色调,
                     "细节元素": list(rec.tags.细节元素),
                 },

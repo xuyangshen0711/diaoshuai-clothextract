@@ -133,6 +133,17 @@ def apply_suggestion(record: ImageRecord, suggestion: FashionTags, backend_name:
     record.touch()
 
 
+def sales_evidence_tags(record: ImageRecord) -> FashionTags:
+    """Historical mock suggestions have no visual evidence, including auto-approved rows."""
+    if record.ai_tags_source == "mock" or record.tags_source == "mock":
+        overrides = dict(record.human_overrides)
+        for name in ("面料", "袖长"):
+            if overrides.get(name):
+                overrides[name + "来源"] = "人工"
+        return FashionTags.model_validate(overrides)
+    return record.display_tags
+
+
 def needs_tagging(record: ImageRecord, overwrite: bool = False) -> bool:
     return record.review_status != "rejected" and (overwrite or not record.has_ai_suggestion
                                                    or record.ai_tags_source == "mock")

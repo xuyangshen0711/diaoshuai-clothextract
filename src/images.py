@@ -40,6 +40,11 @@ def cover_version(record: ImageRecord) -> str:
     return f"{image_version(record.image_path)}-{hashlib.sha256(crop.encode()).hexdigest()[:12]}"
 
 
+def original_data_url(record: ImageRecord, max_side: int = 1600) -> str:
+    from src.tag.images import image_data_url
+    return image_data_url(record.image_path, max_side=max_side)
+
+
 def cover_path(record: ImageRecord) -> Path:
     if record.cover_crop is None:
         return thumbnail_path(record.id, record.image_path)

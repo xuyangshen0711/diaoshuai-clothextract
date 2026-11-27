@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 
 from src import catalog, import_jobs, storage
 from src.factory.codes import image_style_code, parse_style_code
-from src.factory.excel_io import workbook_table_kind
+from src.factory.excel_io import KIND_LABELS, workbook_table_kind
 from src.factory.import_workspace import confirm_table, history, preview_table, replan_table, workspace
 from src.factory.tables import own_factory_images
 from src.factory import sales_deletion
@@ -172,9 +172,7 @@ def inspect_paths(entries, category):
         try:
             kind = workbook_table_kind(path) if path.suffix in {".xlsx", ".xlsm"} else None
             if kind in {"archive", "sales", "production", "guide"}:
-                labels = {"archive": "识别为款式档案", "sales": "识别为销量表", "production": "识别为生产数据",
-                          "guide": "识别为款式指示书"}
-                item.update(kind=kind, action="route", message=labels[kind])
+                item.update(kind=kind, action="route", message=f"识别为{KIND_LABELS[kind]}")
             elif category == "本厂产品" and path.suffix in {".pdf", ".pptx", ".xlsx", ".xlsm"}:
                 item.update(action="invalid", message="本厂封面请上传以款号命名的图片；档案与销量请使用专用入口")
             elif path.suffix not in {".pdf", ".pptx", ".xlsx", ".xlsm"}:
@@ -196,8 +194,8 @@ def inspect_paths(entries, category):
                         seen.add(code)
                         target = images.get(code)
                         if target and storage.is_file(target.image_path):
-                            same = import_jobs._same_file(path, target.pending_image_path or target.image_path)
-                            item.update(action="unchanged" if same else "replacement", message="相同图片，将跳过" if same else "已有图片；新图先送审核，确认后替换")
+                            same = import_jobs.same_tagged_factory_image(target, path)
+                            item.update(action="unchanged" if same else "replacement", message="相同图片，将跳过" if same else "已有图片，新图识别成功后自动替换")
                         else:
                             item["message"] = "匹配已有款号，补充图片" if code in known else "新款号，将建立图片记录"
         except Exception:

@@ -3,12 +3,15 @@ from __future__ import annotations
 import io
 
 import pymupdf
+import pytest
+from pathlib import Path
 from PIL import Image
 
 from test_review_workflow import store, make_record, approve
 from src import catalog, import_jobs as tasks
 from src.extract.office import extract_from_pdf
 from src.tag.openai_tagger import _coerce_tags
+from src.tag.errors import TaggingError
 from src.tag.tagger import MockTagger
 
 
@@ -49,7 +52,9 @@ def test_pdf_merges_strips_keeps_thumbnails_and_drops_banners(store):
 
 def test_model_can_flag_non_garment():
     assert _coerce_tags({"服装款式图": False}) is None
-    assert _coerce_tags({"服装款式图": True, "品类": "外套"}).品类 == "外套"
+    assert _coerce_tags({"服装款式图": True, "品类": "外套", "一句话描述": "深灰色宽松外套"}).品类 == "外套"
+    with pytest.raises(TaggingError, match="有效的款式建议和描述"):
+        _coerce_tags({"服装款式图": True, "品类": "外套"})
 
 
 class NotGarmentFor(MockTagger):
@@ -60,7 +65,7 @@ class NotGarmentFor(MockTagger):
         return None if self.marker in str(image_path) else super().tag(image_path, context)
 
 
-def test_import_discards_non_garments(store, monkeypatch):
+def test_import_keeps_non_garment_in_task_for_retry(store, monkeypatch):
     records = [make_record(store, "sweater-a"), make_record(store, "fabric-b")]
     for record in records:
         record.tags_source = "untagged"
@@ -71,20 +76,29 @@ def test_import_discards_non_garments(store, monkeypatch):
     job = tasks.create_import([source], "mock")
     tasks.run_job(job["id"])
     public = tasks.public_job(tasks.get_job(job["id"]))
-    assert public["status"] == "completed" and public["succeeded"] == 1 and public["filtered"] == 1
-    assert "过滤 1 张" in public["message"]
+    assert public["status"] == "partial" and public["succeeded"] == public["failed"] == 1
+    assert public["filtered"] == 0 and "不是服装款式图" in public["errors"][0]["message"]
     assert [r.id for r in catalog.load_catalog()] == [records[0].id]
-    assert not (store / "extracted" / "fabric-b.png").exists()
+    assert Path(records[1].image_path).is_file()
+    good = catalog.get_record(records[0].id)
+    monkeypatch.setattr(tasks, "get_tagger", lambda _: MockTagger())
+    tasks.retry_job(job["id"])
+    tasks.run_job(job["id"])
+    done = tasks.public_job(tasks.get_job(job["id"]))
+    assert done["status"] == "completed" and done["succeeded"] == 2 and done["failed"] == 0
+    assert catalog.get_record(good.id) == good
 
 
-def test_retag_rejects_catalogued_non_garment_with_history(store, monkeypatch):
+def test_non_garment_retag_preserves_current_record_image_and_history(store, monkeypatch):
     record = make_record(store, "fabric-c")
     catalog.save_catalog([record])
-    approve(record)
+    before = approve(record, record.tags.model_copy(update={"风格": "法式"}))
+    history = catalog.review_history(record.id)
     monkeypatch.setattr(tasks, "get_tagger", lambda _: NotGarmentFor("fabric"))
     job = tasks.create_retag("mock", overwrite=True)
     tasks.run_job(job["id"])
     stored = catalog.load_catalog()[0]
-    assert stored.review_status == "rejected" and stored.reviewer == "AI"
-    assert catalog.review_history(record.id)[0]["action"] == "auto_rejected"
-    assert tasks.public_job(tasks.get_job(job["id"]))["filtered"] == 1
+    assert stored == before and Path(stored.image_path).is_file()
+    assert catalog.review_history(record.id) == history
+    public = tasks.public_job(tasks.get_job(job["id"]))
+    assert public["status"] == "failed" and public["filtered"] == 0 and public["failed"] == 1

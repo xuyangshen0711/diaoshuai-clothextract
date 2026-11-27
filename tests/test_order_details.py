@@ -32,8 +32,8 @@ def test_customer_and_salesperson_names_and_season_text():
 
 def test_each_button_recognizes_its_old_and_new_workbook():
     samples = {
-        "style_10k.xlsx": ("archive", "archive_v2", "新版款式档案", {"设计款号", "设计师", "工艺师", "二级品类"}),
-        "style_archive_516083.xlsx": ("archive", "archive", "款式档案", {"大货款号", "设计款号"}),
+        "style_10k.xlsx": ("archive", "archive_v2", "商品资料表", {"设计款号", "设计师", "工艺师", "二级品类"}),
+        "style_archive_516083.xlsx": ("archive", "archive_v2", "商品资料表", {"大货款号", "设计款号"}),
         "sales_32k.xlsx": ("sales", "sales_lines", "ERP 订单明细", {"订单分类", "订单日期", "客户", "订单", "业务员"}),
         "sales_516083.xlsx": ("sales", "sales_summary", "销量汇总", {"款号", "订单数量", "订单金额"}),
     }
@@ -56,7 +56,7 @@ def test_new_archive_and_order_lines_round_trip(store, monkeypatch):
     )
     assert archive.status_code == 200, archive.text
     archived = archive.json()
-    assert archived["format_label"] == "新版款式档案"
+    assert archived["format_label"] == "商品资料表"
     assert archived["variant_count"] == 5
     assert {"设计款号", "设计师", "工艺师", "二级品类"} <= set(archived["evidence_columns"])
 
@@ -163,7 +163,7 @@ def test_new_archive_and_order_lines_round_trip(store, monkeypatch):
         "/api/import/sales",
         files={"file": ("style_10k.xlsx", (FIXTURES / "style_10k.xlsx").read_bytes())},
     )
-    assert wrong.status_code == 422 and "款式档案" in wrong.json()["detail"]
+    assert wrong.status_code == 422 and "商品资料表" in wrong.json()["detail"]
 
 
 def test_summary_duplicate_keys_add_and_reimport_replaces(store):
@@ -199,7 +199,7 @@ def test_older_archive_still_imports_and_keeps_design_code(store):
     )
     assert report.status_code == 200, report.text
     body = report.json()
-    assert body["format_label"] == "款式档案"
+    assert body["format_label"] == "商品资料表"
     assert "设计款号" in body["evidence_columns"]
     assert body["variant_count"] == 5
     with catalog._database() as conn:
@@ -280,6 +280,8 @@ def test_existing_taxonomy_gains_the_new_category(store):
         conn.execute("DELETE FROM garment_categories WHERE level1='上衣' AND level2='假两件套衫'")
         conn.execute("DELETE FROM category_synonyms WHERE phrase='假两件套衫'")
         conn.execute("DELETE FROM migrations WHERE name='category_jia_liangjian_v1'")
+        identity = catalog._db_identity(conn)
+    catalog._BOOTSTRAPPED.discard(identity)  # first open after upgrading the existing database
     with catalog._database() as conn:
         row = conn.execute(
             "SELECT level1, level2 FROM garment_categories WHERE level2='假两件套衫'"
@@ -323,4 +325,4 @@ def test_new_workbooks_dropped_on_the_image_importer_keep_their_bucket(store, mo
         ("source_categories", (None, "本厂产品")),
     ])
     finished = client.get(f"/api/import/jobs/{job.json()['id']}").json()
-    assert "这像是款式档案，请用下方对应入口" in finished["message"]
+    assert "这像是商品资料表，请用下方对应入口" in finished["message"]

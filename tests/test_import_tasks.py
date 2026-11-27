@@ -12,8 +12,8 @@ from pptx.util import Inches
 
 from test_review_workflow import store, make_record, approve
 from src import catalog, import_jobs as tasks
-from src.schema import FashionTags
-from src.tag.tagger import MockTagger
+from src.schema import ImageRecord
+from src.tag.tagger import MockTagger, apply_suggestion
 from api import main as api
 
 
@@ -50,7 +50,7 @@ def test_partial_task_retries_only_failed_items(store, monkeypatch):
     assert result['status'] == 'completed' and result['succeeded'] == 3
     assert len(calls) == 4 and len(catalog.load_catalog()) == 3
     assert all(r.source.batch_id == job['id'] for r in catalog.load_catalog())
-    assert all(r.review_status == 'pending' for r in catalog.load_catalog())
+    assert all(r.ready and r.review_status == 'approved' for r in catalog.load_catalog())
     with TestClient(api.app) as client:
         assert client.get('/api/catalog').json()['count'] == 3
         assert client.post(f"/api/import/jobs/{job['id']}/retry").status_code == 409
@@ -116,24 +116,31 @@ def test_job_endpoint_upload_source_detail_and_download(store, monkeypatch):
     assert client.get(detail['source_url']).content == payload.getvalue()
     downloaded = client.get(detail['download_url'])
     assert downloaded.status_code == 200 and 'attachment' in downloaded.headers['content-disposition']
+    listed = client.get('/api/catalog', params={'batch': job_id}).json()
+    assert [r['id'] for r in listed['items']] == [record.id]
     queue = client.get('/api/reviews', params={'batch': job_id}).json()
-    assert queue['count'] == 1 and queue['facets']['batches'][0]['id'] == job_id
+    assert queue['count'] == 0 and queue['counts']['approved'] == 1
+    assert queue['facets']['batches'][0]['id'] == job_id
     assert client.get('/api/import/jobs/missing').status_code == 404
 
 
 def test_quota_error_stops_batch_and_redacts_credentials(store, monkeypatch):
-    paths = fixture_sources(store, monkeypatch)
+    paths = fixture_sources(store, monkeypatch, count=tasks.AI_CONCURRENCY + 2)
+    calls = []
     class QuotaError(Exception):
         status_code, code = 429, 'insufficient_quota'
     class NoQuota(MockTagger):
         def tag(self, path, context=''):
+            calls.append(path)
             raise QuotaError('secret-key-material')
     monkeypatch.setattr(tasks, 'get_tagger', lambda _: NoQuota())
     job = tasks.create_import(paths, 'mock')
     tasks.run_job(job['id'])
     public = tasks.public_job(tasks.get_job(job['id']))
-    assert public['status'] == 'failed' and public['processed'] == 1
-    assert '额度不足' in public['message'] and 'secret-key-material' not in str(public)
+    assert public['status'] == 'failed' and public['processed'] == public['failed'] == len(calls)
+    assert 1 <= len(calls) <= tasks.AI_CONCURRENCY
+    assert public['pending'] == len(paths) - len(calls) and public['running'] == 0
+    assert '额度' in public['message'] and 'secret-key-material' not in str(public)
     assert catalog.load_catalog() == []
 
 
@@ -142,7 +149,11 @@ def test_review_filter_and_locate_selected_on_later_page(store):
     for i, record in enumerate(records):
         record.source.batch_id = 'batch-a'
         record.source.source_file = 'lookbook.pdf'
-        if i == 34: record.proposed_tags.品类 = '外套'
+        if i == 34:
+            apply_suggestion(record, record.ai_tags.model_copy(update={'品类': '外套'}), 'mock')
+        # The compatibility queue must still locate actual legacy pending rows.
+        record.review_status = 'pending'
+        record.proposed_tags = record.ai_tags.model_copy(deep=True)
     catalog.save_catalog(records)
     client = TestClient(api.app)
     response = client.get('/api/reviews', params={'selected_id': records[33].id}).json()
@@ -152,19 +163,22 @@ def test_review_filter_and_locate_selected_on_later_page(store):
     assert client.get('/api/reviews', params={'batch': 'missing'}).json()['count'] == 0
 
 
-def test_retag_job_preserves_human_tags_and_requires_new_review(store):
+def test_retag_job_preserves_human_tags_and_updates_ai_in_place(store):
     record = make_record(store)
     catalog.save_catalog([record])
     approved = approve(record, record.tags.model_copy(update={'品类': '外套'}))
     job = tasks.create_retag('mock', True)
     tasks.run_job(job['id'])
     record = catalog.load_catalog()[0]
-    assert record.tags.品类 == '外套' and record.proposed_tags.品类 == '上衣>套衫'
-    assert record.review_status == 'pending' and record.revision > approved.revision
+    assert record.tags.品类 == '外套' and record.ai_tags.品类 == '上衣>套衫'
+    assert record.review_status == 'approved' and record.proposed_tags is None
+    assert record.revision > approved.revision and record.ready
+    assert tasks.public_job(tasks.get_job(job['id']))['succeeded'] == 1
 
 
-def test_similar_records_excludes_self_and_unapproved_and_protects_source(store):
+def test_similar_records_excludes_self_and_unclassified_and_protects_source(store):
     first, other, pending = [make_record(store, name, color) for name, color in [('sweater','navy'),('coat','red'),('dress','white')]]
+    pending = ImageRecord(id=pending.id, image_path=pending.image_path, source=pending.source)
     catalog.save_catalog([first, other, pending])
     first, other = approve(first), approve(other)
     client = TestClient(api.app)
@@ -175,6 +189,35 @@ def test_similar_records_excludes_self_and_unapproved_and_protects_source(store)
     catalog.save_catalog([first])
     assert client.get(f'/api/records/{first.id}').json()['source_url'] is None
     assert client.get(f'/api/records/{first.id}/source').status_code == 404
+
+
+def test_duplicate_checkpoint_failure_retains_retry_image_and_counts(store, monkeypatch):
+    from test_own_factory import _client, _jpeg, _upload
+
+    client = _client(monkeypatch)
+    image = _jpeg("navy")
+    _upload(client, "516083.jpg", image, "本厂产品")
+    original, = catalog.load_catalog()
+    put = tasks._put
+
+    def fail_skip_once(conn, job):
+        if any(item.get("skipped") and item["state"] == "done" for item in job["items"]):
+            monkeypatch.setattr(tasks, "_put", put)
+            raise RuntimeError("checkpoint write failed")
+        put(conn, job)
+
+    monkeypatch.setattr(tasks, "_put", fail_skip_once)
+    failed = _upload(client, "516083.jpg", image, "本厂产品")
+    assert failed["status"] == "failed" and failed["failed"] == 1
+    assert failed["succeeded"] == failed["skipped"] == 0
+    item, = tasks.get_job(failed["id"])["items"]
+    assert Path(item["new_image_path"]).is_file()
+    assert catalog.get_record(original.id) == original
+    tasks.retry_job(failed["id"])
+    tasks.run_job(failed["id"])
+    done = tasks.public_job(tasks.get_job(failed["id"]))
+    assert done["status"] == "completed" and done["skipped"] == 1 and done["succeeded"] == 0
+    assert catalog.get_record(original.id) == original and Path(original.image_path).read_bytes() == image
 
 
 def test_stale_retag_target_fails_before_paid_model_call(store, monkeypatch):

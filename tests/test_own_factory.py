@@ -30,9 +30,11 @@ def test_style_code_splits_base_and_customer_and_rejects_totals():
     own = parse_style_code("516083")
     assert own and own.base == "516083" and own.customer == "本厂自有版本" and own.suffix == ""
     for raw, customer in [("516083若宇", "若宇"), ("516083张学庚", "张学庚"), ("516083卡雷莱", "卡雷莱"),
-                          ("516083声雨竹", "声雨竹"), ("633125*7", "*7"), ("7A933红人", "红人"), ("7A935红人", "红人")]:
+                          ("516083声雨竹", "声雨竹"), ("7A933红人", "红人"), ("7A935红人", "红人")]:
         parsed = parse_style_code(raw)
         assert parsed and parsed.customer == customer and parsed.base == raw.replace(customer, "")
+    starred = parse_style_code("633125*7")
+    assert starred and starred.raw == starred.base == "633125*7" and starred.customer == "本厂自有版本"
     upper = parse_style_code("s7529")
     assert upper and upper.base == "S7529" and upper.customer == "本厂自有版本"
     cd = parse_style_code("CD0153")
@@ -100,7 +102,8 @@ def test_archive_and_sales_samples_upsert_and_skip_totals(store):
     body = archive.json()
     assert body["variant_count"] == 5
     assert body["skipped_rows"] >= 1
-    assert any("系列" in warning for warning in body["warnings"])
+    assert all("系列" not in warning for warning in body["warnings"])
+    assert all(any(col in w for w in body["warnings"]) for col in ("设计师", "工艺师", "二级品类"))
     assert body["archive_without_image"] == ["516083"]
     customers = {row[0] for row in _variants(store)}
     assert customers == {"本厂自有版本", "若宇", "张学庚", "卡雷莱", "声雨竹"}
@@ -116,7 +119,8 @@ def test_archive_and_sales_samples_upsert_and_skip_totals(store):
     assert "633125*7" in codes and "7A933红人" in codes and "S7529" in codes
     assert "KG516083" not in codes
     customers = {row[0] for row in _variants(store)}
-    assert "*7" in customers and "红人" in customers
+    assert "*7" not in customers and "红人" in customers
+    assert _one("SELECT style_code FROM style_variants WHERE variant_code='633125*7'") == "633125*7"
     assert not any("红人服饰" in name for name in customers)
 
     sales = client.post(
@@ -181,21 +185,23 @@ def test_image_upload_folder_case_replacement_and_filters(store, monkeypatch):
     assert any(item.style_code == "S7529" for item in catalog.load_catalog())
 
     same = _upload(client, "516083.jpg", first, "本厂产品")
-    assert same["succeeded"] == 1
-    assert "替换图" in same["message"]
+    assert same["skipped"] == 1 and same["succeeded"] == 0
     assert len(catalog.load_catalog()) == 2
-    repeated = next(item for item in catalog.load_catalog() if item.style_code == "516083")
-    assert repeated.pending_image_path
-    assert Path(repeated.image_path).read_bytes() == Path(repeated.pending_image_path).read_bytes()
+    assert catalog.get_record(record.id) == record
 
-    replacement = _upload(client, "516083.jpg", _jpeg("red"), "本厂产品")
+    first_revision = record.revision
+    edited = client.patch(f"/api/records/{record.id}/tags", json={
+        "changes": {"风格": "法式"}, "expected_revision": first_revision,
+    })
+    assert edited.status_code == 200
+    red = _jpeg("red")
+    replacement = _upload(client, "516083.jpg", red, "本厂产品")
     assert replacement["succeeded"] == 1
-    assert "替换图" in replacement["message"]
-    pending = next(item for item in catalog.load_catalog() if item.style_code == "516083")
-    assert pending.review_status == "pending"
-    assert pending.cover_crop == crop
-    assert pending.pending_image_path
-    assert Path(pending.image_path).read_bytes() != Path(pending.pending_image_path).read_bytes()
+    current = catalog.get_record(record.id)
+    assert current.ready and current.review_status == "approved" and current.pending_image_path is None
+    assert current.cover_crop is None and Path(current.image_path).read_bytes() == red
+    assert current.human_overrides["风格"] == current.tags.风格 == "法式"
+    assert len(current.image_history) == 1 and Path(current.image_history[0]["image_path"]).read_bytes() == first
     assert len(catalog.load_catalog()) == 2
 
     archive = client.post(
@@ -208,7 +214,7 @@ def test_image_upload_folder_case_replacement_and_filters(store, monkeypatch):
         files={"file": ("s.xlsx", (FIXTURES / "sales_516083.xlsx").read_bytes())},
     )
     assert sales.json()["stored_quantity"] == 3411
-    detail = client.get(f"/api/records/{pending.id}").json()
+    detail = client.get(f"/api/records/{current.id}").json()
     assert len(detail["variants"]) == 5
     assert detail["sales"]["total_quantity"] == 3411
     assert detail["sales"]["total_amount"] == 509145
@@ -219,14 +225,16 @@ def test_image_upload_folder_case_replacement_and_filters(store, monkeypatch):
     assert detail["archive_category"] == "长袖套衫"
     assert {row["category"] for row in detail["variants"]} == {"长袖套衫"}
     assert all("KG" not in row["variant_code"] for row in detail["variants"])
-    assert detail["has_pending_image"] and detail["pending_image_url"]
-    assert client.get(detail["pending_image_url"]).status_code == 200
+    assert not detail["has_pending_image"]
+    assert client.get(detail["image_history"][0]["url"]).content == first
 
     library = client.get("/api/catalog", params={"source_category": "本厂产品", "sort": "sales"}).json()
     assert library["items"][0]["style_code"] == "516083"
     assert library["items"][0]["sales_quantity"] == 3411
     for params, expected in [
-        ({"source_category": "本厂产品", "archive_season": "2025秋"}, True),
+        # A summary has no order season. Archived seasons alone cannot place sales in one.
+        ({"source_category": "本厂产品", "archive_season": "2025秋"}, False),
+        ({"source_category": "本厂产品", "order_season": "2025秋"}, False),
         ({"source_category": "本厂产品", "color_family": "紫"}, True),
         ({"source_category": "本厂产品", "size": "M"}, True),
         ({"source_category": "本厂产品", "customer": "若宇"}, True),
@@ -236,39 +244,31 @@ def test_image_upload_folder_case_replacement_and_filters(store, monkeypatch):
         ({"source_category": "网图趋势"}, False),
     ]:
         found = client.get("/api/catalog", params=params).json()["items"]
-        assert (pending.id in {item["id"] for item in found}) is expected, params
+        assert (current.id in {item["id"] for item in found}) is expected, params
 
     hits = client.get("/api/search/text", params={"q": "卡雷莱", "include_pending": "true", "source_category": "本厂产品"}).json()
-    assert pending.id in {item["id"] for item in hits["items"]}
+    assert current.id in {item["id"] for item in hits["items"]}
     other = client.get("/api/search/text", params={"q": "516083", "include_pending": "true", "source_category": "市调拍照"}).json()
-    assert pending.id not in {item["id"] for item in other["items"]}
+    assert current.id not in {item["id"] for item in other["items"]}
 
-    approved = client.post(f"/api/records/{pending.id}/review", json={
-        "action": "approve", "reviewer": "审核员", "expected_revision": detail["revision"],
-        "tags": FashionTags(品类="毛衣", 季节="秋").model_dump(),
-    })
-    assert approved.status_code == 200, approved.text
-    swapped = catalog.load_catalog()
-    current = next(item for item in swapped if item.id == pending.id)
-    assert current.review_status == "approved"
-    assert current.pending_image_path is None
-    assert current.cover_crop is None
-    assert current.image_history and Path(current.image_history[0]["image_path"]).is_file()
-    history = client.get(f"/api/records/{pending.id}").json()["image_history"]
-    assert history and client.get(history[0]["url"]).status_code == 200
+    client.post("/api/import/sales", files={
+        "file": ("orders.xlsx", (FIXTURES / "sales_32k.xlsx").read_bytes())
+    }).raise_for_status()
+    for key in ("archive_season", "order_season"):
+        scoped = client.get("/api/catalog", params={"source_category": "本厂产品", key: "2025秋"}).json()
+        scoped_item, = scoped["items"]
+        assert scoped_item["id"] == current.id and scoped_item["order_seasons"] == ["2025秋"]
+        assert 0 < scoped_item["sales_quantity"] < detail["sales"]["total_quantity"]
 
-    second = _upload(client, "516083.jpg", _jpeg("white"), "本厂产品")
-    assert "替换图" in second["message"]
-    current = next(item for item in catalog.load_catalog() if item.id == pending.id)
-    assert current.review_status == "pending" and current.pending_image_path
-    kept = client.post(f"/api/records/{pending.id}/review", json={
-        "action": "keep_image", "reviewer": "审核员", "note": "保留原图", "expected_revision": current.revision,
-    })
-    assert kept.status_code == 200, kept.text
-    restored = next(item for item in catalog.load_catalog() if item.id == pending.id)
-    assert restored.review_status == "approved"
-    assert restored.pending_image_path is None
-    assert restored.image_path == current.image_path
+    # Failed recognition of a third image must preserve the active one and the entire history.
+    class InvalidTagger:
+        name = "mock"
+        def tag(self, *_):
+            return None
+    monkeypatch.setattr(import_jobs, "get_tagger", lambda _: InvalidTagger())
+    failed = _upload(client, "516083.jpg", _jpeg("white"), "本厂产品")
+    assert failed["status"] == "failed" and failed["failed"] == 1 and failed["succeeded"] == 0
+    assert catalog.get_record(record.id) == current
 
 
 def test_duplicate_style_code_cannot_be_reassigned(store, monkeypatch):
@@ -374,7 +374,7 @@ def test_wrong_table_and_image_slot_only_change_the_wording(store, monkeypatch):
     assert "可能传错了表" in swapped.json()["detail"] and "销量表" in swapped.json()["detail"]
     swapped = client.post("/api/import/sales", files={"file": ("archive.xlsx", archive)})
     assert swapped.status_code == 422
-    assert "可能传错了表" in swapped.json()["detail"] and "款式档案" in swapped.json()["detail"]
+    assert "可能传错了表" in swapped.json()["detail"] and "商品资料表" in swapped.json()["detail"]
     job = client.post("/api/import/jobs?backend=mock", files=[
         ("files", ("sales_516083.xlsx", sales, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")),
         ("source_categories", (None, "本厂产品")),
@@ -416,7 +416,7 @@ def test_library_search_finds_customer_and_color_names(store, monkeypatch):
 def test_review_reject_still_removes_factory_image_from_library(store, monkeypatch):
     client = _client(monkeypatch)
     _upload(client, "516083.jpg", _jpeg("navy"), "本厂产品")
-    item = client.get("/api/reviews").json()["items"][0]
+    item, = client.get("/api/catalog").json()["items"]
     rejected = client.post(f"/api/records/{item['id']}/review", json={
         "action": "reject", "reviewer": "审核员", "note": "不是这款", "expected_revision": item["revision"],
     })

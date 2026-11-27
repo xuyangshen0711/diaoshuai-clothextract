@@ -64,11 +64,11 @@ def parse_sales_rows(path: Path, *, sheet_rows=None) -> tuple[list[dict], dict]:
     if detected in {"guide", "production"}:
         raise ValueError(f"可能传错了表，这像是{KIND_LABELS[detected]}，请用「{KIND_LABELS[detected]}」入口。")
     if detected == "archive":
-        raise ValueError("可能传错了表，这像是款式档案，请用款式档案入口。")
+        raise ValueError(f"可能传错了表，这像是{KIND_LABELS['archive']}，请用{KIND_LABELS['archive']}入口。")
     header_index, headers = find_header(rows, "款号")
     recognized = describe_headers(headers)
     if recognized["kind"] != "sales":
-        raise ValueError("可能传错了表，这像是款式档案，请用款式档案入口。")
+        raise ValueError(f"可能传错了表，这像是{KIND_LABELS['archive']}，请用{KIND_LABELS['archive']}入口。")
     missing = [name for name in SALES_COLUMNS if name not in headers]
     if missing:
         raise ValueError("销量表缺少列：" + "、".join(missing))

@@ -26,7 +26,7 @@ from src.db import (
     mysql_config,
     on_conflict_update,
 )
-from src.schema import CoverCrop, DesignNotes, FashionTags, ImageRecord, coerce_source_category
+from src.schema import FILTER_FIELDS, CoverCrop, DesignNotes, FashionTags, ImageRecord, coerce_source_category
 from src.storage import bind_cleanups, is_file, is_remote, publish_record, remove, reset_cleanups
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -140,6 +140,29 @@ def _db_identity(conn) -> tuple:
     return ("sqlite", str(resolved), db_stat, cat_mtime)
 
 
+def _recover_legacy_ai(record: ImageRecord) -> None:
+    """Keep the recorded AI proposal separate from subsequent human classifications."""
+    from src.tag.errors import TaggingError
+    from src.tag.openai_tagger import validate_suggestion
+
+    providers = {"openai", "deepseek", "mock"}
+    source = record.ai_tags_source or (record.tags_source if record.tags_source in providers else None)
+    if source not in providers:
+        return
+    old_ai_tags = record.tags if record.tags_source in providers else None
+    for suggestion in (record.ai_tags, record.proposed_tags, old_ai_tags):
+        if suggestion is None:
+            continue
+        try:
+            validate_suggestion(suggestion)
+        except TaggingError:
+            continue
+        if suggestion is not record.ai_tags:
+            record.ai_tags = suggestion.model_copy(deep=True)
+        record.ai_tags_source = source
+        return
+
+
 def _bootstrap_schema_and_migrations(conn) -> None:
     _ensure_core(conn)
     from src.factory.tables import ensure_factory, migrate_source_categories, migrate_starred_styles
@@ -156,9 +179,7 @@ def _bootstrap_schema_and_migrations(conn) -> None:
             for item in json.loads(CATALOG_PATH.read_text(encoding="utf-8")):
                 record = ImageRecord.model_validate(item)
                 record.tag_overrides = dict(record.human_overrides)
-                if record.ai_tags is None and record.tags_source in {"openai", "deepseek", "mock"}:
-                    record.ai_tags = record.tags.model_copy(deep=True)
-                    record.ai_tags_source = record.tags_source
+                _recover_legacy_ai(record)
                 if record.review_status != "rejected" and (
                     record.has_ai_suggestion or record.tags_source == "manual"
                 ):
@@ -288,21 +309,21 @@ def _ensure_catalog_snapshot(*, conn=None):
 
 def load_catalog(*, conn=None) -> list[ImageRecord]:
     snap = _ensure_catalog_snapshot(conn=conn)
-    return [r.model_copy(deep=False) for r in snap[2]]
+    return [r.model_copy(deep=True) for r in snap[2]]
 
 
 def load_library_catalog(*, conn=None) -> list[ImageRecord]:
     """Fast path for gallery endpoints: uses pre-validated ready_ids when snapshot is warm."""
     snap = _ensure_catalog_snapshot(conn=conn)
     ready_ids = snap[3]
-    return [r.model_copy(deep=False) for r in snap[2] if r.id in ready_ids]
+    return [r.model_copy(deep=True) for r in snap[2] if r.id in ready_ids]
 
 
 def get_record(record_id: str, *, conn=None) -> ImageRecord | None:
     fast = _fresh_mysql_catalog_snapshot(conn)
     if fast is not None:
         hit = fast[4].get(record_id)
-        return hit.model_copy(deep=False) if hit is not None else None
+        return hit.model_copy(deep=True) if hit is not None else None
     with (nullcontext(conn) if conn is not None else read_database()) as rconn:
         row = rconn.execute("SELECT payload FROM records WHERE id=?", (record_id,)).fetchone()
         return ImageRecord.model_validate_json(row[0]) if row else None
@@ -357,9 +378,7 @@ def _migrate_automatic_entry(conn) -> None:
                     if key == "品类" or old is None or value != getattr(old.display_tags, key):
                         overrides[key] = value
         record.tag_overrides = overrides
-        if record.ai_tags is None and record.tags_source in {"openai", "deepseek", "mock"}:
-            record.ai_tags = (record.proposed_tags or record.tags).model_copy(deep=True)
-            record.ai_tags_source = record.tags_source
+        _recover_legacy_ai(record)
         if record.ready:
             record.review_status = "approved"  # Stored enum retained for DB compatibility.
             record.proposed_tags = None
@@ -374,13 +393,16 @@ def _migrate_automatic_entry(conn) -> None:
     conn.execute("INSERT INTO migrations VALUES (?)", (name,))
 
 
+_EDITABLE_TAGS = {*FILTER_FIELDS, "袖长", "面料", "细节元素", "一句话描述"}
+
+
 def _validated_overrides(values: dict) -> dict:
-    from src.schema import DETAILS, FILTER_FIELDS
+    from src.schema import DETAILS
     from src.taxonomy import FABRICS, SLEEVE_LENGTHS, resolve
 
     cleaned = {}
     for key, value in values.items():
-        if key not in FashionTags.model_fields:
+        if key not in _EDITABLE_TAGS:
             raise ValueError(f"不支持修改标签：{key}")
         if key == "细节元素":
             if not isinstance(value, list) or any(not isinstance(v, str) or v not in DETAILS for v in value):
@@ -408,6 +430,9 @@ def _validated_overrides(values: dict) -> dict:
 def update_tags(record_id: str, *, changes: dict, reset_fields: list[str], expected_revision: int,
                 note: str = "") -> ImageRecord:
     """Patch individual overrides. Resetting a field returns it to the latest AI value."""
+    from src.taxonomy import UNSORTED, learn_phrase, refresh_learned_phrases, resolve
+
+    learned = False
     with _database() as conn:
         row = conn.execute("SELECT payload FROM records WHERE id=?", (record_id,)).fetchone()
         if row is None:
@@ -417,7 +442,7 @@ def update_tags(record_id: str, *, changes: dict, reset_fields: list[str], expec
             raise CatalogConflict("这款资料已更新，请重新载入后再修改；你的修改尚未保存")
         if not record.ready:
             raise ValueError("这款资料尚未完成有效 AI 识别，请在导入任务中重试")
-        if set(reset_fields) - FashionTags.model_fields.keys():
+        if set(reset_fields) - _EDITABLE_TAGS:
             raise ValueError("恢复列表包含不支持的标签")
         if set(reset_fields) & changes.keys():
             raise ValueError("同一标签不能同时修改和恢复")
@@ -430,11 +455,17 @@ def update_tags(record_id: str, *, changes: dict, reset_fields: list[str], expec
         overrides.update(patch)
         if overrides == record.human_overrides:
             return record
+        if patch.get("品类") and resolve(record.display_tags.品类).label == UNSORTED:
+            level1, _, level2 = patch["品类"].partition(">")
+            learned = learn_phrase(conn, record.category_raw, level1, level2,
+                                   patch.get("袖长", ""), patch.get("面料", ""))
         record.tag_overrides = overrides
         record.sync_effective_tags()
         record.proposed_tags = None
         record.touch()
         record.revision = _save(conn, record, "tags_updated" if patch else "tags_reset", "人工修改", note)
+    if learned:
+        refresh_learned_phrases()
     return record
 
 
@@ -486,6 +517,9 @@ def get_by_id(records: list[ImageRecord], record_id: str) -> ImageRecord | None:
 def review_record(record_id: str, *, action: str, reviewer: str, expected_revision: int,
                   tags: FashionTags | None = None, note: str = "",
                   notes: DesignNotes | None = None) -> ImageRecord:
+    from src.taxonomy import refresh_learned_phrases
+
+    learned = False
     reviewer, note = reviewer.strip(), note.strip()
     if not reviewer:
         raise ValueError("请填写审核人")
@@ -557,7 +591,7 @@ def review_record(record_id: str, *, action: str, reviewer: str, expected_revisi
                     record.fabric = stored.面料
                 if previous_label == UNSORTED and stored.品类 != UNSORTED and raw_phrase and raw_phrase != stored.品类:
                     level1, _, level2 = stored.品类.partition(">")
-                    learn_phrase(conn, raw_phrase, level1, level2, stored.袖长, stored.面料)
+                    learned = learn_phrase(conn, raw_phrase, level1, level2, stored.袖长, stored.面料)
                 if notes is not None:
                     record.notes = notes.model_copy(deep=True)
                 record.proposed_tags = None
@@ -574,6 +608,8 @@ def review_record(record_id: str, *, action: str, reviewer: str, expected_revisi
         record.touch()
         revision = _save(conn, record, action, reviewer, note)
     record.revision = revision
+    if learned:
+        refresh_learned_phrases()
     if dropped_image:
         discard_unreferenced_image(dropped_image, record)
     return record
@@ -590,10 +626,11 @@ def assign_garment_category(record_id: str, *, level1: str, level2: str = "", sl
         _require_node,
         label_of,
         learn_phrase,
-        read_taxonomy,
+        read_taxonomy, refresh_learned_phrases,
         resolve,
     )
 
+    learned = False
     level2 = level2 or ""
     sleeve_length = (sleeve_length or "").strip()
     fabric = (fabric or "").strip()
@@ -621,10 +658,12 @@ def assign_garment_category(record_id: str, *, level1: str, level2: str = "", sl
                                 **({"面料": fabric} if fabric else {})}
         record.sync_effective_tags()
         if was_unsorted and raw_phrase and raw_phrase != label:
-            learn_phrase(conn, raw_phrase, level1, level2, sleeve_length, fabric)
+            learned = learn_phrase(conn, raw_phrase, level1, level2, sleeve_length, fabric)
         record.touch()
         revision = _save(conn, record, "category_assigned", note=label)
     record.revision = revision
+    if learned:
+        refresh_learned_phrases()
     return record
 
 
@@ -661,12 +700,12 @@ def discard_unreferenced_image(path_str: str, record: ImageRecord) -> None:
     if not path_str:
         return
     if is_remote(path_str):
-        referenced = {record.image_path, *(entry.get("image_path") for entry in record.image_history)}
+        referenced = {record.image_path, record.pending_image_path, *(entry.get("image_path") for entry in record.image_history)}
         if path_str not in referenced:
             remove(path_str)
         return
     path = Path(path_str)
-    referenced = {str(Path(item).resolve()) for item in [record.image_path, *(
+    referenced = {str(Path(item).resolve()) for item in [record.image_path, record.pending_image_path, *(
         entry.get("image_path") for entry in record.image_history
     )] if item and not is_remote(item) and Path(item).exists()}
     try:

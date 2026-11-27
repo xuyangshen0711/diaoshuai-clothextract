@@ -15,6 +15,7 @@ from src.factory.archive import import_archive
 from src.factory.import_workspace import confirm_table, history, preview_table, replan_table, workspace
 from src.factory.library import load_index
 from src.factory.sales import import_sales, parse_sales_rows
+from src.tag.tagger import MockTagger
 from test_review_workflow import make_record, store
 
 ARCHIVE = ['大货款号', '季节', '颜色', '尺码', '原料名称']
@@ -128,16 +129,44 @@ def test_api_inspects_tables_and_deferred_images_without_ai(store, monkeypatch):
     response = client.post('/api/import/jobs?backend=deferred', data={'source_categories': '本厂产品'}, files={'files': ('516083.png', data.getvalue())})
     assert response.status_code == 202, response.text
     job = client.get('/api/import/jobs/' + response.json()['id']).json()
-    assert job['succeeded'] == 1 and job['filtered'] == 0
-    record = catalog.load_catalog()[0]
-    assert record.tags_source == 'deferred' and record.ai_tags is None
-    assert catalog.library_records([record]) == [record]
+    assert job['status'] == 'awaiting_ai' and job['succeeded'] == job['processed'] == job['filtered'] == 0
+    assert job['pending'] == 1 and not catalog.load_catalog()
+    checkpoint = import_jobs.get_job(job['id'])['items'][0]
+    assert Path(checkpoint['record']['image_path']).is_file()
+    retry = f"/api/import/jobs/{job['id']}/retry"
+    assert client.post(retry).status_code == 409
+    monkeypatch.setattr(import_jobs, 'get_tagger', lambda _: MockTagger())
+    assert client.post(retry, params={'backend': 'mock'}).status_code == 202
+    finished = client.get('/api/import/jobs/' + job['id']).json()
+    assert finished['status'] == 'completed' and finished['succeeded'] == 1
+    record, = catalog.load_catalog()
+    assert record.ready and record.id == checkpoint['record']['id'] and record.source.batch_id == job['id']
     assert import_jobs.create_retag('mock', False, batch_id=job['id'])['items']
     assert not import_jobs.create_retag('mock', False, batch_id='other-batch')['items']
     response = client.post('/api/import/inspect', data={'category': '本厂产品'}, files={'files': ('516083.png', data.getvalue())})
     assert response.json()['items'][0]['action'] == 'unchanged'
     response = client.get('/api/import/workspace?status=all')
     assert response.status_code == 200 and response.json()['counts']['styles'] == 1
+
+
+def test_inspection_and_import_agree_on_an_identical_but_untagged_factory_image(store, monkeypatch):
+    from src.schema import ImageRecord, SourceMeta
+
+    path = store / "extracted" / "516083.png"
+    Image.new("RGB", (240, 320), "navy").save(path)
+    original = ImageRecord(image_path=str(path), style_code="516083", source_category="本厂产品",
+                           source=SourceMeta(source_type="image", source_file=path.name, location=path.name))
+    catalog.save_catalog([original])
+    client = TestClient(api.app)
+    files = {"files": (path.name, path.read_bytes())}
+    def inspect():
+        return client.post("/api/import/inspect", data={"category": "本厂产品"}, files=files).json()["items"][0]
+    assert inspect()["action"] == "replacement"
+    monkeypatch.setattr(import_jobs, "submit_job", import_jobs.run_job)
+    job = client.post("/api/import/jobs?backend=mock", data={"source_categories": "本厂产品"}, files=files).json()
+    finished = client.get("/api/import/jobs/" + job["id"]).json()
+    assert finished["succeeded"] == 1 and finished["skipped"] == 0
+    assert catalog.get_record(original.id).ready and inspect()["action"] == "unchanged"
 
 
 def test_historical_repreview_counts_and_confirms_the_selected_range(store):

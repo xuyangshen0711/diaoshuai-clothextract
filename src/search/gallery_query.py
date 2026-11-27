@@ -31,6 +31,8 @@ from src.factory.library import (
     effective_placement,
     matches_level2,
 )
+from src.garment_structure import garment_structure
+from src.taxonomy import NECK_ALIASES
 from src.schema import DETAIL_GROUPS, FILTER_FIELDS, ImageRecord
 from src.taxonomy import FABRICS, SLEEVE_LENGTHS
 
@@ -165,11 +167,11 @@ def _build_vocabulary() -> tuple[dict[str, QueryToken], dict[str, QueryToken], l
     for v in FILTER_FIELDS["领型"]:
         if v != "其他":
             register(v, VisualTagToken(v, "neckline", v))
-    register("半高领", VisualTagToken("半高领", "neckline", "高领", ("半高领",)))
-    register("polo领", VisualTagToken("polo领", "neckline", "翻领", ("polo",)))
-    register("POLO领", VisualTagToken("POLO领", "neckline", "翻领", ("polo",)))
-    register("帽衫", VisualTagToken("帽衫", "neckline", "连帽", ("连帽", "帽衫")))
-    register("连帽衫", VisualTagToken("连帽衫", "neckline", "连帽", ("连帽", "帽衫")))
+    for canonical, aliases in NECK_ALIASES.items():
+        for alias in aliases:
+            register(alias, VisualTagToken(alias, "neckline", canonical))
+    register("连帽衫", VisualTagToken("连帽衫", "neckline", "连帽"))
+    register("polo领", VisualTagToken("polo领", "neckline", "翻领"))
 
     for v in (*SLEEVE_LENGTHS, *(s for s in FILTER_FIELDS["袖型"] if s != "其他")):
         register(v, VisualTagToken(v, "sleeve", v))
@@ -256,7 +258,8 @@ def _build_vocabulary() -> tuple[dict[str, QueryToken], dict[str, QueryToken], l
 
     # 5. Details (structural details stay visual-only; craft/knit textures allow low-score note fallback)
     for d in DETAIL_GROUPS["结构与闭合"]:
-        register(d, VisualTagToken(d, "detail_struct", d))
+        if d not in NECK_ALIASES:
+            register(d, VisualTagToken(d, "detail_struct", d))
     for group_name in ("装饰工艺", "针织纹理"):
         for d in DETAIL_GROUPS[group_name]:
             register(d, VisualTagToken(d, "detail_craft", d))
@@ -472,16 +475,8 @@ def _score_visual_tag(
     kind = token.kind
 
     if kind == "neckline":
-        if token.components:
-            comp = token.components[0].casefold()
-            if comp in desc_low:
-                return 115.0 if shown.领型 == token.canonical else 80.0
-            return None
-        if shown.领型 == token.canonical:
-            return 105.0 if raw_low in desc_low else 95.0
-        if raw_low in desc_low:
-            return 60.0
-        return None
+        effective = garment_structure(record.model_copy(update={"tags": shown}), cat2=archive.get("品类", "")).neck
+        return 105.0 if effective == token.canonical else None
 
     if kind == "sleeve":
         if token.components:
