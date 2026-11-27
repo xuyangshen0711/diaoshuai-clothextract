@@ -565,3 +565,44 @@ def test_style_code_search_cross_season_gallery_only_and_category_autoswitch(sto
     r2 = client.get("/api/analytics/sales/styles/search?q=NEW9")
     assert r2.status_code == 200
     assert r2.json()["items"][0]["code"] == "NEW901"
+
+    # 5. Locking a V-neck hero style MUST rank V-neck candidates ahead of higher-lift hoodies!
+    v_own = _make_img(img_dir, "669215.jpg", (32, 38, 56))
+    ext_vneck = _make_img(img_dir, "ext_vneck.jpg", (50, 58, 72))
+    ext_hoodie_high = _make_img(img_dir, "ext_hoodie_high.jpg", (230, 228, 222))
+    with catalog._database() as conn:
+        conn.execute(
+            "INSERT INTO style_variants (variant_code, style_code, customer, season, needle, series, category, "
+            "material, design_code, designer, craftsman, subcategory, colors_json, sizes_json, source_file, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("669215", "669215", "本厂自有版本", "2026冬", "12针", "气质", "长袖套衫", "40/60", "D215", "沈爱和", "王工", "V领长袖套衫",
+             '["藏青"]', '["M"]', "a.xlsx", "2026-11-01"),
+        )
+        conn.execute(
+            "INSERT INTO style_order_lines VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("O215", "669215", "藏青", "M", 13006, 1560000, "669215", "张总", "杭州张总", "", "订单", "2026-10-12", "小王", "套衫", "2026冬", "o.xlsx", "t"),
+        )
+    catalog.save_catalog([
+        ImageRecord(
+            id="own_669215", image_path=v_own, source_category="本厂产品", style_code="669215", review_status="approved",
+            source=SourceMeta(source_file="669215.jpg", source_type="image", location="上传图片"),
+            tags=FashionTags(品类="上衣>套衫", 风格="通勤", 季节="冬", 版型="修身", 颜色主色调="蓝色", 领型="V领", 袖型="长袖", 袖长="长袖", 面料="针织", 图案="纯色/无明显图案", 细节元素=["抽绳"], 一句话描述="深蓝V领抽绳针织套衫"),
+        ),
+        ImageRecord(
+            id="ext_vneck_real", image_path=ext_vneck, source_category="网图趋势", review_status="approved",
+            source=SourceMeta(source_file="vneck_trend.jpg", source_type="image", location="上传图片"),
+            # Even if old tag said 圆领, description mentions V领 -> rescued by _cand_effective_neckline!
+            tags=FashionTags(品类="上衣>套衫", 风格="通勤", 季节="冬", 版型="宽松", 颜色主色调="灰色", 领型="其他", 袖型="长袖", 袖长="长袖", 面料="针织", 图案="纯色/无明显图案", 细节元素=["绞花"], 一句话描述="烟灰色气质大V领细绞花针织套衫"),
+        ),
+        ImageRecord(
+            id="ext_hoodie_wrong", image_path=ext_hoodie_high, source_category="网图趋势", review_status="approved",
+            source=SourceMeta(source_file="hoodie_wrong.jpg", source_type="image", location="上传图片"),
+            tags=FashionTags(品类="上衣>套衫", 风格="休闲", 季节="冬", 版型="宽松", 颜色主色调="白色", 领型="连帽", 袖型="长袖", 袖长="长袖", 面料="针织", 图案="纯色/无明显图案", 细节元素=["连帽", "抽绳"], 一句话描述="米白色宽松连帽抽绳针织帽衫"),
+        ),
+    ])
+    with catalog.read_database() as conn:
+        pre_v = build_selection_preview(conn, SelectionFilters(seasons=["2026冬"], category="长袖套衫", target_style_code="669215"))
+    assert pre_v["shortlist"][0]["record_id"] == "ext_vneck_real"
+    assert pre_v["shortlist"][0]["tags"]["领型"] == "V领"
+    assert pre_v["shortlist"][0]["total_score"] > pre_v["shortlist"][1]["total_score"]
+    assert "V领" in pre_v["target_hero_notice"]

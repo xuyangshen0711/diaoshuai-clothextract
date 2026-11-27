@@ -508,8 +508,17 @@ def _matches_category_plan(record: ImageRecord, plan: str) -> bool:
     desc = (record.tags.一句话描述 or "").strip()
     is_short_or_mid = sleeve_len in {"短袖", "中袖"} or sleeve_type == "短袖" or any(k in desc for k in ("短袖", "五分袖", "七分袖", "半袖"))
     is_sleeveless = sleeve_len == "无袖" or sleeve_type == "无袖"
+    is_full_zip_outer = (
+        any(k in desc for k in ("拉链开衫", "拉链外套", "连帽开衫", "开襟外套", "拉链卫衣外套"))
+        and "半拉链" not in desc
+    )
     if plan == "长袖套衫":
-        return cat in {"上衣>套衫", "上衣>假两件套衫", "上衣>卫衣", "上衣"} and not is_short_or_mid and not is_sleeveless
+        return (
+            cat in {"上衣>套衫", "上衣>假两件套衫", "上衣>卫衣", "上衣"}
+            and not is_short_or_mid
+            and not is_sleeveless
+            and not is_full_zip_outer
+        )
     if plan == "长袖开衫":
         return cat in {"上衣>开衫", "外套>针织外套"} and not is_short_or_mid and not is_sleeveless
     if plan == "短/中袖套衫":
@@ -761,12 +770,37 @@ def _own_structural_hints(st: dict) -> tuple[str, list[str]]:
     return effective_neck, hints
 
 
+_NECKLINE_COMPATIBLE: dict[str, set[str]] = {
+    "V领": {"翻领", "方领", "系带领", "荡领"},
+    "连帽": {"立领", "翻领"},
+    "半高领": {"高领", "立领", "圆领"},
+    "高领": {"半高领", "立领", "堆堆领"},
+    "翻领": {"V领", "立领", "方领"},
+    "圆领": {"半高领", "一字领", "方领"},
+    "方领": {"V领", "一字领", "圆领"},
+    "一字领": {"方领", "圆领", "荡领"},
+}
+
+
 def _cand_effective_neckline(rec: ImageRecord) -> str:
     desc = (rec.tags.一句话描述 or "").strip()
     details = rec.tags.细节元素 or []
+    tag_neck = (rec.tags.领型 or "").strip()
     if "连帽" in details or any(k in desc for k in ("连帽", "帽衫", "带帽", "卫衣帽")):
         return "连帽"
-    return (rec.tags.领型 or "").strip()
+    if any(k in desc for k in ("V领", "v领", "鸡心领", "深V", "大V")):
+        return "V领"
+    if any(k in desc for k in ("半高领", "小高领", "中领")):
+        return "半高领"
+    if any(k in desc for k in ("高领", "堆堆领", "翻高领")):
+        return "高领"
+    if any(k in desc for k in ("POLO", "polo", "Polo", "翻领", "海军领", "娃娃领")):
+        return "翻领"
+    if "方领" in desc:
+        return "方领"
+    if any(k in desc for k in ("一字领", "船领")):
+        return "一字领"
+    return tag_neck
 
 
 def _is_busy_pattern(rec: ImageRecord) -> tuple[bool, str]:
@@ -1700,10 +1734,19 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
             novelty_score += 3.5
         if rec.notes.text():
             novelty_score += 1.5
-        # Structural alignment bonus when targeting a specific hero style (e.g. hoodie -> hoodie/related neckline)
+        # Structural neckline tiering when targeting a specific hero style (e.g. V领 -> V领 first, hoodies penalized)
+        neck_tier = 0
+        neck_bonus = 0.0
         if target_hero is not None and target_hero_neck and target_hero_neck not in {"其他", "未判断"}:
             if cand_neck == target_hero_neck:
-                novelty_score += 6.0
+                neck_tier = 0
+                neck_bonus = 10.0
+            elif cand_neck in _NECKLINE_COMPATIBLE.get(target_hero_neck, set()):
+                neck_tier = 1
+                neck_bonus = 0.0
+            else:
+                neck_tier = 2
+                neck_bonus = -16.0
         novelty_score = round(min(40.0, novelty_score), 1)
 
         # Tone-clash penalty against minimalist/neutral reference winners
@@ -1722,7 +1765,7 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
             if (ref_rec.tags.风格 or "") in {"极简", "通勤"} and (rec.tags.风格 or "") in {"甜美", "街头", "运动"}:
                 penalty += 7.0
 
-        total_score = round(max(15.0, min(98.0, gene_score + novelty_score - penalty)), 1)
+        total_score = round(max(15.0, min(98.0, gene_score + novelty_score + neck_bonus - penalty)), 1)
         ref_card = _serialize_style_card(best_winner) if best_winner else None
         cand_obj = {
             "record_id": rec.id,
@@ -1753,10 +1796,11 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
             "reference_winner": ref_card,
             "closest_any_code": closest_any["code"] if closest_any else "",
             "closest_any_sim": round(max_any_sim, 2) if closest_any else 0.0,
+            "_neck_tier": neck_tier,
         }
         raw_scored.append((cand_obj, rec))
 
-    raw_scored.sort(key=lambda pair: (-pair[0]["total_score"], -pair[0]["gene_score"], pair[0]["record_id"]))
+    raw_scored.sort(key=lambda pair: (pair[0]["_neck_tier"], -pair[0]["total_score"], -pair[0]["gene_score"], pair[0]["record_id"]))
 
     # Gate 1C: External-vs-External visual deduplication across canonical score order
     # (run BEFORE skipping excluded_ids so duplicate siblings never resurface in Batch 2+!)
@@ -1817,6 +1861,22 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
             continue
         scored_candidates.append(cand_obj)
 
+    target_neck_matched = (
+        sum(1 for c in scored_candidates if c.get("_neck_tier") == 0)
+        if (target_hero is not None and target_hero_neck and target_hero_neck not in {"其他", "未判断"})
+        else 0
+    )
+    for c in scored_candidates:
+        c.pop("_neck_tier", None)
+
+    if target_hero is not None and target_hero_neck and target_hero_neck not in {"其他", "未判断"} and target_hero.get("record") is not None:
+        neck_hint = (
+            f"已将外部图库中 {target_neck_matched} 张「{target_hero_neck}」同领型候选优先排在最前（点击下方绿色「AI 真视觉海选」按钮由千问肉眼进一步精筛）。"
+            if target_neck_matched > 0
+            else f"外部图库当前旧标签中暂未标出「{target_hero_neck}」，建议点击下方绿色「AI 真视觉海选」让千问直接肉眼搜图。"
+        )
+        target_hero_notice = f"{target_hero_notice} {neck_hint}".strip() if target_hero_notice else neck_hint
+
     scan_pool = scored_candidates[: filters.scan_limit]
     shortlist = scored_candidates[: filters.pool_size]
     for item in shortlist:
@@ -1828,7 +1888,7 @@ def _build_selection_context(conn, filters: SelectionFilters) -> tuple[dict, lis
     scan_candidate_ids = [c["record_id"] for c in scan_pool]
 
     snapshot_payload = [
-        "v2-visual-screen",
+        "v3-neck-priority",
         filters.seasons,
         effective_category,
         filters.sources,
@@ -1994,12 +2054,19 @@ def run_selection_ai(conn, filters: SelectionFilters, *, force: bool = False, cl
             pipeline_mode = "two_stage_contact_sheet"
             if target_hero and target_hero.get("record") is not None:
                 hero_pairs = [(target_hero["code"], target_hero["record"])]
-                t_hints = "、".join(_own_structural_hints(target_hero)[1])
+                t_neck, t_hint_list = _own_structural_hints(target_hero)
+                t_hints = "、".join(t_hint_list)
+                neck_strict = (
+                    f"【领型强对齐要求】本厂参照款核心领型为「{t_neck}」，请优先精选肉眼明确可见为「{t_neck}」（或同颈部修饰逻辑）的微创新款；"
+                    f"与「{t_neck}」结构跨度过大的款（例如目标V领却给连帽卫衣/拉链帽衫外套，或目标连帽却给圆领打底）直接淘汰！"
+                    if t_neck and t_neck not in {"其他", "未判断"}
+                    else ""
+                )
                 hero_brief = (
                     f"【定向锚定本厂单款 {target_hero['code']}】等级={target_hero['grade']} | "
                     f"销量={target_hero['qty']:,}件（补单{target_hero['rep_qty']:,}件）| "
-                    f"材质={target_hero['material']} | ERP信息={t_hints or '无'}。"
-                    "请重点先用肉眼确认图 1 的真实领型与结构（例如是否连帽帽衫/翻领/V领等），再挑选同调性微创新升级款！"
+                    f"材质={target_hero['material']} | ERP信息={t_hints or '无'}。\n{neck_strict}"
+                    "请先用肉眼确认图 1 的真实领型与结构，再挑选同结构、同气质调性的微创新升级款！"
                 )
             else:
                 top_heroes = [w for w in own_winners[:4] if w.get("record") is not None]
